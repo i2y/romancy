@@ -1,0 +1,41 @@
+# Docker Compose for Romancy development and testing
+# Usage:
+#   docker compose up -d         # Start PostgreSQL and Jaeger
+#   docker compose down          # Stop all services
+#   docker compose down -v       # Stop and remove volumes
+#
+# Jaeger UI: http://localhost:16686
+# OTLP gRPC: localhost:4317
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: romancy-postgres
+    environment:
+      POSTGRES_USER: romancy
+      POSTGRES_PASSWORD: romancy
+      POSTGRES_DB: romancy_test
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - romancy_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U romancy -d romancy_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Jaeger all-in-one for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.75.0
+    container_name: romancy-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+
+volumes:
+  romancy_pgdata:

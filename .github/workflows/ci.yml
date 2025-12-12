@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: romancy
+          POSTGRES_PASSWORD: romancy_test_password
+          POSTGRES_DB: romancy_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      mysql:
+        image: mysql:9
+        env:
+          MYSQL_ROOT_PASSWORD: root_password
+          MYSQL_DATABASE: romancy_test
+          MYSQL_USER: romancy
+          MYSQL_PASSWORD: romancy_test_password
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+        ports:
+          - 3306:3306
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        env:
+          ROMANCY_TEST_POSTGRES_URL: postgres://romancy:romancy_test_password@localhost:5432/romancy_test?sslmode=disable
+          ROMANCY_TEST_MYSQL_URL: romancy:romancy_test_password@tcp(localhost:3306)/romancy_test
+        run: go test -v ./...
+
+      - name: Build
+        run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2

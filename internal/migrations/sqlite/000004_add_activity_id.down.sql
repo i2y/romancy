@@ -1,0 +1,3 @@
+-- SQLite doesn't support DROP COLUMN directly, so we need to recreate the table
+-- For simplicity, we'll leave the column (it's just unused if downgrading)
+-- Production downgrade would require table recreation
