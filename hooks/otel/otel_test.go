@@ -134,7 +134,7 @@ func TestWorkflowCancelled(t *testing.T) {
 
 	span := spans[0]
 	if span.Status().Code != codes.Error {
-		t.Errorf("expected status Error (cancelled), got %v", span.Status().Code)
+		t.Errorf("expected status Error (canceled), got %v", span.Status().Code)
 	}
 
 	attrs := span.Attributes()

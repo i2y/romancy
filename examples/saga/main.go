@@ -226,7 +226,7 @@ func (w *TripBookingWorkflow) Execute(ctx *romancy.WorkflowContext, input TripBo
 	if err != nil {
 		// All compensations (car, hotel, flight) will be executed in LIFO order!
 		result.Status = "payment_failed"
-		result.CompensationNotes = "All bookings will be automatically cancelled"
+		result.CompensationNotes = "All bookings will be automatically canceled"
 		log.Printf("[Workflow] Payment failed! Compensations will be executed...")
 		return result, fmt.Errorf("payment failed: %w", err)
 	}

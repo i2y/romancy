@@ -113,7 +113,7 @@ func (h *OTelHooks) OnWorkflowCancelled(ctx context.Context, info hooks.Workflow
 			attribute.Int64("romancy.duration_ms", info.Duration.Milliseconds()),
 			attribute.String("romancy.cancel_reason", info.Reason),
 		)
-		span.SetStatus(codes.Error, "workflow cancelled: "+info.Reason)
+		span.SetStatus(codes.Error, "workflow canceled: "+info.Reason)
 		span.End()
 		delete(h.workflowSpans, info.InstanceID)
 		delete(h.workflowContexts, info.InstanceID)
