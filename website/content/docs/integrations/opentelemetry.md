@@ -38,23 +38,33 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
+// Result types
+
+type ReservationResult struct {
+	Reserved bool `json:"reserved"`
+}
+
+type OrderResult struct {
+	Status string `json:"status"`
+}
+
 // Activities
 
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
-		return map[string]any{"reserved": true}, nil
+	func(ctx context.Context, orderID string) (ReservationResult, error) {
+		return ReservationResult{Reserved: true}, nil
 	},
 )
 
 // Workflow
 
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderResult, error) {
 		_, err := reserveInventory.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderResult{}, err
 		}
-		return map[string]any{"status": "completed"}, nil
+		return OrderResult{Status: "completed"}, nil
 	},
 )
 
@@ -267,39 +277,59 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
+// Result types
+
+type ValidationResult struct {
+	Valid bool `json:"valid"`
+}
+
+type PaymentResult struct {
+	TransactionID string `json:"transaction_id"`
+}
+
+type OrderInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
+type OrderWorkflowResult struct {
+	Status        string `json:"status"`
+	TransactionID string `json:"transaction_id"`
+}
+
 // Activities
 
 var validateOrder = romancy.DefineActivity("validate_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (ValidationResult, error) {
 		time.Sleep(100 * time.Millisecond)
-		return map[string]any{"valid": true}, nil
+		return ValidationResult{Valid: true}, nil
 	},
 )
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, amount float64) (map[string]any, error) {
+	func(ctx context.Context, amount float64) (PaymentResult, error) {
 		time.Sleep(500 * time.Millisecond)
-		return map[string]any{"transaction_id": "TXN-123"}, nil
+		return PaymentResult{TransactionID: "TXN-123"}, nil
 	},
 )
 
 // Workflow
 
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string, amount float64) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string, amount float64) (OrderWorkflowResult, error) {
 		_, err := validateOrder.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
 		paymentResult, err := processPayment.Execute(ctx, amount)
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
-		return map[string]any{
-			"status":         "completed",
-			"transaction_id": paymentResult["transaction_id"],
+		return OrderWorkflowResult{
+			Status:        "completed",
+			TransactionID: paymentResult.TransactionID,
 		}, nil
 	},
 )

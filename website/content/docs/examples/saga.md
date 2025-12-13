@@ -61,13 +61,28 @@ import (
 	"github.com/i2y/romancy"
 )
 
+// Result types
+type ReservationResult struct {
+	ReservationID string `json:"reservation_id"`
+	ItemID        string `json:"item_id"`
+}
+
+type PaymentResult struct {
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
+type ShipmentResult struct {
+	ShipmentID string `json:"shipment_id"`
+}
+
 // Reserve inventory (linked to cancelInventoryReservation)
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID, itemID string) (map[string]any, error) {
+	func(ctx context.Context, orderID, itemID string) (ReservationResult, error) {
 		fmt.Printf("✅ Reserved %s for order %s\n", itemID, orderID)
-		return map[string]any{
-			"reservation_id": fmt.Sprintf("RES-%s", itemID),
-			"item_id":        itemID,
+		return ReservationResult{
+			ReservationID: fmt.Sprintf("RES-%s", itemID),
+			ItemID:        itemID,
 		}, nil
 	},
 	romancy.WithCompensation(cancelInventoryReservation), // Link compensation
@@ -75,11 +90,11 @@ var reserveInventory = romancy.DefineActivity("reserve_inventory",
 
 // Charge payment (linked to refundPayment)
 var chargePayment = romancy.DefineActivity("charge_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
 		fmt.Printf("✅ Charged $%.2f for order %s\n", amount, orderID)
-		return map[string]any{
-			"transaction_id": fmt.Sprintf("TXN-%s", orderID),
-			"amount":         amount,
+		return PaymentResult{
+			TransactionID: fmt.Sprintf("TXN-%s", orderID),
+			Amount:        amount,
 		}, nil
 	},
 	romancy.WithCompensation(refundPayment), // Link compensation
@@ -87,9 +102,9 @@ var chargePayment = romancy.DefineActivity("charge_payment",
 
 // Ship order (no compensation - this will fail)
 var shipOrder = romancy.DefineActivity("ship_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (ShipmentResult, error) {
 		fmt.Printf("🚚 Attempting to ship order %s\n", orderID)
-		return nil, errors.New("shipping service unavailable")
+		return ShipmentResult{}, errors.New("shipping service unavailable")
 	},
 )
 ```
@@ -100,35 +115,38 @@ var shipOrder = romancy.DefineActivity("ship_order",
 package main
 
 import (
-	"fmt"
-
 	"github.com/i2y/romancy"
 )
+
+// Result type for the saga workflow
+type OrderSagaResult struct {
+	Status string `json:"status"`
+}
 
 // orderSaga processes an order with automatic compensation on failure.
 // If any step fails, Romancy automatically calls compensation functions
 // for all completed steps in reverse order.
 var orderSaga = romancy.DefineWorkflow("order_saga",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderSagaResult, error) {
 		// Step 1: Reserve inventory
 		_, err := reserveInventory.Execute(ctx, orderID, "ITEM-123")
 		if err != nil {
-			return nil, err
+			return OrderSagaResult{}, err
 		}
 
 		// Step 2: Charge payment
 		_, err = chargePayment.Execute(ctx, orderID, 99.99)
 		if err != nil {
-			return nil, err
+			return OrderSagaResult{}, err
 		}
 
 		// Step 3: Ship order (will fail!)
 		_, err = shipOrder.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderSagaResult{}, err
 		}
 
-		return map[string]any{"status": "completed"}, nil
+		return OrderSagaResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -216,6 +234,25 @@ import (
 	"github.com/i2y/romancy"
 )
 
+// Result types
+type ReservationResult struct {
+	ReservationID string `json:"reservation_id"`
+	ItemID        string `json:"item_id"`
+}
+
+type PaymentResult struct {
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
+type ShipmentResult struct {
+	ShipmentID string `json:"shipment_id"`
+}
+
+type OrderSagaResult struct {
+	Status string `json:"status"`
+}
+
 // Compensation functions
 
 var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_reservation",
@@ -235,57 +272,57 @@ var refundPayment = romancy.DefineCompensation("refund_payment",
 // Activities with compensation links
 
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID, itemID string) (map[string]any, error) {
+	func(ctx context.Context, orderID, itemID string) (ReservationResult, error) {
 		fmt.Printf("✅ Reserved %s for order %s\n", itemID, orderID)
-		return map[string]any{
-			"reservation_id": fmt.Sprintf("RES-%s", itemID),
-			"item_id":        itemID,
+		return ReservationResult{
+			ReservationID: fmt.Sprintf("RES-%s", itemID),
+			ItemID:        itemID,
 		}, nil
 	},
 	romancy.WithCompensation(cancelInventoryReservation),
 )
 
 var chargePayment = romancy.DefineActivity("charge_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
 		fmt.Printf("✅ Charged $%.2f for order %s\n", amount, orderID)
-		return map[string]any{
-			"transaction_id": fmt.Sprintf("TXN-%s", orderID),
-			"amount":         amount,
+		return PaymentResult{
+			TransactionID: fmt.Sprintf("TXN-%s", orderID),
+			Amount:        amount,
 		}, nil
 	},
 	romancy.WithCompensation(refundPayment),
 )
 
 var shipOrder = romancy.DefineActivity("ship_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (ShipmentResult, error) {
 		fmt.Printf("🚚 Attempting to ship order %s\n", orderID)
-		return nil, errors.New("shipping service unavailable")
+		return ShipmentResult{}, errors.New("shipping service unavailable")
 	},
 )
 
 // Saga workflow
 
 var orderSaga = romancy.DefineWorkflow("order_saga",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderSagaResult, error) {
 		// Step 1: Reserve inventory
 		_, err := reserveInventory.Execute(ctx, orderID, "ITEM-123")
 		if err != nil {
-			return nil, err
+			return OrderSagaResult{}, err
 		}
 
 		// Step 2: Charge payment
 		_, err = chargePayment.Execute(ctx, orderID, 99.99)
 		if err != nil {
-			return nil, err
+			return OrderSagaResult{}, err
 		}
 
 		// Step 3: Ship order (will fail!)
 		_, err = shipOrder.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderSagaResult{}, err
 		}
 
-		return map[string]any{"status": "completed"}, nil
+		return OrderSagaResult{Status: "completed"}, nil
 	},
 )
 

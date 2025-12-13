@@ -63,11 +63,16 @@ By default, workflows are NOT automatically registered as CloudEvents handlers (
 To enable auto-registration:
 
 ```go
+type OrderResult struct {
+	Status  string `json:"status"`
+	OrderID string `json:"order_id"`
+}
+
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderResult, error) {
 		// This workflow will automatically handle CloudEvents
 		// with type="order_workflow"
-		return map[string]any{"status": "completed"}, nil
+		return OrderResult{Status: "completed", OrderID: orderID}, nil
 	},
 	romancy.WithEventHandler(true), // Enable CloudEvents auto-registration
 )
@@ -89,16 +94,21 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 ### Basic Usage
 
 ```go
+type EmailResult struct {
+	Sent      bool   `json:"sent"`
+	MessageID string `json:"message_id"`
+}
+
 var sendEmail = romancy.DefineActivity("send_email",
-	func(ctx context.Context, email, subject string) (map[string]any, error) {
+	func(ctx context.Context, email, subject string) (EmailResult, error) {
 		// Call external service
 		response, err := emailService.Send(email, subject)
 		if err != nil {
-			return nil, err
+			return EmailResult{}, err
 		}
-		return map[string]any{
-			"sent":       true,
-			"message_id": response.ID,
+		return EmailResult{
+			Sent:      true,
+			MessageID: response.ID,
 		}, nil
 	},
 )
@@ -109,13 +119,17 @@ var sendEmail = romancy.DefineActivity("send_email",
 Activities are automatically transactional:
 
 ```go
+type OrderResult struct {
+	OrderID string `json:"order_id"`
+}
+
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (OrderResult, error) {
 		// All operations in a single transaction:
 		// 1. Activity execution
 		// 2. History recording
 		// 3. Event publishing (if using transactional outbox)
-		return map[string]any{"order_id": orderID}, nil
+		return OrderResult{OrderID: orderID}, nil
 	},
 )
 ```
@@ -126,7 +140,7 @@ For atomic operations with your own database tables, use the session from Workfl
 
 ```go
 var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (OrderResult, error) {
 		// Access workflow context for session
 		wfCtx := romancy.GetWorkflowContext(ctx)
 		session := wfCtx.Session()
@@ -134,11 +148,11 @@ var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
 		// Your database operations
 		order := &Order{OrderID: orderID}
 		if err := session.Create(order).Error; err != nil {
-			return nil, err
+			return OrderResult{}, err
 		}
 
 		// Romancy automatically commits (or rolls back on error)
-		return map[string]any{"order_id": orderID}, nil
+		return OrderResult{OrderID: orderID}, nil
 	},
 )
 ```
@@ -152,14 +166,18 @@ Activities automatically retry on failure with exponential backoff. This provide
 By default, activities retry **5 times** with exponential backoff:
 
 ```go
+type PaymentResult struct {
+	TransactionID string `json:"transaction_id"`
+}
+
 var callPaymentAPI = romancy.DefineActivity("call_payment_api",
-	func(ctx context.Context, amount float64) (map[string]any, error) {
+	func(ctx context.Context, amount float64) (PaymentResult, error) {
 		// Default: 5 attempts with exponential backoff
 		response, err := paymentService.Charge(amount)
 		if err != nil {
-			return nil, err
+			return PaymentResult{}, err
 		}
-		return map[string]any{"transaction_id": response.ID}, nil
+		return PaymentResult{TransactionID: response.ID}, nil
 	},
 )
 ```
@@ -179,13 +197,17 @@ If all 5 attempts fail, a retry exhausted error is returned.
 Configure retry behavior per activity using `WithRetryPolicy`:
 
 ```go
+type PaymentStatusResult struct {
+	Status string `json:"status"`
+}
+
 var criticalPayment = romancy.DefineActivity("critical_payment",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (PaymentStatusResult, error) {
 		response, err := paymentService.Process(orderID)
 		if err != nil {
-			return nil, err
+			return PaymentStatusResult{}, err
 		}
-		return map[string]any{"status": response.Status}, nil
+		return PaymentStatusResult{Status: response.Status}, nil
 	},
 	romancy.WithRetryPolicy(&retry.Policy{
 		MaxAttempts:     10,                      // More attempts for critical operations
@@ -231,24 +253,29 @@ app := romancy.NewApp(
 Use `TerminalError` for errors that should **never** be retried:
 
 ```go
+type ValidationResult struct {
+	OrderID string `json:"order_id"`
+	Valid   bool   `json:"valid"`
+}
+
 var validateOrder = romancy.DefineActivity("validate_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (ValidationResult, error) {
 		order, err := db.GetOrder(orderID)
 		if err != nil {
-			return nil, err
+			return ValidationResult{}, err
 		}
 
 		if order == nil {
 			// Don't retry - order doesn't exist
-			return nil, romancy.TerminalError(fmt.Errorf("order %s not found", orderID))
+			return ValidationResult{}, romancy.TerminalError(fmt.Errorf("order %s not found", orderID))
 		}
 
 		if order.Status == "cancelled" {
 			// Business rule violation - don't retry
-			return nil, romancy.TerminalError(fmt.Errorf("order %s is cancelled", orderID))
+			return ValidationResult{}, romancy.TerminalError(fmt.Errorf("order %s is cancelled", orderID))
 		}
 
-		return map[string]any{"order_id": orderID, "valid": true}, nil
+		return ValidationResult{OrderID: orderID, Valid: true}, nil
 	},
 )
 ```
@@ -267,34 +294,38 @@ Romancy provides helper functions for common scenarios:
 ```go
 import "github.com/i2y/romancy/retry"
 
+type ProcessResult struct {
+	Processed bool `json:"processed"`
+}
+
 // Default policy (5 attempts, exponential backoff)
 var defaultActivity = romancy.DefineActivity("default_activity",
-	func(ctx context.Context, data string) (map[string]any, error) {
-		return nil, nil
+	func(ctx context.Context, data string) (ProcessResult, error) {
+		return ProcessResult{Processed: true}, nil
 	},
 	romancy.WithRetryPolicy(retry.DefaultPolicy()),
 )
 
 // No retries - fail immediately
 var noRetryActivity = romancy.DefineActivity("no_retry_activity",
-	func(ctx context.Context, data string) (map[string]any, error) {
-		return nil, nil
+	func(ctx context.Context, data string) (ProcessResult, error) {
+		return ProcessResult{Processed: true}, nil
 	},
 	romancy.WithRetryPolicy(retry.NoRetry()),
 )
 
 // Fixed interval retries
 var fixedRetryActivity = romancy.DefineActivity("fixed_retry_activity",
-	func(ctx context.Context, data string) (map[string]any, error) {
-		return nil, nil
+	func(ctx context.Context, data string) (ProcessResult, error) {
+		return ProcessResult{Processed: true}, nil
 	},
 	romancy.WithRetryPolicy(retry.Fixed(5, 2*time.Second)), // 5 attempts, 2s interval
 )
 
 // Exponential backoff
 var exponentialActivity = romancy.DefineActivity("exponential_activity",
-	func(ctx context.Context, data string) (map[string]any, error) {
-		return nil, nil
+	func(ctx context.Context, data string) (ProcessResult, error) {
+		return ProcessResult{Processed: true}, nil
 	},
 	romancy.WithRetryPolicy(retry.Exponential(10, 100*time.Millisecond, 30*time.Second)),
 )
@@ -309,13 +340,17 @@ Romancy automatically assigns IDs to activities for deterministic replay after c
 For **sequential execution**, Romancy automatically generates IDs in the format `"{function_name}:{counter}"`:
 
 ```go
+type WorkflowResult struct {
+	Status string `json:"status"`
+}
+
 var myWorkflow = romancy.DefineWorkflow("my_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (WorkflowResult, error) {
 		// Auto-generated IDs: "validate:1", "process:1", "notify:1"
-		result1, _ := validate.Execute(ctx, orderID)    // "validate:1"
-		result2, _ := process.Execute(ctx, orderID)     // "process:1"
-		result3, _ := notify.Execute(ctx, orderID)      // "notify:1"
-		return map[string]any{"status": "completed"}, nil
+		_, _ = validate.Execute(ctx, orderID)    // "validate:1"
+		_, _ = process.Execute(ctx, orderID)     // "process:1"
+		_, _ = notify.Execute(ctx, orderID)      // "notify:1"
+		return WorkflowResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -329,12 +364,20 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
 **Even with conditional branches**, auto-generation works correctly:
 
 ```go
-var loanApproval = romancy.DefineWorkflow("loan_approval",
-	func(ctx *romancy.WorkflowContext, applicantID string) (map[string]any, error) {
-		creditResult, _ := checkCredit.Execute(ctx, applicantID) // "check_credit:1"
-		creditScore := creditResult["score"].(int)
+type CreditCheckResult struct {
+	Score int `json:"score"`
+}
 
-		if creditScore >= 700 {
+type LoanResult struct {
+	Status      string `json:"status"`
+	ApplicantID string `json:"applicant_id"`
+}
+
+var loanApproval = romancy.DefineWorkflow("loan_approval",
+	func(ctx *romancy.WorkflowContext, applicantID string) (LoanResult, error) {
+		creditResult, _ := checkCredit.Execute(ctx, applicantID) // "check_credit:1"
+
+		if creditResult.Score >= 700 {
 			result, _ := approve.Execute(ctx, applicantID)  // "approve:1"
 			return result, nil
 		} else {
@@ -350,11 +393,20 @@ var loanApproval = romancy.DefineWorkflow("loan_approval",
 Manual activity ID specification is **required ONLY** for concurrent execution using goroutines:
 
 ```go
+type FetchResult struct {
+	URL     string `json:"url"`
+	Content string `json:"content"`
+}
+
+type ConcurrentResult struct {
+	Results []FetchResult `json:"results"`
+}
+
 var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
-	func(ctx *romancy.WorkflowContext, urls []string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, urls []string) (ConcurrentResult, error) {
 		// Manual IDs required for concurrent execution
 		var wg sync.WaitGroup
-		results := make([]map[string]any, len(urls))
+		results := make([]FetchResult, len(urls))
 
 		for i, url := range urls {
 			wg.Add(1)
@@ -368,7 +420,7 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 		}
 
 		wg.Wait()
-		return map[string]any{"results": results}, nil
+		return ConcurrentResult{Results: results}, nil
 	},
 )
 ```
@@ -405,13 +457,22 @@ result2, _ := activityTwo.Execute(ctx, data, romancy.WithActivityID("activity_tw
 **Example:**
 
 ```go
+type OnboardingResult struct {
+	Status string `json:"status"`
+}
+
+type AccountResult struct {
+	AccountID string `json:"account_id"`
+	Email     string `json:"email"`
+}
+
 var userOnboarding = romancy.DefineWorkflow("user_onboarding",
-	func(ctx *romancy.WorkflowContext, userID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, userID string) (OnboardingResult, error) {
 		// Orchestration logic
 		account, _ := createAccount.Execute(ctx, userID)
-		sendWelcomeEmail.Execute(ctx, account["email"].(string))
-		setupPreferences.Execute(ctx, userID)
-		return map[string]any{"status": "completed"}, nil
+		_, _ = sendWelcomeEmail.Execute(ctx, account.Email)
+		_, _ = setupPreferences.Execute(ctx, userID)
+		return OnboardingResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -428,15 +489,15 @@ var userOnboarding = romancy.DefineWorkflow("user_onboarding",
 
 ```go
 var createAccount = romancy.DefineActivity("create_account",
-	func(ctx context.Context, userID string) (map[string]any, error) {
+	func(ctx context.Context, userID string) (AccountResult, error) {
 		// Business logic
 		account, err := db.CreateUser(userID)
 		if err != nil {
-			return nil, err
+			return AccountResult{}, err
 		}
-		return map[string]any{
-			"account_id": account.ID,
-			"email":      account.Email,
+		return AccountResult{
+			AccountID: account.ID,
+			Email:     account.Email,
 		}, nil
 	},
 )
@@ -470,34 +531,55 @@ type UserResult struct {
 	Status    string `json:"status"`
 }
 
+type DatabaseRecordResult struct {
+	AccountID string `json:"account_id"`
+	Email     string `json:"email"`
+	Name      string `json:"name"`
+}
+
+type WelcomeEmailResult struct {
+	Sent  bool   `json:"sent"`
+	Email string `json:"email"`
+}
+
+type ProfileSettings struct {
+	Theme         string `json:"theme"`
+	Notifications bool   `json:"notifications"`
+}
+
+type UserProfileResult struct {
+	ProfileID string          `json:"profile_id"`
+	Settings  ProfileSettings `json:"settings"`
+}
+
 // Activities
 var createDatabaseRecord = romancy.DefineActivity("create_database_record",
-	func(ctx context.Context, userID, email, name string) (map[string]any, error) {
+	func(ctx context.Context, userID, email, name string) (DatabaseRecordResult, error) {
 		fmt.Printf("Creating user %s in database\n", userID)
 		// Simulate database write
-		return map[string]any{
-			"account_id": fmt.Sprintf("ACC-%s", userID),
-			"email":      email,
-			"name":       name,
+		return DatabaseRecordResult{
+			AccountID: fmt.Sprintf("ACC-%s", userID),
+			Email:     email,
+			Name:      name,
 		}, nil
 	},
 )
 
 var sendWelcomeEmail = romancy.DefineActivity("send_welcome_email",
-	func(ctx context.Context, email, name string) (map[string]any, error) {
+	func(ctx context.Context, email, name string) (WelcomeEmailResult, error) {
 		fmt.Printf("Sending welcome email to %s\n", email)
 		// Simulate email service
-		return map[string]any{"sent": true, "email": email}, nil
+		return WelcomeEmailResult{Sent: true, Email: email}, nil
 	},
 )
 
 var createUserProfile = romancy.DefineActivity("create_user_profile",
-	func(ctx context.Context, accountID, name string) (map[string]any, error) {
+	func(ctx context.Context, accountID, name string) (UserProfileResult, error) {
 		fmt.Printf("Creating profile for %s\n", accountID)
 		// Simulate profile creation
-		return map[string]any{
-			"profile_id": fmt.Sprintf("PROF-%s", accountID),
-			"settings":   map[string]any{"theme": "light", "notifications": true},
+		return UserProfileResult{
+			ProfileID: fmt.Sprintf("PROF-%s", accountID),
+			Settings:  ProfileSettings{Theme: "light", Notifications: true},
 		}, nil
 	},
 )
@@ -512,20 +594,20 @@ var userRegistrationWorkflow = romancy.DefineWorkflow("user_registration",
 		}
 
 		// Step 2: Welcome email
-		_, err = sendWelcomeEmail.Execute(ctx, account["email"].(string), account["name"].(string))
+		_, err = sendWelcomeEmail.Execute(ctx, account.Email, account.Name)
 		if err != nil {
 			return UserResult{}, err
 		}
 
 		// Step 3: User profile
-		_, err = createUserProfile.Execute(ctx, account["account_id"].(string), account["name"].(string))
+		_, err = createUserProfile.Execute(ctx, account.AccountID, account.Name)
 		if err != nil {
 			return UserResult{}, err
 		}
 
 		return UserResult{
 			UserID:    input.UserID,
-			AccountID: account["account_id"].(string),
+			AccountID: account.AccountID,
 			Status:    "completed",
 		}, nil
 	},
@@ -565,12 +647,20 @@ func main() {
 ✅ **Good:**
 
 ```go
+type OrderProcessResult struct {
+	Status string `json:"status"`
+}
+
+type InventoryResult struct {
+	Total float64 `json:"total"`
+}
+
 var processOrder = romancy.DefineWorkflow("process_order",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderProcessResult, error) {
 		inventory, _ := reserveInventory.Execute(ctx, orderID)
-		payment, _ := processPayment.Execute(ctx, inventory["total"].(float64))
-		shipOrder.Execute(ctx, orderID)
-		return map[string]any{"status": "completed"}, nil
+		_, _ = processPayment.Execute(ctx, inventory.Total)
+		_, _ = shipOrder.Execute(ctx, orderID)
+		return OrderProcessResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -579,12 +669,12 @@ var processOrder = romancy.DefineWorkflow("process_order",
 
 ```go
 var processOrder = romancy.DefineWorkflow("process_order",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderProcessResult, error) {
 		// Don't put business logic in workflows!
 		inventoryData := db.Query("SELECT ...")  // ❌
 		total := calculateTotal(inventoryData)    // ❌
 		externalAPI.Call(...)                     // ❌
-		return map[string]any{"status": "completed"}, nil
+		return OrderProcessResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -594,14 +684,18 @@ var processOrder = romancy.DefineWorkflow("process_order",
 ✅ **Good:**
 
 ```go
+type SendEmailResult struct {
+	Sent bool `json:"sent"`
+}
+
 var sendEmail = romancy.DefineActivity("send_email",
-	func(ctx context.Context, email, subject string) (map[string]any, error) {
+	func(ctx context.Context, email, subject string) (SendEmailResult, error) {
 		// Single responsibility: send email
-		response, err := emailService.Send(email, subject)
+		_, err := emailService.Send(email, subject)
 		if err != nil {
-			return nil, err
+			return SendEmailResult{}, err
 		}
-		return map[string]any{"sent": true}, nil
+		return SendEmailResult{Sent: true}, nil
 	},
 )
 ```
@@ -610,13 +704,13 @@ var sendEmail = romancy.DefineActivity("send_email",
 
 ```go
 var sendEmailAndUpdateDBAndLog = romancy.DefineActivity("send_email_and_update_db_and_log",
-	func(ctx context.Context, ...) (map[string]any, error) {
+	func(ctx context.Context, ...) (SendEmailResult, error) {
 		// Too many responsibilities!
 		emailService.Send(...)
 		db.Update(...)
 		logger.Log(...)
 		// Break this into 3 separate activities!
-		return nil, nil
+		return SendEmailResult{}, nil
 	},
 )
 ```
@@ -631,10 +725,15 @@ type OrderInput struct {
 	Amount  float64 `json:"amount"`
 }
 
+type OrderWorkflowResult struct {
+	Status  string `json:"status"`
+	OrderID string `json:"order_id"`
+}
+
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, input OrderInput) (map[string]any, error) {
-		// Type-safe, structured input
-		return nil, nil
+	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderWorkflowResult, error) {
+		// Type-safe, structured input and output
+		return OrderWorkflowResult{Status: "completed", OrderID: input.OrderID}, nil
 	},
 )
 ```
@@ -643,9 +742,9 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 
 ```go
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string, amount float64) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string, amount float64) (OrderWorkflowResult, error) {
 		// Multiple parameters - harder to extend, no validation
-		return nil, nil
+		return OrderWorkflowResult{}, nil
 	},
 )
 ```

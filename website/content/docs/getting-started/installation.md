@@ -23,7 +23,7 @@ This installs Romancy with SQLite support, which is perfect for:
 - Testing
 - Single-process deployments
 
-**Important**: For multi-process or multi-pod deployments (K8s, Docker Compose with multiple replicas, etc.), you must use PostgreSQL. SQLite supports multiple goroutines within a single process, but its table-level locking makes it unsuitable for multi-process/multi-pod scenarios.
+**Important**: For multi-process or multi-pod deployments (K8s, Docker Compose with multiple replicas, etc.), you must use PostgreSQL or MySQL 8.0+. SQLite supports multiple goroutines within a single process, but its table-level locking makes it unsuitable for multi-process/multi-pod scenarios.
 
 ## Verifying Installation
 
@@ -40,6 +40,11 @@ import (
 	"github.com/i2y/romancy"
 )
 
+// Result type
+type HelloResult struct {
+	Message string `json:"message"`
+}
+
 // Define an activity
 var helloActivity = romancy.DefineActivity("hello",
 	func(ctx context.Context, name string) (string, error) {
@@ -49,12 +54,12 @@ var helloActivity = romancy.DefineActivity("hello",
 
 // Define a workflow
 var helloWorkflow = romancy.DefineWorkflow("hello_workflow",
-	func(ctx *romancy.WorkflowContext, name string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, name string) (HelloResult, error) {
 		result, err := helloActivity.Execute(ctx, name)
 		if err != nil {
-			return nil, err
+			return HelloResult{}, err
 		}
-		return map[string]any{"message": result}, nil
+		return HelloResult{Message: result}, nil
 	},
 )
 
@@ -110,6 +115,7 @@ Result: map[message:Hello, World!]
 |----------|----------|-------------------|------------------|
 | **SQLite** | Development, testing, single-process apps | Single-process only | Limited |
 | **PostgreSQL** | Production, multi-process/multi-pod systems | Yes | Yes (Recommended) |
+| **MySQL 8.0+** | Production, multi-process systems | Yes | Yes |
 
 ### SQLite (Default)
 
@@ -143,9 +149,9 @@ app := romancy.NewApp(
 
 **Performance limitations:**
 
-- Table-level locking (not row-level like PostgreSQL)
+- Table-level locking (not row-level like PostgreSQL or MySQL)
 - Concurrent writes are serialized, impacting throughput
-- For production with multiple processes/pods, use PostgreSQL
+- For production with multiple processes/pods, use PostgreSQL or MySQL 8.0+
 
 ### PostgreSQL
 
@@ -164,6 +170,36 @@ app := romancy.NewApp(
 	romancy.WithDatabase("postgres://user:password@localhost/romancy_workflows"),
 )
 ```
+
+**PostgreSQL Features:**
+
+- Row-level locking for concurrent access
+- [LISTEN/NOTIFY](/docs/core-features/events/postgres-notify) for real-time event delivery (recommended for low latency)
+- Supports multi-worker deployments
+
+### MySQL 8.0+
+
+1. **Install MySQL 8.0+** (if not already installed)
+
+2. **Create a database**:
+
+```sql
+CREATE DATABASE romancy_workflows;
+```
+
+3. **Configure connection**:
+
+```go
+app := romancy.NewApp(
+	romancy.WithDatabase("mysql://user:password@localhost:3306/romancy_workflows"),
+)
+```
+
+**MySQL Requirements:**
+
+- MySQL 8.0 or higher required (for `FOR UPDATE SKIP LOCKED` support)
+- Row-level locking for concurrent access
+- Supports multi-worker deployments
 
 ## Next Steps
 

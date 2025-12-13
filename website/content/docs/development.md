@@ -15,7 +15,11 @@ This guide explains how to set up and use the Tilt-based development environment
 
 1. Install Tilt:
    ```bash
+   # macOS (Homebrew)
    brew install tilt-dev/tap/tilt
+
+   # Linux/Windows - see https://docs.tilt.dev/install.html
+   curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash
    ```
 
 2. Start the development environment:

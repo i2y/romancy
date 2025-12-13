@@ -29,6 +29,10 @@ import (
 	"github.com/i2y/romancy"
 )
 
+type ReservationResult struct {
+	ReservationID string `json:"reservation_id"`
+}
+
 // Define compensation function
 var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_reservation",
 	func(ctx context.Context, orderID, itemID string) error {
@@ -40,10 +44,10 @@ var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_re
 
 // Define activity with compensation link
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID, itemID string) (map[string]any, error) {
+	func(ctx context.Context, orderID, itemID string) (ReservationResult, error) {
 		// Reserve inventory logic
 		fmt.Printf("Reserved inventory for %s\n", orderID)
-		return map[string]any{"reservation_id": fmt.Sprintf("RES-%s", itemID)}, nil
+		return ReservationResult{ReservationID: fmt.Sprintf("RES-%s", itemID)}, nil
 	},
 	romancy.WithCompensation(cancelInventoryReservation), // Link compensation
 )
@@ -65,18 +69,22 @@ When a workflow fails (returns an error), Romancy automatically:
 Compensation functions always execute in **reverse order** of activity execution:
 
 ```go
+type OrderSagaResult struct {
+	Status string `json:"status"`
+}
+
 var orderSaga = romancy.DefineWorkflow("order_saga",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
-		reserveInventory.Execute(ctx, orderID, "ITEM-123")  // Step 1
-		chargePayment.Execute(ctx, orderID, 99.99)          // Step 2
-		shipOrder.Execute(ctx, orderID)                     // Step 3 (fails)
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderSagaResult, error) {
+		_, _ = reserveInventory.Execute(ctx, orderID, "ITEM-123")  // Step 1
+		_, _ = chargePayment.Execute(ctx, orderID, 99.99)          // Step 2
+		_, _ = shipOrder.Execute(ctx, orderID)                     // Step 3 (fails)
 
 		// On failure, compensations run as:
 		// 1. Compensation for Step 2 (refund payment)
 		// 2. Compensation for Step 1 (cancel reservation)
 		// Step 3 has no compensation as it failed
 
-		return map[string]any{"status": "completed"}, nil
+		return OrderSagaResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -115,6 +123,35 @@ type ShippingAddress struct {
 	City   string `json:"city"`
 }
 
+type OrderInput struct {
+	OrderID string          `json:"order_id"`
+	Items   []OrderItem     `json:"items"`
+	Amount  float64         `json:"amount"`
+	Token   string          `json:"token"`
+	Address ShippingAddress `json:"address"`
+}
+
+// Result structures
+type InventoryReservationResult struct {
+	ReservationIDs []string `json:"reservation_ids"`
+}
+
+type PaymentResult struct {
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
+type ShipmentResult struct {
+	ShipmentID string `json:"shipment_id"`
+}
+
+type OrderProcessingResult struct {
+	OrderID     string                     `json:"order_id"`
+	Reservation InventoryReservationResult `json:"reservation"`
+	Payment     PaymentResult              `json:"payment"`
+	Shipment    ShipmentResult             `json:"shipment"`
+}
+
 // Define compensation functions
 
 var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_reservation",
@@ -134,66 +171,66 @@ var refundPayment = romancy.DefineCompensation("refund_payment",
 // Define activities with compensation links
 
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID string, items []OrderItem) (map[string]any, error) {
+	func(ctx context.Context, orderID string, items []OrderItem) (InventoryReservationResult, error) {
 		fmt.Printf("Reserved inventory for order %s\n", orderID)
 		reservationIDs := make([]string, len(items))
 		for i, item := range items {
 			reservationIDs[i] = fmt.Sprintf("RES-%s", item.ID)
 		}
-		return map[string]any{"reservation_ids": reservationIDs}, nil
+		return InventoryReservationResult{ReservationIDs: reservationIDs}, nil
 	},
 	romancy.WithCompensation(cancelInventoryReservation),
 )
 
 var chargePayment = romancy.DefineActivity("charge_payment",
-	func(ctx context.Context, orderID string, amount float64, cardToken string) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64, cardToken string) (PaymentResult, error) {
 		fmt.Printf("Charged $%.2f for order %s\n", amount, orderID)
-		return map[string]any{
-			"transaction_id": fmt.Sprintf("TXN-%s", orderID),
-			"amount":         amount,
+		return PaymentResult{
+			TransactionID: fmt.Sprintf("TXN-%s", orderID),
+			Amount:        amount,
 		}, nil
 	},
 	romancy.WithCompensation(refundPayment),
 )
 
 var createShipment = romancy.DefineActivity("create_shipment",
-	func(ctx context.Context, orderID string, address ShippingAddress) (map[string]any, error) {
+	func(ctx context.Context, orderID string, address ShippingAddress) (ShipmentResult, error) {
 		fmt.Printf("Creating shipment for order %s\n", orderID)
 		// This might fail if shipping service is unavailable
 		if address.Street == "invalid" {
-			return nil, fmt.Errorf("invalid shipping address")
+			return ShipmentResult{}, fmt.Errorf("invalid shipping address")
 		}
-		return map[string]any{"shipment_id": fmt.Sprintf("SHIP-%s", orderID)}, nil
+		return ShipmentResult{ShipmentID: fmt.Sprintf("SHIP-%s", orderID)}, nil
 	},
 )
 
 // Define the saga workflow
 
 var orderProcessingSaga = romancy.DefineWorkflow("order_processing_saga",
-	func(ctx *romancy.WorkflowContext, orderID string, items []OrderItem, amount float64, cardToken string, shippingAddress ShippingAddress) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderProcessingResult, error) {
 		// Reserve inventory
-		reservation, err := reserveInventory.Execute(ctx, orderID, items)
+		reservation, err := reserveInventory.Execute(ctx, input.OrderID, input.Items)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
 		// Charge payment
-		payment, err := chargePayment.Execute(ctx, orderID, amount, cardToken)
+		payment, err := chargePayment.Execute(ctx, input.OrderID, input.Amount, input.Token)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
 		// Create shipment (might fail)
-		shipment, err := createShipment.Execute(ctx, orderID, shippingAddress)
+		shipment, err := createShipment.Execute(ctx, input.OrderID, input.Address)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
-		return map[string]any{
-			"order_id":    orderID,
-			"reservation": reservation,
-			"payment":     payment,
-			"shipment":    shipment,
+		return OrderProcessingResult{
+			OrderID:     input.OrderID,
+			Reservation: reservation,
+			Payment:     payment,
+			Shipment:    shipment,
 		}, nil
 	},
 )
@@ -248,6 +285,10 @@ func main() {
 Make compensation functions idempotent - they should handle being called multiple times safely:
 
 ```go
+type ChargeResult struct {
+	TransactionID string `json:"transaction_id"`
+}
+
 var refundPayment = romancy.DefineCompensation("refund_payment",
 	func(ctx context.Context, orderID string, amount float64) error {
 		// Check if already refunded
@@ -261,12 +302,12 @@ var refundPayment = romancy.DefineCompensation("refund_payment",
 )
 
 var chargePayment = romancy.DefineActivity("charge_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (ChargeResult, error) {
 		transactionID, err := processPayment(orderID, amount)
 		if err != nil {
-			return nil, err
+			return ChargeResult{}, err
 		}
-		return map[string]any{"transaction_id": transactionID}, nil
+		return ChargeResult{TransactionID: transactionID}, nil
 	},
 	romancy.WithCompensation(refundPayment),
 )
@@ -277,21 +318,26 @@ var chargePayment = romancy.DefineActivity("charge_payment",
 Activities should return data needed for compensation:
 
 ```go
+type ReservationData struct {
+	ReservationIDs []string    `json:"reservation_ids"`
+	Items          []OrderItem `json:"items"`
+}
+
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID string, items []OrderItem) (map[string]any, error) {
+	func(ctx context.Context, orderID string, items []OrderItem) (ReservationData, error) {
 		reservationIDs := make([]string, 0)
 		for _, item := range items {
 			resID, err := reserveItem(item.ID, item.Quantity)
 			if err != nil {
-				return nil, err
+				return ReservationData{}, err
 			}
 			reservationIDs = append(reservationIDs, resID)
 		}
 
 		// Return data needed for compensation
-		return map[string]any{
-			"reservation_ids": reservationIDs,
-			"items":           items,
+		return ReservationData{
+			ReservationIDs: reservationIDs,
+			Items:          items,
 		}, nil
 	},
 	romancy.WithCompensation(cancelReservation),
@@ -303,8 +349,12 @@ var reserveInventory = romancy.DefineActivity("reserve_inventory",
 Consider partial completion within activities:
 
 ```go
+type MultiReservationResult struct {
+	AllReserved []string `json:"all_reserved"`
+}
+
 var reserveMultipleItems = romancy.DefineActivity("reserve_multiple_items",
-	func(ctx context.Context, items []OrderItem) (map[string]any, error) {
+	func(ctx context.Context, items []OrderItem) (MultiReservationResult, error) {
 		reserved := make([]string, 0)
 
 		for _, item := range items {
@@ -314,12 +364,12 @@ var reserveMultipleItems = romancy.DefineActivity("reserve_multiple_items",
 				for _, r := range reserved {
 					cancelReservation(r)
 				}
-				return nil, err
+				return MultiReservationResult{}, err
 			}
 			reserved = append(reserved, resID)
 		}
 
-		return map[string]any{"all_reserved": reserved}, nil
+		return MultiReservationResult{AllReserved: reserved}, nil
 	},
 )
 ```
@@ -329,22 +379,32 @@ var reserveMultipleItems = romancy.DefineActivity("reserve_multiple_items",
 Set appropriate timeouts for compensation functions:
 
 ```go
+type LongRunningInput struct {
+	TaskID string `json:"task_id"`
+	Data   string `json:"data"`
+}
+
+type LongRunningResult struct {
+	TaskID  string `json:"task_id"`
+	Success bool   `json:"success"`
+}
+
 var compensateLongRunning = romancy.DefineCompensation("compensate_long_running",
-	func(ctx context.Context, data map[string]any) error {
+	func(ctx context.Context, input LongRunningInput) error {
 		// Create context with timeout
 		timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
 		// Perform compensation with timeout
-		return performCompensation(timeoutCtx, data)
+		return performCompensation(timeoutCtx, input)
 	},
 )
 
 var longRunningActivity = romancy.DefineActivity("long_running_activity",
-	func(ctx context.Context, data map[string]any) (map[string]any, error) {
-		result, err := performLongOperation(data)
+	func(ctx context.Context, input LongRunningInput) (LongRunningResult, error) {
+		result, err := performLongOperation(input)
 		if err != nil {
-			return nil, err
+			return LongRunningResult{}, err
 		}
 		return result, nil
 	},
@@ -359,6 +419,11 @@ var longRunningActivity = romancy.DefineActivity("long_running_activity",
 You can conditionally execute compensation based on activity results:
 
 ```go
+type ConditionalResult struct {
+	ActionID          string `json:"action_id"`
+	NeedsCompensation bool   `json:"needs_compensation"`
+}
+
 var conditionalCompensation = romancy.DefineCompensation("conditional_compensation",
 	func(ctx context.Context, shouldCompensate bool) error {
 		if !shouldCompensate {
@@ -370,13 +435,15 @@ var conditionalCompensation = romancy.DefineCompensation("conditional_compensati
 )
 
 var conditionalActivity = romancy.DefineActivity("conditional_activity",
-	func(ctx context.Context, shouldCompensate bool) (map[string]any, error) {
-		result, err := performAction()
+	func(ctx context.Context, shouldCompensate bool) (ConditionalResult, error) {
+		actionID, err := performAction()
 		if err != nil {
-			return nil, err
+			return ConditionalResult{}, err
 		}
-		result["needs_compensation"] = shouldCompensate
-		return result, nil
+		return ConditionalResult{
+			ActionID:          actionID,
+			NeedsCompensation: shouldCompensate,
+		}, nil
 	},
 	romancy.WithCompensation(conditionalCompensation),
 )
@@ -387,25 +454,33 @@ var conditionalActivity = romancy.DefineActivity("conditional_activity",
 Sagas can call other sagas, with compensation cascading through the hierarchy:
 
 ```go
+type ParentSagaInput struct {
+	ChildData  ChildInput  `json:"child_data"`
+	ParentData ParentInput `json:"parent_data"`
+}
+
+type ParentSagaResult struct {
+	Child  ChildResult  `json:"child"`
+	Parent ParentResult `json:"parent"`
+}
+
 var parentSaga = romancy.DefineWorkflow("parent_saga",
-	func(ctx *romancy.WorkflowContext, orderData map[string]any) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input ParentSagaInput) (ParentSagaResult, error) {
 		// If child saga fails, its compensations run first
-		childData := orderData["child_data"].(map[string]any)
-		childResult, err := childSaga.Execute(ctx, childData)
+		childResult, err := childSaga.Execute(ctx, input.ChildData)
 		if err != nil {
-			return nil, err
+			return ParentSagaResult{}, err
 		}
 
 		// Then parent activities
-		parentData := orderData["parent_data"].(map[string]any)
-		parentResult, err := parentActivity.Execute(ctx, parentData)
+		parentResult, err := parentActivity.Execute(ctx, input.ParentData)
 		if err != nil {
-			return nil, err
+			return ParentSagaResult{}, err
 		}
 
-		return map[string]any{
-			"child":  childResult,
-			"parent": parentResult,
+		return ParentSagaResult{
+			Child:  childResult,
+			Parent: parentResult,
 		}, nil
 	},
 )
@@ -416,16 +491,25 @@ var parentSaga = romancy.DefineWorkflow("parent_saga",
 While Romancy handles automatic compensation, you can also manually trigger compensation:
 
 ```go
+type RiskyInput struct {
+	ActionType string `json:"action_type"`
+}
+
+type RiskyResult struct {
+	Success       bool `json:"success"`
+	NeedsRollback bool `json:"needs_rollback"`
+}
+
 var manualCompensationSaga = romancy.DefineWorkflow("manual_compensation_saga",
-	func(ctx *romancy.WorkflowContext, data map[string]any) (map[string]any, error) {
-		result, err := riskyActivity.Execute(ctx, data)
+	func(ctx *romancy.WorkflowContext, input RiskyInput) (RiskyResult, error) {
+		result, err := riskyActivity.Execute(ctx, input)
 		if err != nil {
-			return nil, err
+			return RiskyResult{}, err
 		}
 
-		if result["needs_rollback"].(bool) {
+		if result.NeedsRollback {
 			// Manually trigger compensation by returning error
-			return nil, fmt.Errorf("manual rollback triggered")
+			return RiskyResult{}, fmt.Errorf("manual rollback triggered")
 		}
 
 		return result, nil
@@ -458,26 +542,36 @@ var manualCompensationSaga = romancy.DefineWorkflow("manual_compensation_saga",
 Add detailed logging to compensation functions:
 
 ```go
-var compensateCritical = romancy.DefineCompensation("compensate_critical",
-	func(ctx context.Context, data map[string]any) error {
-		log.Printf("Starting compensation for %v\n", data["id"])
+type CriticalInput struct {
+	ID   string `json:"id"`
+	Data string `json:"data"`
+}
 
-		err := performCompensation(data)
+type CriticalResult struct {
+	ID      string `json:"id"`
+	Success bool   `json:"success"`
+}
+
+var compensateCritical = romancy.DefineCompensation("compensate_critical",
+	func(ctx context.Context, input CriticalInput) error {
+		log.Printf("Starting compensation for %s\n", input.ID)
+
+		err := performCompensation(input)
 		if err != nil {
 			log.Printf("Compensation failed: %v\n", err)
 			return err
 		}
 
-		log.Printf("Compensation successful for %v\n", data["id"])
+		log.Printf("Compensation successful for %s\n", input.ID)
 		return nil
 	},
 )
 
 var criticalActivity = romancy.DefineActivity("critical_activity",
-	func(ctx context.Context, data map[string]any) (map[string]any, error) {
-		result, err := performCriticalOperation(data)
+	func(ctx context.Context, input CriticalInput) (CriticalResult, error) {
+		result, err := performCriticalOperation(input)
 		if err != nil {
-			return nil, err
+			return CriticalResult{}, err
 		}
 		return result, nil
 	},

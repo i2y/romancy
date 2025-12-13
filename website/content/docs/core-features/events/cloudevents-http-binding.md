@@ -5,6 +5,83 @@ weight: 2
 
 Romancy fully supports the [CloudEvents HTTP Protocol Binding specification](https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/bindings/http-protocol-binding), ensuring reliable event delivery and proper error handling.
 
+## Server Setup
+
+Romancy's `App` implements `http.Handler`, allowing easy integration with any HTTP server or router.
+
+### Standalone Server
+
+The simplest way to start receiving CloudEvents:
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+
+	"github.com/i2y/romancy"
+)
+
+func main() {
+	ctx := context.Background()
+
+	app := romancy.NewApp(romancy.WithDatabase("app.db"))
+	if err := app.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	defer app.Shutdown(ctx)
+
+	// Start CloudEvents server on port 8080
+	log.Println("Listening for CloudEvents on :8080")
+	log.Fatal(app.ListenAndServe(":8080"))
+}
+```
+
+### Integration with net/http
+
+Mount the handler on an existing HTTP server:
+
+```go
+app := romancy.NewApp(romancy.WithDatabase("app.db"))
+app.Start(ctx)
+
+// Mount as http.Handler
+http.Handle("/events/", http.StripPrefix("/events", app.Handler()))
+http.ListenAndServe(":8080", nil)
+```
+
+### Integration with Popular Routers
+
+**Gin:**
+```go
+r := gin.Default()
+r.Any("/events/*path", gin.WrapH(app.Handler()))
+```
+
+**Chi:**
+```go
+r := chi.NewRouter()
+r.Mount("/events", app.Handler())
+```
+
+**Echo:**
+```go
+e := echo.New()
+e.Any("/events/*", echo.WrapHandler(app.Handler()))
+```
+
+### Handler Endpoints
+
+The `app.Handler()` returns an `http.Handler` that provides:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | POST | Receive CloudEvents |
+| `/health/live` | GET | Liveness probe |
+| `/health/ready` | GET | Readiness probe |
+| `/cancel/{instanceID}` | POST | Cancel a workflow |
+
 ## CloudEvents Content Modes
 
 Romancy supports both CloudEvents content modes:

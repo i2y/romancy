@@ -412,19 +412,24 @@ func (h *MyHooks) OnActivityComplete(ctx context.Context, instanceID, activityID
 	}
 }
 
+// Result type
+type GreetingResult struct {
+	Message string `json:"message"`
+}
+
 // Activity
 var greetUser = romancy.DefineActivity("greet_user",
-	func(ctx context.Context, name string) (map[string]any, error) {
-		return map[string]any{"message": "Hello, " + name}, nil
+	func(ctx context.Context, name string) (GreetingResult, error) {
+		return GreetingResult{Message: "Hello, " + name}, nil
 	},
 )
 
 // Workflow
 var greetingWorkflow = romancy.DefineWorkflow("greeting_workflow",
-	func(ctx *romancy.WorkflowContext, name string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, name string) (GreetingResult, error) {
 		result, err := greetUser.Execute(ctx, name)
 		if err != nil {
-			return nil, err
+			return GreetingResult{}, err
 		}
 		return result, nil
 	},

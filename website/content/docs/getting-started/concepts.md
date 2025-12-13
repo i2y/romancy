@@ -14,14 +14,19 @@ Romancy separates orchestration logic (**workflows**) from business logic (**act
 **Activity**: A unit of work that performs business logic.
 
 ```go
+type EmailResult struct {
+	Sent      bool   `json:"sent"`
+	MessageID string `json:"message_id"`
+}
+
 var sendEmail = romancy.DefineActivity("send_email",
-	func(ctx context.Context, email, message string) (map[string]any, error) {
+	func(ctx context.Context, email, message string) (EmailResult, error) {
 		// Business logic - sends an actual email
 		response, err := emailService.Send(email, message)
 		if err != nil {
-			return nil, err
+			return EmailResult{}, err
 		}
-		return map[string]any{"sent": true, "message_id": response.ID}, nil
+		return EmailResult{Sent: true, MessageID: response.ID}, nil
 	},
 )
 ```
@@ -38,27 +43,36 @@ var sendEmail = romancy.DefineActivity("send_email",
 **Workflow**: Orchestration logic that coordinates activities.
 
 ```go
+type UserResult struct {
+	UserID string `json:"user_id"`
+}
+
+type SignupResult struct {
+	UserID string `json:"user_id"`
+	Status string `json:"status"`
+}
+
 var userSignup = romancy.DefineWorkflow("user_signup",
-	func(ctx *romancy.WorkflowContext, email, name string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, email, name string) (SignupResult, error) {
 		// Step 1: Create user account
 		user, err := createAccount.Execute(ctx, email, name)
 		if err != nil {
-			return nil, err
+			return SignupResult{}, err
 		}
 
 		// Step 2: Send welcome email
 		_, err = sendEmail.Execute(ctx, email, fmt.Sprintf("Welcome, %s!", name))
 		if err != nil {
-			return nil, err
+			return SignupResult{}, err
 		}
 
 		// Step 3: Initialize user settings
-		_, err = setupDefaultSettings.Execute(ctx, user["user_id"].(string))
+		_, err = setupDefaultSettings.Execute(ctx, user.UserID)
 		if err != nil {
-			return nil, err
+			return SignupResult{}, err
 		}
 
-		return map[string]any{"user_id": user["user_id"], "status": "active"}, nil
+		return SignupResult{UserID: user.UserID, Status: "active"}, nil
 	},
 )
 ```
@@ -77,12 +91,17 @@ Romancy ensures workflow progress is never lost through **deterministic replay**
 ### How It Works
 
 ```go
+type ProcessOrderResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 var processOrder = romancy.DefineWorkflow("process_order",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (ProcessOrderResult, error) {
 		// Step 1: Reserve inventory
 		reservation, err := reserveInventory.Execute(ctx, orderID) // Saved to history
 		if err != nil {
-			return nil, err
+			return ProcessOrderResult{}, err
 		}
 
 		// Process crashes here!
@@ -90,10 +109,10 @@ var processOrder = romancy.DefineWorkflow("process_order",
 		// Step 2: Charge payment
 		payment, err := chargePayment.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return ProcessOrderResult{}, err
 		}
 
-		return map[string]any{"order_id": orderID, "status": "completed"}, nil
+		return ProcessOrderResult{OrderID: orderID, Status: "completed"}, nil
 	},
 )
 ```
@@ -133,6 +152,15 @@ This implements the [Saga pattern](https://microservices.io/patterns/data/saga.h
 ### Basic Compensation
 
 ```go
+type ReservationResult struct {
+	Reserved bool   `json:"reserved"`
+	ItemID   string `json:"item_id"`
+}
+
+type OrderWorkflowResult struct {
+	Status string `json:"status"`
+}
+
 // Compensation function
 var cancelReservation = romancy.DefineCompensation("cancel_reservation",
 	func(ctx context.Context, itemID string) error {
@@ -143,30 +171,30 @@ var cancelReservation = romancy.DefineCompensation("cancel_reservation",
 
 // Activity with compensation
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, itemID string) (map[string]any, error) {
+	func(ctx context.Context, itemID string) (ReservationResult, error) {
 		log.Printf("Reserved %s", itemID)
-		return map[string]any{"reserved": true, "item_id": itemID}, nil
+		return ReservationResult{Reserved: true, ItemID: itemID}, nil
 	},
 	romancy.WithCompensation(cancelReservation),
 )
 
 // Workflow
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, item1, item2 string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, item1, item2 string) (OrderWorkflowResult, error) {
 		_, err := reserveInventory.Execute(ctx, item1) // Step 1
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 		_, err = reserveInventory.Execute(ctx, item2) // Step 2
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 		_, err = chargePayment.Execute(ctx) // Step 3: Fails!
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
-		return map[string]any{"status": "completed"}, nil
+		return OrderWorkflowResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -201,57 +229,69 @@ Romancy is well-suited for orchestrating AI agent workflows that involve long-ru
 ### Example: Research Agent Workflow
 
 ```go
+type ResearchResult struct {
+	Research string `json:"research"`
+}
+
+type AnalysisResult struct {
+	Analysis string `json:"analysis"`
+}
+
+type ReportResult struct {
+	Report string `json:"report"`
+}
+
 var researchTopic = romancy.DefineActivity("research_topic",
-	func(ctx context.Context, topic string) (map[string]any, error) {
+	func(ctx context.Context, topic string) (ResearchResult, error) {
 		// Call LLM to research a topic (may take minutes)
 		result, err := llmClient.Generate(fmt.Sprintf("Research: %s", topic))
 		if err != nil {
-			return nil, err
+			return ResearchResult{}, err
 		}
-		return map[string]any{"research": result}, nil
+		return ResearchResult{Research: result}, nil
 	},
 )
 
 var analyzeResearch = romancy.DefineActivity("analyze_research",
-	func(ctx context.Context, research string) (map[string]any, error) {
+	func(ctx context.Context, research string) (AnalysisResult, error) {
 		// Analyze research results with another LLM call
 		analysis, err := llmClient.Generate(fmt.Sprintf("Analyze: %s", research))
 		if err != nil {
-			return nil, err
+			return AnalysisResult{}, err
 		}
-		return map[string]any{"analysis": analysis}, nil
+		return AnalysisResult{Analysis: analysis}, nil
 	},
 )
 
 var synthesizeReport = romancy.DefineActivity("synthesize_report",
-	func(ctx context.Context, analysis string) (map[string]any, error) {
+	func(ctx context.Context, analysis string) (ReportResult, error) {
 		// Create final report
 		report, err := llmClient.Generate(fmt.Sprintf("Report: %s", analysis))
 		if err != nil {
-			return nil, err
+			return ReportResult{}, err
 		}
-		return map[string]any{"report": report}, nil
+		return ReportResult{Report: report}, nil
 	},
 )
 
 var aiResearchWorkflow = romancy.DefineWorkflow("ai_research_workflow",
-	func(ctx *romancy.WorkflowContext, topic string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, topic string) (ReportResult, error) {
 		// Step 1: Research (may take 2-3 minutes)
 		research, err := researchTopic.Execute(ctx, topic)
 		if err != nil {
-			return nil, err
+			return ReportResult{}, err
 		}
 
 		// Step 2: Analyze (if crash happens here, Step 1 won't re-run)
-		analysis, err := analyzeResearch.Execute(ctx, research["research"].(string))
+		analysis, err := analyzeResearch.Execute(ctx, research.Research)
 		if err != nil {
-			return nil, err
+			return ReportResult{}, err
 		}
 
 		// Step 3: Synthesize
-		report, err := synthesizeReport.Execute(ctx, analysis["analysis"].(string))
+		report, err := synthesizeReport.Execute(ctx, analysis.Analysis)
 		if err != nil {
-			return nil, err
+			return ReportResult{}, err
 		}
 
 		return report, nil

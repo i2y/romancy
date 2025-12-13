@@ -22,39 +22,60 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/i2y/romancy"
 )
 
+// Result types for activities
+type GreetResult struct {
+	Message string `json:"message"`
+}
+
+type ProcessResult struct {
+	Processed string `json:"processed"`
+	Length    int    `json:"length"`
+}
+
+type FinalizeInput struct {
+	Greeting GreetResult   `json:"greeting"`
+	Process  ProcessResult `json:"process"`
+}
+
+type FinalResult struct {
+	Status string        `json:"status"`
+	Input  FinalizeInput `json:"input"`
+}
+
 // greetUser activity that greets a user
 var greetUser = romancy.DefineActivity("greet_user",
-	func(ctx context.Context, name string) (map[string]any, error) {
+	func(ctx context.Context, name string) (GreetResult, error) {
 		fmt.Printf("[Activity] Greeting user: %s\n", name)
-		return map[string]any{
-			"message": fmt.Sprintf("Hello, %s!", name),
+		return GreetResult{
+			Message: fmt.Sprintf("Hello, %s!", name),
 		}, nil
 	},
 )
 
 // processData activity that processes some data
 var processData = romancy.DefineActivity("process_data",
-	func(ctx context.Context, data string) (map[string]any, error) {
+	func(ctx context.Context, data string) (ProcessResult, error) {
 		fmt.Printf("[Activity] Processing data: %s\n", data)
 		processed := strings.ToUpper(data)
-		return map[string]any{
-			"processed": processed,
-			"length":    len(processed),
+		return ProcessResult{
+			Processed: processed,
+			Length:    len(processed),
 		}, nil
 	},
 )
 
 // finalize activity that finalizes the workflow
 var finalize = romancy.DefineActivity("finalize",
-	func(ctx context.Context, result map[string]any) (map[string]any, error) {
-		fmt.Printf("[Activity] Finalizing with result: %v\n", result)
-		return map[string]any{
-			"status":       "completed",
-			"final_result": result,
+	func(ctx context.Context, input FinalizeInput) (FinalResult, error) {
+		fmt.Printf("[Activity] Finalizing with input: %v\n", input)
+		return FinalResult{
+			Status: "completed",
+			Input:  input,
 		}, nil
 	},
 )
@@ -71,32 +92,38 @@ import (
 	"github.com/i2y/romancy"
 )
 
+// SimpleInput defines the workflow input
+type SimpleInput struct {
+	Name string `json:"name"`
+	Data string `json:"data"`
+}
+
 // simpleWorkflow coordinates multiple activities
 var simpleWorkflow = romancy.DefineWorkflow("simple_workflow",
-	func(ctx *romancy.WorkflowContext, input SimpleInput) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input SimpleInput) (FinalResult, error) {
 		fmt.Printf("[Workflow] Starting simple_workflow for %s\n", input.Name)
 
 		// Step 1: Greet the user
 		greetingResult, err := greetUser.Execute(ctx, input.Name)
 		if err != nil {
-			return nil, err
+			return FinalResult{}, err
 		}
 		fmt.Printf("[Workflow] Step 1 completed: %v\n", greetingResult)
 
 		// Step 2: Process data
 		processResult, err := processData.Execute(ctx, input.Data)
 		if err != nil {
-			return nil, err
+			return FinalResult{}, err
 		}
 		fmt.Printf("[Workflow] Step 2 completed: %v\n", processResult)
 
 		// Step 3: Finalize
-		finalResult, err := finalize.Execute(ctx, map[string]any{
-			"greeting":   greetingResult,
-			"processing": processResult,
+		finalResult, err := finalize.Execute(ctx, FinalizeInput{
+			Greeting: greetingResult,
+			Process:  processResult,
 		})
 		if err != nil {
-			return nil, err
+			return FinalResult{}, err
 		}
 		fmt.Printf("[Workflow] Step 3 completed: %v\n", finalResult)
 
@@ -104,12 +131,6 @@ var simpleWorkflow = romancy.DefineWorkflow("simple_workflow",
 		return finalResult, nil
 	},
 )
-
-// SimpleInput defines the workflow input
-type SimpleInput struct {
-	Name string `json:"name"`
-	Data string `json:"data"`
-}
 ```
 
 ### Run the Workflow
@@ -207,34 +228,54 @@ type SimpleInput struct {
 	Data string `json:"data"`
 }
 
+// Result types for activities
+type GreetResult struct {
+	Message string `json:"message"`
+}
+
+type ProcessResult struct {
+	Processed string `json:"processed"`
+	Length    int    `json:"length"`
+}
+
+type FinalizeInput struct {
+	Greeting GreetResult   `json:"greeting"`
+	Process  ProcessResult `json:"process"`
+}
+
+type FinalResult struct {
+	Status string        `json:"status"`
+	Input  FinalizeInput `json:"input"`
+}
+
 // Activities
 
 var greetUser = romancy.DefineActivity("greet_user",
-	func(ctx context.Context, name string) (map[string]any, error) {
+	func(ctx context.Context, name string) (GreetResult, error) {
 		fmt.Printf("[Activity] Greeting user: %s\n", name)
-		return map[string]any{
-			"message": fmt.Sprintf("Hello, %s!", name),
+		return GreetResult{
+			Message: fmt.Sprintf("Hello, %s!", name),
 		}, nil
 	},
 )
 
 var processData = romancy.DefineActivity("process_data",
-	func(ctx context.Context, data string) (map[string]any, error) {
+	func(ctx context.Context, data string) (ProcessResult, error) {
 		fmt.Printf("[Activity] Processing data: %s\n", data)
 		processed := strings.ToUpper(data)
-		return map[string]any{
-			"processed": processed,
-			"length":    len(processed),
+		return ProcessResult{
+			Processed: processed,
+			Length:    len(processed),
 		}, nil
 	},
 )
 
 var finalize = romancy.DefineActivity("finalize",
-	func(ctx context.Context, result map[string]any) (map[string]any, error) {
-		fmt.Printf("[Activity] Finalizing with result: %v\n", result)
-		return map[string]any{
-			"status":       "completed",
-			"final_result": result,
+	func(ctx context.Context, input FinalizeInput) (FinalResult, error) {
+		fmt.Printf("[Activity] Finalizing with input: %v\n", input)
+		return FinalResult{
+			Status: "completed",
+			Input:  input,
 		}, nil
 	},
 )
@@ -242,30 +283,30 @@ var finalize = romancy.DefineActivity("finalize",
 // Workflow
 
 var simpleWorkflow = romancy.DefineWorkflow("simple_workflow",
-	func(ctx *romancy.WorkflowContext, input SimpleInput) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input SimpleInput) (FinalResult, error) {
 		fmt.Printf("[Workflow] Starting simple_workflow for %s\n", input.Name)
 
 		// Step 1: Greet the user
 		greetingResult, err := greetUser.Execute(ctx, input.Name)
 		if err != nil {
-			return nil, err
+			return FinalResult{}, err
 		}
 		fmt.Printf("[Workflow] Step 1 completed: %v\n", greetingResult)
 
 		// Step 2: Process data
 		processResult, err := processData.Execute(ctx, input.Data)
 		if err != nil {
-			return nil, err
+			return FinalResult{}, err
 		}
 		fmt.Printf("[Workflow] Step 2 completed: %v\n", processResult)
 
 		// Step 3: Finalize
-		finalResult, err := finalize.Execute(ctx, map[string]any{
-			"greeting":   greetingResult,
-			"processing": processResult,
+		finalResult, err := finalize.Execute(ctx, FinalizeInput{
+			Greeting: greetingResult,
+			Process:  processResult,
 		})
 		if err != nil {
-			return nil, err
+			return FinalResult{}, err
 		}
 		fmt.Printf("[Workflow] Step 3 completed: %v\n", finalResult)
 
@@ -320,11 +361,20 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type ItemResult struct {
+	Item      string `json:"item"`
+	Processed string `json:"processed"`
+}
+
+type ConcurrentResult struct {
+	Results []ItemResult `json:"results"`
+}
+
 var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
-	func(ctx *romancy.WorkflowContext, items []string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, items []string) (ConcurrentResult, error) {
 		// Concurrent execution with errgroup
-		g, gctx := errgroup.WithContext(ctx.Context())
-		results := make([]map[string]any, len(items))
+		g, _ := errgroup.WithContext(ctx.Context())
+		results := make([]ItemResult, len(items))
 
 		for i, item := range items {
 			i, item := i, item // Capture loop variables
@@ -340,10 +390,10 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 		}
 
 		if err := g.Wait(); err != nil {
-			return nil, err
+			return ConcurrentResult{}, err
 		}
 
-		return map[string]any{"results": results}, nil
+		return ConcurrentResult{Results: results}, nil
 	},
 )
 ```

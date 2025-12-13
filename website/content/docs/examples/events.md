@@ -38,25 +38,37 @@ import (
 	"github.com/i2y/romancy"
 )
 
+// Result types
+type PaymentStartResult struct {
+	PaymentID string `json:"payment_id"`
+	Status    string `json:"status"`
+}
+
+type PaymentWorkflowResult struct {
+	Status        string `json:"status"`
+	TransactionID string `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
 var startPaymentProcessing = romancy.DefineActivity("start_payment_processing",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (PaymentStartResult, error) {
 		fmt.Printf("🔄 Starting payment for order %s\n", orderID)
 		// Call external payment service API...
-		return map[string]any{
-			"payment_id": fmt.Sprintf("PAY-%s", orderID),
-			"status":     "pending",
+		return PaymentStartResult{
+			PaymentID: fmt.Sprintf("PAY-%s", orderID),
+			Status:    "pending",
 		}, nil
 	},
 )
 
 var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (PaymentWorkflowResult, error) {
 		// Step 1: Start payment processing
 		payment, err := startPaymentProcessing.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return PaymentWorkflowResult{}, err
 		}
-		fmt.Printf("Payment started: %s\n", payment["payment_id"])
+		fmt.Printf("Payment started: %s\n", payment.PaymentID)
 
 		// Step 2: Wait for payment completion event
 		// Workflow pauses here, worker process is released
@@ -65,14 +77,20 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 			romancy.WithTimeout(5*time.Minute), // 5-minute timeout
 		)
 		if err != nil {
-			return nil, err
+			return PaymentWorkflowResult{}, err
 		}
 
-		// Step 3: Process payment result
+		// Step 3: Parse and process payment result
+		var paymentResult PaymentCompleted
+		if err := romancy.DecodeEventData(event.Data, &paymentResult); err != nil {
+			return PaymentWorkflowResult{}, fmt.Errorf("invalid payment event: %w", err)
+		}
+
 		fmt.Printf("✅ Payment completed: %v\n", event.Data)
-		return map[string]any{
-			"status":         "completed",
-			"payment_result": event.Data,
+		return PaymentWorkflowResult{
+			Status:        "completed",
+			TransactionID: paymentResult.TransactionID,
+			Amount:        paymentResult.Amount,
 		}, nil
 	},
 )
@@ -91,33 +109,51 @@ import (
 	"github.com/i2y/romancy"
 )
 
+// Result types
+type OrderResult struct {
+	OrderID string `json:"order_id"`
+}
+
+type PaymentStatusResult struct {
+	Paid bool `json:"paid"`
+}
+
+type CancelResult struct {
+	Cancelled bool `json:"cancelled"`
+}
+
+type OrderTimeoutResult struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (OrderResult, error) {
 		fmt.Printf("📦 Creating order %s\n", orderID)
-		return map[string]any{"order_id": orderID}, nil
+		return OrderResult{OrderID: orderID}, nil
 	},
 )
 
 var checkPaymentStatus = romancy.DefineActivity("check_payment_status",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (PaymentStatusResult, error) {
 		// Check payment status from external service
-		return map[string]any{"paid": false}, nil
+		return PaymentStatusResult{Paid: false}, nil
 	},
 )
 
 var cancelOrder = romancy.DefineActivity("cancel_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (CancelResult, error) {
 		fmt.Printf("🚫 Cancelling order %s\n", orderID)
-		return map[string]any{"cancelled": true}, nil
+		return CancelResult{Cancelled: true}, nil
 	},
 )
 
 var orderWithTimeout = romancy.DefineWorkflow("order_with_timeout",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderTimeoutResult, error) {
 		// Step 1: Create order
 		_, err := createOrder.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderTimeoutResult{}, err
 		}
 		fmt.Printf("Order %s created\n", orderID)
 
@@ -125,30 +161,30 @@ var orderWithTimeout = romancy.DefineWorkflow("order_with_timeout",
 		fmt.Println("⏱️  Sleeping 60 seconds before checking payment...")
 		err = romancy.Sleep(ctx, 60*time.Second)
 		if err != nil {
-			return nil, err
+			return OrderTimeoutResult{}, err
 		}
 
 		// Step 3: Check payment status
 		status, err := checkPaymentStatus.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderTimeoutResult{}, err
 		}
 
-		if paid, ok := status["paid"].(bool); ok && paid {
+		if status.Paid {
 			fmt.Println("✅ Payment received!")
-			return map[string]any{"status": "completed"}, nil
+			return OrderTimeoutResult{Status: "completed"}, nil
 		}
 
 		// Step 4: Cancel order due to timeout
 		fmt.Println("❌ Payment timeout - cancelling order")
 		_, err = cancelOrder.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderTimeoutResult{}, err
 		}
 
-		return map[string]any{
-			"status": "cancelled",
-			"reason": "payment_timeout",
+		return OrderTimeoutResult{
+			Status: "cancelled",
+			Reason: "payment_timeout",
 		}, nil
 	},
 )
@@ -190,7 +226,6 @@ Define Go structs for type-safe event data access:
 package main
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -205,33 +240,38 @@ type PaymentCompleted struct {
 	Status        string  `json:"status"`
 }
 
+type PaymentTypedResult struct {
+	Status string  `json:"status"`
+	Amount float64 `json:"amount"`
+}
+
 var paymentWorkflowTyped = romancy.DefineWorkflow("payment_workflow_typed",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (PaymentTypedResult, error) {
 		// Wait for event
 		event, err := romancy.WaitEvent(ctx, "payment.completed",
 			romancy.WithTimeout(5*time.Minute),
 		)
 		if err != nil {
-			return nil, err
+			return PaymentTypedResult{}, err
 		}
 
 		// Parse event data into struct
 		var payment PaymentCompleted
 		if err := romancy.DecodeEventData(event.Data, &payment); err != nil {
-			return nil, fmt.Errorf("invalid payment event: %w", err)
+			return PaymentTypedResult{}, fmt.Errorf("invalid payment event: %w", err)
 		}
 
 		// Type-safe access
-		amount := payment.Amount           // float64
+		amount := payment.Amount              // float64
 		transactionID := payment.TransactionID // string
-		orderID = payment.OrderID          // string
+		orderID = payment.OrderID              // string
 
 		fmt.Printf("✅ Payment of $%.2f completed for order %s\n", amount, orderID)
 		fmt.Printf("   Transaction ID: %s\n", transactionID)
 
-		return map[string]any{
-			"status": "completed",
-			"amount": amount,
+		return PaymentTypedResult{
+			Status: "completed",
+			Amount: amount,
 		}, nil
 	},
 )
@@ -262,19 +302,21 @@ amount := payment.Amount  // float64, type-safe
 ### 1. Resource Efficiency
 
 ```go
+type EmptyResult struct{}
+
 // ❌ Bad: Keeps goroutine running for 1 hour
 var badWorkflow = romancy.DefineWorkflow("bad_workflow",
-	func(ctx *romancy.WorkflowContext, input string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input string) (EmptyResult, error) {
 		time.Sleep(time.Hour) // Goroutine held in memory!
-		return nil, nil
+		return EmptyResult{}, nil
 	},
 )
 
 // ✅ Good: Persists state and releases goroutine
 var goodWorkflow = romancy.DefineWorkflow("good_workflow",
-	func(ctx *romancy.WorkflowContext, input string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input string) (EmptyResult, error) {
 		romancy.Sleep(ctx, time.Hour) // Memory freed!
-		return nil, nil
+		return EmptyResult{}, nil
 	},
 )
 ```
@@ -289,12 +331,16 @@ var goodWorkflow = romancy.DefineWorkflow("good_workflow",
 Perfect for workflows that span hours or days:
 
 ```go
+type LoanApprovalResult struct {
+	Status string `json:"status"`
+}
+
 var loanApprovalWorkflow = romancy.DefineWorkflow("loan_approval_workflow",
-	func(ctx *romancy.WorkflowContext, applicationID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, applicationID string) (LoanApprovalResult, error) {
 		// Submit for manual review
 		_, err := submitForReview.Execute(ctx, applicationID)
 		if err != nil {
-			return nil, err
+			return LoanApprovalResult{}, err
 		}
 
 		// Wait up to 48 hours for approval
@@ -302,16 +348,16 @@ var loanApprovalWorkflow = romancy.DefineWorkflow("loan_approval_workflow",
 			romancy.WithTimeout(48*time.Hour),
 		)
 		if err != nil {
-			return nil, err
+			return LoanApprovalResult{}, err
 		}
 
 		// Process approval
 		_, err = processApproval.Execute(ctx, event.Data)
 		if err != nil {
-			return nil, err
+			return LoanApprovalResult{}, err
 		}
 
-		return map[string]any{"status": "approved"}, nil
+		return LoanApprovalResult{Status: "approved"}, nil
 	},
 )
 ```
@@ -321,27 +367,31 @@ var loanApprovalWorkflow = romancy.DefineWorkflow("loan_approval_workflow",
 Integrate with event-driven systems:
 
 ```go
+type FulfillmentResult struct {
+	Status string `json:"status"`
+}
+
 var orderFulfillment = romancy.DefineWorkflow("order_fulfillment",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (FulfillmentResult, error) {
 		// Wait for warehouse to pack the order
-		packEvent, err := romancy.WaitEvent(ctx, "order.packed")
+		_, err := romancy.WaitEvent(ctx, "order.packed")
 		if err != nil {
-			return nil, err
+			return FulfillmentResult{}, err
 		}
 
 		// Wait for carrier to pick up
-		pickupEvent, err := romancy.WaitEvent(ctx, "order.picked_up")
+		_, err = romancy.WaitEvent(ctx, "order.picked_up")
 		if err != nil {
-			return nil, err
+			return FulfillmentResult{}, err
 		}
 
 		// Wait for delivery confirmation
-		deliveryEvent, err := romancy.WaitEvent(ctx, "order.delivered")
+		_, err = romancy.WaitEvent(ctx, "order.delivered")
 		if err != nil {
-			return nil, err
+			return FulfillmentResult{}, err
 		}
 
-		return map[string]any{"status": "delivered"}, nil
+		return FulfillmentResult{Status: "delivered"}, nil
 	},
 )
 ```
@@ -467,14 +517,26 @@ type PaymentCompleted struct {
 	Status        string  `json:"status"`
 }
 
+// Result types
+type PaymentStartResult struct {
+	PaymentID string `json:"payment_id"`
+	Status    string `json:"status"`
+}
+
+type PaymentWorkflowResult struct {
+	Status        string  `json:"status"`
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
 // Activities
 
 var startPaymentProcessing = romancy.DefineActivity("start_payment_processing",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (PaymentStartResult, error) {
 		fmt.Printf("🔄 Starting payment for order %s\n", orderID)
-		return map[string]any{
-			"payment_id": fmt.Sprintf("PAY-%s", orderID),
-			"status":     "pending",
+		return PaymentStartResult{
+			PaymentID: fmt.Sprintf("PAY-%s", orderID),
+			Status:    "pending",
 		}, nil
 	},
 )
@@ -482,13 +544,13 @@ var startPaymentProcessing = romancy.DefineActivity("start_payment_processing",
 // Workflow
 
 var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (PaymentWorkflowResult, error) {
 		// Step 1: Start payment processing
 		payment, err := startPaymentProcessing.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return PaymentWorkflowResult{}, err
 		}
-		fmt.Printf("Payment started: %s\n", payment["payment_id"])
+		fmt.Printf("Payment started: %s\n", payment.PaymentID)
 
 		// Step 2: Wait for payment completion event
 		fmt.Println("⏸️  Waiting for payment.completed event...")
@@ -496,22 +558,22 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 			romancy.WithTimeout(5*time.Minute),
 		)
 		if err != nil {
-			return nil, err
+			return PaymentWorkflowResult{}, err
 		}
 
 		// Step 3: Parse and process payment result
 		var paymentResult PaymentCompleted
 		if err := romancy.DecodeEventData(event.Data, &paymentResult); err != nil {
-			return nil, fmt.Errorf("invalid payment event: %w", err)
+			return PaymentWorkflowResult{}, fmt.Errorf("invalid payment event: %w", err)
 		}
 
 		fmt.Printf("✅ Payment completed: $%.2f for order %s\n",
 			paymentResult.Amount, paymentResult.OrderID)
 
-		return map[string]any{
-			"status":         "completed",
-			"transaction_id": paymentResult.TransactionID,
-			"amount":         paymentResult.Amount,
+		return PaymentWorkflowResult{
+			Status:        "completed",
+			TransactionID: paymentResult.TransactionID,
+			Amount:        paymentResult.Amount,
 		}, nil
 	},
 )

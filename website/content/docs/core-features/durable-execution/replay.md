@@ -74,8 +74,13 @@ for _, item := range items {
 // Execution order is non-deterministic, so manual IDs are required
 import "golang.org/x/sync/errgroup"
 
+type ProcessResult struct {
+    Status string `json:"status"`
+    Data   string `json:"data"`
+}
+
 var eg errgroup.Group
-var results [3]map[string]any
+var results [3]ProcessResult
 
 eg.Go(func() error {
     r, err := processA.Execute(ctx, data, romancy.WithActivityID("process_a:1"))
@@ -96,7 +101,7 @@ eg.Go(func() error {
 })
 
 if err := eg.Wait(); err != nil {
-    return nil, err
+    return ConcurrentResult{}, err
 }
 ```
 
@@ -120,46 +125,64 @@ import (
 	"github.com/i2y/romancy"
 )
 
+type ReservationResult struct {
+	ReservationID string `json:"reservation_id"`
+	Status        string `json:"status"`
+}
+
+type PaymentResult struct {
+	TransactionID string `json:"transaction_id"`
+	Status        string `json:"status"`
+}
+
+type ShippingResult struct {
+	TrackingNumber string `json:"tracking_number"`
+}
+
+type OrderWorkflowResult struct {
+	Status string `json:"status"`
+}
+
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (ReservationResult, error) {
 		// Business logic here
-		return map[string]any{"reservation_id": "R123", "status": "reserved"}, nil
+		return ReservationResult{ReservationID: "R123", Status: "reserved"}, nil
 	},
 )
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (PaymentResult, error) {
 		// Business logic here
-		return map[string]any{"transaction_id": "T456", "status": "completed"}, nil
+		return PaymentResult{TransactionID: "T456", Status: "completed"}, nil
 	},
 )
 
 var arrangeShipping = romancy.DefineActivity("arrange_shipping",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (ShippingResult, error) {
 		// Business logic here
-		return map[string]any{"tracking_number": "TRACK789"}, nil
+		return ShippingResult{TrackingNumber: "TRACK789"}, nil
 	},
 )
 
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderWorkflowResult, error) {
 		// Activity IDs are auto-generated for sequential calls
-		inventory, err := reserveInventory.Execute(ctx, orderID)
+		_, err := reserveInventory.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
-		payment, err := processPayment.Execute(ctx, orderID)
+		_, err = processPayment.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
-		shipping, err := arrangeShipping.Execute(ctx, orderID)
+		_, err = arrangeShipping.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
-		return map[string]any{"status": "completed"}, nil
+		return OrderWorkflowResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -187,8 +210,22 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 ### Example
 
 ```go
+type BalanceCheckResult struct {
+	Sufficient bool    `json:"sufficient"`
+	Balance    float64 `json:"balance"`
+}
+
+type TransactionResult struct {
+	Amount float64 `json:"amount"`
+	Fee    float64 `json:"fee"`
+}
+
+type ComplexWorkflowResult struct {
+	Status string `json:"status"`
+}
+
 var complexWorkflow = romancy.DefineWorkflow("complex_workflow",
-	func(ctx *romancy.WorkflowContext, amount float64) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, amount float64) (ComplexWorkflowResult, error) {
 		// This code executes every time (including replay)
 		tax := amount * 0.1
 		total := amount + tax
@@ -197,34 +234,34 @@ var complexWorkflow = romancy.DefineWorkflow("complex_workflow",
 		// Activity is skipped during replay (cached)
 		result1, err := checkBalance.Execute(ctx, total)
 		if err != nil {
-			return nil, err
+			return ComplexWorkflowResult{}, err
 		}
 
 		// This if statement is evaluated every time
-		if result1["sufficient"].(bool) {
+		if result1.Sufficient {
 			// This activity is also skipped during replay
 			result2, err := processTransaction.Execute(ctx, total)
 			if err != nil {
-				return nil, err
+				return ComplexWorkflowResult{}, err
 			}
 
 			// This calculation executes every time
-			finalAmount := result2["amount"].(float64) - result2["fee"].(float64)
+			finalAmount := result2.Amount - result2.Fee
 
 			// This activity is also skipped during replay
 			_, err = sendReceipt.Execute(ctx, finalAmount)
 			if err != nil {
-				return nil, err
+				return ComplexWorkflowResult{}, err
 			}
 		} else {
 			// This branch is also evaluated every time
 			_, err := sendRejection.Execute(ctx, "Insufficient balance")
 			if err != nil {
-				return nil, err
+				return ComplexWorkflowResult{}, err
 			}
 		}
 
-		return map[string]any{"status": "completed"}, nil
+		return ComplexWorkflowResult{Status: "completed"}, nil
 	},
 )
 ```
@@ -304,14 +341,18 @@ var getCurrentTime = romancy.DefineActivity("get_current_time",
 	},
 )
 
+type TimestampResult struct {
+	Timestamp string `json:"timestamp"`
+}
+
 var myWorkflow = romancy.DefineWorkflow("my_workflow",
-	func(ctx *romancy.WorkflowContext) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext) (TimestampResult, error) {
 		// Replay will use the same timestamp
 		timestamp, err := getCurrentTime.Execute(ctx)
 		if err != nil {
-			return nil, err
+			return TimestampResult{}, err
 		}
-		return map[string]any{"timestamp": timestamp}, nil
+		return TimestampResult{Timestamp: timestamp}, nil
 	},
 )
 ```
@@ -329,22 +370,28 @@ var generateID = romancy.DefineActivity("generate_id",
 **3. External API calls should be activities (recommended):**
 
 ```go
+type APIData struct {
+	ID     string `json:"id"`
+	Value  string `json:"value"`
+	Status string `json:"status"`
+}
+
 var callExternalAPI = romancy.DefineActivity("call_external_api",
-	func(ctx context.Context) (map[string]any, error) {
+	func(ctx context.Context) (APIData, error) {
 		resp, err := http.Get("https://api.example.com/data")
 		if err != nil {
-			return nil, err
+			return APIData{}, err
 		}
 		defer resp.Body.Close()
 
-		var data map[string]any
+		var data APIData
 		json.NewDecoder(resp.Body).Decode(&data)
 		return data, nil
 	},
 )
 
 var myWorkflow = romancy.DefineWorkflow("my_workflow",
-	func(ctx *romancy.WorkflowContext) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext) (APIData, error) {
 		// Benefits of making it an activity:
 		// - Not re-executed on replay (definitely from cache)
 		// - Easy to test (can be mocked)
@@ -352,7 +399,7 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
 		// - Better performance (network cost reduced)
 		data, err := callExternalAPI.Execute(ctx)
 		if err != nil {
-			return nil, err
+			return APIData{}, err
 		}
 		return data, nil
 	},
@@ -362,8 +409,12 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
 ### ❌ Anti-Patterns
 
 ```go
+type SomeActivityResult struct {
+	Status string `json:"status"`
+}
+
 var badWorkflow = romancy.DefineWorkflow("bad_workflow",
-	func(ctx *romancy.WorkflowContext) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext) (SomeActivityResult, error) {
 		// ❌ Direct time access in workflow (different on replay)
 		timestamp := time.Now()
 		// First run: 2025-01-01 10:00:00
@@ -395,12 +446,21 @@ var badWorkflow = romancy.DefineWorkflow("bad_workflow",
 The most common case is when a workflow resumes after waiting for an external event.
 
 ```go
+type StartPaymentResult struct {
+	PaymentID string `json:"payment_id"`
+}
+
+type CompleteOrderResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (CompleteOrderResult, error) {
 		// Step 1: Start payment
-		payment, err := startPayment.Execute(ctx, orderID)
+		_, err := startPayment.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return CompleteOrderResult{}, err
 		}
 
 		// Step 2: Wait for payment completion event
@@ -410,14 +470,14 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 			romancy.WithTimeout(5*time.Minute),
 		)
 		if err != nil {
-			return nil, err
+			return CompleteOrderResult{}, err
 		}
 
 		// After event received, resume from here (replay happens)
 		// Step 3: Complete order
 		result, err := completeOrder.Execute(ctx, orderID, event)
 		if err != nil {
-			return nil, err
+			return CompleteOrderResult{}, err
 		}
 
 		return result, nil
@@ -633,29 +693,29 @@ err := app.WithWorkflowLock(ctx, instanceID, workerID, func() error {
 
 ```go
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderWorkflowResult, error) {
 		// Activity 1 (auto-generated ID: "reserve_inventory:1")
 		inventory, err := reserveInventory.Execute(ctx, orderID)
 		// → DB saved: activity_id="reserve_inventory:1", result={"reservation_id": "R123"}
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
 		// Activity 2 (auto-generated ID: "process_payment:1")
 		payment, err := processPayment.Execute(ctx, orderID)
 		// → DB saved: activity_id="process_payment:1", result={"transaction_id": "T456"}
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
 		// Activity 3: Error occurs (e.g., network error)
 		shipping, err := arrangeShipping.Execute(ctx, orderID)
 		// → Error, workflow interrupted
 		if err != nil {
-			return nil, err
+			return OrderWorkflowResult{}, err
 		}
 
-		return map[string]any{"status": "completed"}, nil
+		return OrderWorkflowResult{Status: "completed"}, nil
 	},
 )
 ```

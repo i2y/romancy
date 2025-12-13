@@ -48,8 +48,13 @@ import (
 	"github.com/i2y/romancy"
 )
 
+type CreateOrderResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (CreateOrderResult, error) {
 		// Business logic
 		fmt.Printf("Creating order %s\n", orderID)
 
@@ -68,10 +73,10 @@ var createOrder = romancy.DefineActivity("create_order",
 			},
 		)
 		if err != nil {
-			return nil, err
+			return CreateOrderResult{}, err
 		}
 
-		return map[string]any{"order_id": orderID, "status": "created"}, nil
+		return CreateOrderResult{OrderID: orderID, Status: "created"}, nil
 	},
 )
 ```
@@ -145,8 +150,13 @@ type Payment struct {
 	Status  string
 }
 
+type ProcessPaymentResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (ProcessPaymentResult, error) {
 		// Get workflow context
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
@@ -166,7 +176,7 @@ var processPayment = romancy.DefineActivity("process_payment",
 			payment.OrderID, payment.Amount, payment.Status,
 		)
 		if err != nil {
-			return nil, err
+			return ProcessPaymentResult{}, err
 		}
 
 		// Romancy event (same transaction)
@@ -176,14 +186,14 @@ var processPayment = romancy.DefineActivity("process_payment",
 			map[string]any{"order_id": orderID, "amount": amount},
 		)
 		if err != nil {
-			return nil, err
+			return ProcessPaymentResult{}, err
 		}
 
 		// Romancy automatically commits (or rolls back on exception):
 		// 1. Your payment record (same database)
 		// 2. Romancy's outbox event
 		// 3. Romancy's workflow history
-		return map[string]any{"order_id": orderID, "status": "processed"}, nil
+		return ProcessPaymentResult{OrderID: orderID, Status: "processed"}, nil
 	},
 )
 ```
@@ -193,8 +203,12 @@ var processPayment = romancy.DefineActivity("process_payment",
 **Activities automatically manage transactions:**
 
 ```go
+type PaymentResult struct {
+	OrderID string `json:"order_id"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// Access Romancy-managed session
@@ -203,17 +217,17 @@ var processPayment = romancy.DefineActivity("process_payment",
 		// Your business logic
 		_, err := session.Exec("INSERT INTO payments ...")
 		if err != nil {
-			return nil, err // Romancy automatically rolls back
+			return PaymentResult{}, err // Romancy automatically rolls back
 		}
 
 		// Events in same transaction
 		err = romancy.SendEventTransactional(wfCtx, ...)
 		if err != nil {
-			return nil, err // Romancy automatically rolls back
+			return PaymentResult{}, err // Romancy automatically rolls back
 		}
 
 		// Romancy automatically commits on success
-		return map[string]any{"order_id": orderID}, nil
+		return PaymentResult{OrderID: orderID}, nil
 	},
 )
 ```
@@ -264,8 +278,13 @@ Activities are automatically transactional (see [Automatic Transaction Managemen
 Within an activity, you can use `ctx.Transaction()` for savepoints:
 
 ```go
+type OrderWithPaymentResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 var processOrderWithOptionalPayment = romancy.DefineActivity("process_order_with_optional_payment",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (OrderWithPaymentResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 		session := wfCtx.Session()
 
@@ -275,7 +294,7 @@ var processOrderWithOptionalPayment = romancy.DefineActivity("process_order_with
 			orderID, "pending",
 		)
 		if err != nil {
-			return nil, err
+			return OrderWithPaymentResult{}, err
 		}
 
 		err = romancy.SendEventTransactional(wfCtx,
@@ -284,7 +303,7 @@ var processOrderWithOptionalPayment = romancy.DefineActivity("process_order_with
 			map[string]any{"order_id": orderID},
 		)
 		if err != nil {
-			return nil, err
+			return OrderWithPaymentResult{}, err
 		}
 
 		// Nested transaction (savepoint)
@@ -320,12 +339,12 @@ var processOrderWithOptionalPayment = romancy.DefineActivity("process_order_with
 				map[string]any{"order_id": orderID, "reason": "gateway_unavailable"},
 			)
 			if err != nil {
-				return nil, err
+				return OrderWithPaymentResult{}, err
 			}
 		}
 
 		// Outer transaction commits successfully
-		return map[string]any{"order_id": orderID, "status": "created"}, nil
+		return OrderWithPaymentResult{OrderID: orderID, Status: "created"}, nil
 	},
 )
 ```
@@ -584,27 +603,44 @@ for _, event := range events {
 ### 1. Order Processing with Events
 
 ```go
+type InventoryResult struct {
+	TotalAmount float64 `json:"total_amount"`
+}
+
+type ChargeResult struct {
+	TransactionID string `json:"transaction_id"`
+}
+
+type ShipmentResult struct {
+	TrackingNumber string `json:"tracking_number"`
+}
+
+type OrderProcessingResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 var orderProcessingWorkflow = romancy.DefineWorkflow("process_order",
-	func(ctx *romancy.WorkflowContext, orderID string, items []OrderItem) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string, items []OrderItem) (OrderProcessingResult, error) {
 		// Step 1: Reserve inventory
 		// → Sends "inventory.reserved" event
 		inventory, err := reserveInventory.Execute(ctx, orderID, items)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
 		// Step 2: Charge payment
 		// → Sends "payment.charged" event
-		payment, err := chargePayment.Execute(ctx, orderID, inventory["total_amount"].(float64))
+		_, err = chargePayment.Execute(ctx, orderID, inventory.TotalAmount)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
 		// Step 3: Ship order
 		// → Sends "order.shipped" event
-		shipment, err := shipOrder.Execute(ctx, orderID)
+		_, err = shipOrder.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
 		// Final event
@@ -614,10 +650,10 @@ var orderProcessingWorkflow = romancy.DefineWorkflow("process_order",
 			map[string]any{"order_id": orderID, "status": "completed"},
 		)
 		if err != nil {
-			return nil, err
+			return OrderProcessingResult{}, err
 		}
 
-		return map[string]any{"order_id": orderID, "status": "completed"}, nil
+		return OrderProcessingResult{OrderID: orderID, Status: "completed"}, nil
 	},
 )
 ```
@@ -662,8 +698,12 @@ var cancelReservation = romancy.DefineCompensation("cancel_hotel_reservation",
 	},
 )
 
+type ReserveHotelResult struct {
+	ReservationID string `json:"reservation_id"`
+}
+
 var reserveHotel = romancy.DefineActivity("reserve_hotel",
-	func(ctx context.Context, bookingID string) (map[string]any, error) {
+	func(ctx context.Context, bookingID string) (ReserveHotelResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// Reserve hotel
@@ -676,10 +716,10 @@ var reserveHotel = romancy.DefineActivity("reserve_hotel",
 			map[string]any{"reservation_id": reservationID},
 		)
 		if err != nil {
-			return nil, err
+			return ReserveHotelResult{}, err
 		}
 
-		return map[string]any{"reservation_id": reservationID}, nil
+		return ReserveHotelResult{ReservationID: reservationID}, nil
 	},
 	romancy.WithCompensation(cancelReservation),
 )
@@ -694,9 +734,13 @@ var reserveHotel = romancy.DefineActivity("reserve_hotel",
 Activities are **automatically transactional**. All operations within an activity (including `SendEventTransactional()`) are executed within a single transaction.
 
 ```go
+type OrderActivityResult struct {
+	OrderID string `json:"order_id"`
+}
+
 // ✅ Default: Automatic transaction (recommended)
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (OrderActivityResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// All operations are automatically transactional:
@@ -704,16 +748,16 @@ var createOrder = romancy.DefineActivity("create_order",
 		// - Event publishing to outbox
 		err := romancy.SendEventTransactional(wfCtx, "order.created", "order-service", ...)
 		if err != nil {
-			return nil, err
+			return OrderActivityResult{}, err
 		}
 
-		return map[string]any{"order_id": orderID}, nil
+		return OrderActivityResult{OrderID: orderID}, nil
 	},
 )
 
 // ✅ With session access for custom database operations
 var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (OrderActivityResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// Access Romancy-managed session
@@ -722,16 +766,16 @@ var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
 		// Your database operations
 		_, err := session.Exec("INSERT INTO orders (order_id) VALUES (?)", orderID)
 		if err != nil {
-			return nil, err
+			return OrderActivityResult{}, err
 		}
 
 		// Events in same transaction
 		err = romancy.SendEventTransactional(wfCtx, "order.created", "order-service", ...)
 		if err != nil {
-			return nil, err
+			return OrderActivityResult{}, err
 		}
 
-		return map[string]any{"order_id": orderID}, nil
+		return OrderActivityResult{OrderID: orderID}, nil
 	},
 )
 ```
@@ -874,9 +918,14 @@ type Order struct {
 	CreatedAt     time.Time
 }
 
+type EcommerceOrderResult struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
 // Activity with custom database operations
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID, customerEmail string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID, customerEmail string, amount float64) (EcommerceOrderResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// Access Romancy-managed session (same database)
@@ -888,7 +937,7 @@ var createOrder = romancy.DefineActivity("create_order",
 			VALUES (?, ?, ?, ?, ?)
 		`, orderID, customerEmail, amount, "pending", time.Now())
 		if err != nil {
-			return nil, err
+			return EcommerceOrderResult{}, err
 		}
 
 		// 2. Publish event to Romancy's outbox (SAME transaction)
@@ -903,24 +952,24 @@ var createOrder = romancy.DefineActivity("create_order",
 			},
 		)
 		if err != nil {
-			return nil, err
+			return EcommerceOrderResult{}, err
 		}
 
 		// 3. Romancy automatically commits (or rolls back on error)
 		// If event publishing fails, order creation rolls back
 		// If order creation fails, event publishing rolls back
 
-		return map[string]any{"order_id": orderID, "status": "created"}, nil
+		return EcommerceOrderResult{OrderID: orderID, Status: "created"}, nil
 	},
 )
 
 // Workflow
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID, customerEmail string, amount float64) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID, customerEmail string, amount float64) (EcommerceOrderResult, error) {
 		// Create order (atomic with event)
 		result, err := createOrder.Execute(ctx, orderID, customerEmail, amount)
 		if err != nil {
-			return nil, err
+			return EcommerceOrderResult{}, err
 		}
 
 		return result, nil

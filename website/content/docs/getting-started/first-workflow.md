@@ -98,9 +98,26 @@ var refundPayment = romancy.DefineCompensation("refund_payment",
 	},
 )
 
+// Activity result types
+type ReservationResult struct {
+	ReservationID string  `json:"reservation_id"`
+	TotalAmount   float64 `json:"total_amount"`
+}
+
+type PaymentResult struct {
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+	Status        string  `json:"status"`
+}
+
+type ShipmentResult struct {
+	TrackingNumber string `json:"tracking_number"`
+	Status         string `json:"status"`
+}
+
 // Activities with compensation links
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID string, items []OrderItem) (map[string]any, error) {
+	func(ctx context.Context, orderID string, items []OrderItem) (ReservationResult, error) {
 		var total float64
 		for _, item := range items {
 			total += float64(item.Quantity) * item.UnitPrice
@@ -108,22 +125,22 @@ var reserveInventory = romancy.DefineActivity("reserve_inventory",
 
 		fmt.Printf("📦 Reserving inventory for %s: $%.2f\n", orderID, total)
 
-		return map[string]any{
-			"reservation_id": fmt.Sprintf("RES-%s", orderID),
-			"total_amount":   total,
+		return ReservationResult{
+			ReservationID: fmt.Sprintf("RES-%s", orderID),
+			TotalAmount:   total,
 		}, nil
 	},
 	romancy.WithCompensation(cancelInventoryReservation),
 )
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64, customerEmail string) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64, customerEmail string) (PaymentResult, error) {
 		fmt.Printf("💳 Processing payment for %s: $%.2f\n", orderID, amount)
 
-		return map[string]any{
-			"transaction_id": fmt.Sprintf("TXN-%s", orderID),
-			"amount":         amount,
-			"status":         "completed",
+		return PaymentResult{
+			TransactionID: fmt.Sprintf("TXN-%s", orderID),
+			Amount:        amount,
+			Status:        "completed",
 		}, nil
 	},
 	romancy.WithCompensation(refundPayment),
@@ -131,12 +148,12 @@ var processPayment = romancy.DefineActivity("process_payment",
 
 // Activity 3: Ship Order (no compensation - final step)
 var shipOrder = romancy.DefineActivity("ship_order",
-	func(ctx context.Context, orderID string, address ShippingAddress) (map[string]any, error) {
+	func(ctx context.Context, orderID string, address ShippingAddress) (ShipmentResult, error) {
 		fmt.Printf("🚚 Shipping %s to %s, %s\n", orderID, address.City, address.Country)
 
-		return map[string]any{
-			"tracking_number": fmt.Sprintf("TRACK-%s", orderID),
-			"status":          "shipped",
+		return ShipmentResult{
+			TrackingNumber: fmt.Sprintf("TRACK-%s", orderID),
+			Status:         "shipped",
 		}, nil
 	},
 )
@@ -156,8 +173,7 @@ var orderProcessingWorkflow = romancy.DefineWorkflow("order_processing",
 		}
 
 		// Step 2: Process payment
-		totalAmount := reservation["total_amount"].(float64)
-		payment, err := processPayment.Execute(ctx, input.OrderID, totalAmount, input.CustomerEmail)
+		payment, err := processPayment.Execute(ctx, input.OrderID, reservation.TotalAmount, input.CustomerEmail)
 		if err != nil {
 			return OrderResult{}, err
 		}
@@ -172,8 +188,8 @@ var orderProcessingWorkflow = romancy.DefineWorkflow("order_processing",
 		return OrderResult{
 			OrderID:            input.OrderID,
 			Status:             "completed",
-			TotalAmount:        payment["amount"].(float64),
-			ConfirmationNumber: shipment["tracking_number"].(string),
+			TotalAmount:        payment.Amount,
+			ConfirmationNumber: shipment.TrackingNumber,
 		}, nil
 	},
 )
@@ -272,11 +288,11 @@ Modify `shipOrder` to fail:
 
 ```go
 var shipOrder = romancy.DefineActivity("ship_order",
-	func(ctx context.Context, orderID string, address ShippingAddress) (map[string]any, error) {
+	func(ctx context.Context, orderID string, address ShippingAddress) (ShipmentResult, error) {
 		fmt.Printf("🚚 Shipping %s to %s, %s\n", orderID, address.City, address.Country)
 
 		// Simulate shipping failure
-		return nil, fmt.Errorf("shipping service unavailable")
+		return ShipmentResult{}, fmt.Errorf("shipping service unavailable")
 	},
 )
 ```
@@ -380,21 +396,27 @@ Romancy's replay mechanism ensures idempotency:
 **Example:**
 
 ```go
+type PaymentResult struct {
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+	Status        string  `json:"status"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
 		// This code executes ONCE per workflow instance
 		// On crash recovery, cached result is returned
 		fmt.Printf("💳 Processing payment for %s: $%.2f\n", orderID, amount)
 
 		paymentResult, err := externalPaymentAPI.Charge(amount)
 		if err != nil {
-			return nil, err
+			return PaymentResult{}, err
 		}
 
-		return map[string]any{
-			"transaction_id": paymentResult.ID,
-			"amount":         amount,
-			"status":         "completed",
+		return PaymentResult{
+			TransactionID: paymentResult.ID,
+			Amount:        amount,
+			Status:        "completed",
 		}, nil
 	},
 	romancy.WithCompensation(refundPayment),

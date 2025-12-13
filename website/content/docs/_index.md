@@ -28,7 +28,10 @@ Romancy is a lightweight durable execution framework for Go that runs as a **lib
 - 📦 **Transactional Outbox**: Reliable event publishing with guaranteed delivery
 - ☁️ **CloudEvents Support**: Native support for CloudEvents protocol
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers, resume on any available worker
-- 🤖 **MCP Integration**: Expose workflows as MCP tools for AI assistants like Claude Desktop
+- 📨 **Channel-Based Messaging**: Publish/Subscribe with broadcast and competing consumer modes
+- 🔄 **Recur Pattern**: Erlang-style tail recursion for unbounded workflows without history growth
+- 📡 **PostgreSQL LISTEN/NOTIFY**: Real-time event delivery with near-zero latency
+- 🤖 **MCP Integration**: Expose workflows as MCP tools for AI assistants
 
 ## Use Cases
 
@@ -55,20 +58,24 @@ Romancy's waiting functions make it ideal for time-based and event-driven busine
 - `WaitEvent(eventType)`: Wait for external events (near real-time response)
 
 ```go
+type ReminderResult struct {
+    Status string `json:"status"`
+}
+
 var onboardingReminder = romancy.DefineWorkflow("onboarding_reminder",
-    func(ctx *romancy.WorkflowContext, userID string) (map[string]any, error) {
+    func(ctx *romancy.WorkflowContext, userID string) (ReminderResult, error) {
         // Sleep for 3 days
         if err := romancy.Sleep(ctx, 3*24*time.Hour); err != nil {
-            return nil, err
+            return ReminderResult{}, err
         }
         completed, err := checkCompleted.Execute(ctx, userID)
         if err != nil {
-            return nil, err
+            return ReminderResult{}, err
         }
-        if !completed {
+        if !completed.Completed {
             return sendReminder.Execute(ctx, userID)
         }
-        return map[string]any{"status": "completed"}, nil
+        return ReminderResult{Status: "completed"}, nil
     },
 )
 ```
@@ -136,22 +143,33 @@ import (
     "github.com/i2y/romancy"
 )
 
+// Result types
+type PaymentResult struct {
+    Status string  `json:"status"`
+    Amount float64 `json:"amount"`
+}
+
+type OrderResult struct {
+    OrderID string        `json:"order_id"`
+    Payment PaymentResult `json:"payment"`
+}
+
 // Define an activity
 var processPayment = romancy.DefineActivity("process_payment",
-    func(ctx context.Context, amount float64) (map[string]any, error) {
+    func(ctx context.Context, amount float64) (PaymentResult, error) {
         log.Printf("Processing payment: $%.2f", amount)
-        return map[string]any{"status": "paid", "amount": amount}, nil
+        return PaymentResult{Status: "paid", Amount: amount}, nil
     },
 )
 
 // Define a workflow
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-    func(ctx *romancy.WorkflowContext, orderID string, amount float64) (map[string]any, error) {
+    func(ctx *romancy.WorkflowContext, orderID string, amount float64) (OrderResult, error) {
         result, err := processPayment.Execute(ctx, amount)
         if err != nil {
-            return nil, err
+            return OrderResult{}, err
         }
-        return map[string]any{"order_id": orderID, "payment": result}, nil
+        return OrderResult{OrderID: orderID, Payment: result}, nil
     },
 )
 
@@ -163,7 +181,7 @@ func main() {
     )
 
     ctx := context.Background()
-    if err := app.Initialize(ctx); err != nil {
+    if err := app.Start(ctx); err != nil {
         log.Fatal(err)
     }
     defer app.Shutdown(ctx)
@@ -199,8 +217,9 @@ go get github.com/i2y/romancy
 |----------|----------|-------------------|------------------|
 | **SQLite** | Development, testing, single-process | ⚠️ Limited | ⚠️ Limited |
 | **PostgreSQL** | Production, multi-process/multi-pod | ✅ Yes | ✅ Recommended |
+| **MySQL** | Production, multi-process/multi-pod (8.0+) | ✅ Yes | ✅ Yes |
 
-**Important**: For distributed execution (multiple worker pods/containers), you **must** use PostgreSQL. SQLite's single-writer limitation makes it unsuitable for multi-pod deployments.
+**Important**: For distributed execution (multiple worker pods/containers), you **must** use PostgreSQL or MySQL. SQLite's single-writer limitation makes it unsuitable for multi-pod deployments.
 
 ## Next Steps
 
@@ -208,6 +227,8 @@ go get github.com/i2y/romancy
 - **[Core Concepts](getting-started/concepts)**: Learn about workflows, activities, and durable execution
 - **[Examples](examples/simple)**: See Romancy in action with real-world examples
 - **[HTTP Integration](examples/http-integration)**: Integrate with any Go HTTP router
+- **[Channels](core-features/channels)**: Pub/Sub and work queue patterns with channel-based messaging
+- **[Recur Pattern](core-features/recur)**: Handle unbounded workflows with Erlang-style tail recursion
 - **[Transactional Outbox](core-features/transactional-outbox)**: Reliable event publishing with guaranteed delivery
 - **[Lifecycle Hooks](core-features/hooks)**: Add observability and monitoring with custom hooks
 - **[CloudEvents HTTP Binding](core-features/events/cloudevents-http-binding)**: CloudEvents specification compliance and error handling

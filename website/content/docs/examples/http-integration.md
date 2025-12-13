@@ -51,23 +51,34 @@ type OrderResult struct {
 	ProcessedAt string `json:"processed_at"`
 }
 
+// Activity result types
+
+type ValidationResult struct {
+	Valid bool `json:"valid"`
+}
+
+type PaymentResult struct {
+	TransactionID string `json:"transaction_id"`
+	Status        string `json:"status"`
+}
+
 // Activities
 
 var validateOrder = romancy.DefineActivity("validate_order",
-	func(ctx context.Context, order OrderInput) (map[string]any, error) {
+	func(ctx context.Context, order OrderInput) (ValidationResult, error) {
 		if err := order.Validate(); err != nil {
-			return nil, err
+			return ValidationResult{}, err
 		}
-		return map[string]any{"valid": true}, nil
+		return ValidationResult{Valid: true}, nil
 	},
 )
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
 		fmt.Printf("Processing payment of $%.2f for order %s\n", amount, orderID)
-		return map[string]any{
-			"transaction_id": fmt.Sprintf("TXN-%s", orderID),
-			"status":         "completed",
+		return PaymentResult{
+			TransactionID: fmt.Sprintf("TXN-%s", orderID),
+			Status:        "completed",
 		}, nil
 	},
 )
@@ -292,22 +303,38 @@ import (
 	"github.com/i2y/romancy"
 )
 
+type PaymentStartResult struct {
+	PaymentID string `json:"payment_id"`
+	Status    string `json:"status"`
+}
+
+type PaymentWorkflowResult struct {
+	Status        string  `json:"status"`
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
+type PaymentCompleted struct {
+	TransactionID string  `json:"transaction_id"`
+	Amount        float64 `json:"amount"`
+}
+
 var startPayment = romancy.DefineActivity("start_payment",
-	func(ctx context.Context, orderID string) (map[string]any, error) {
+	func(ctx context.Context, orderID string) (PaymentStartResult, error) {
 		fmt.Printf("Starting payment for order %s\n", orderID)
-		return map[string]any{
-			"payment_id": fmt.Sprintf("PAY-%s", orderID),
-			"status":     "pending",
+		return PaymentStartResult{
+			PaymentID: fmt.Sprintf("PAY-%s", orderID),
+			Status:    "pending",
 		}, nil
 	},
 )
 
 var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, orderID string) (PaymentWorkflowResult, error) {
 		// Start payment process
 		_, err := startPayment.Execute(ctx, orderID)
 		if err != nil {
-			return nil, err
+			return PaymentWorkflowResult{}, err
 		}
 
 		// Wait for payment confirmation event (with timeout)
@@ -315,12 +342,19 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 			romancy.WithTimeout(5*time.Minute),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("payment timeout: %w", err)
+			return PaymentWorkflowResult{}, fmt.Errorf("payment timeout: %w", err)
 		}
 
-		return map[string]any{
-			"status":       "completed",
-			"payment_data": event.Data,
+		// Parse event data
+		var payment PaymentCompleted
+		if err := romancy.DecodeEventData(event.Data, &payment); err != nil {
+			return PaymentWorkflowResult{}, err
+		}
+
+		return PaymentWorkflowResult{
+			Status:        "completed",
+			TransactionID: payment.TransactionID,
+			Amount:        payment.Amount,
 		}, nil
 	},
 )
@@ -543,21 +577,31 @@ type OrderResult struct {
 	ProcessedAt string `json:"processed_at"`
 }
 
+// Activity result types
+
+type ValidationResult struct {
+	Valid bool `json:"valid"`
+}
+
+type PaymentResult struct {
+	TransactionID string `json:"transaction_id"`
+}
+
 // Activities
 
 var validateOrder = romancy.DefineActivity("validate_order",
-	func(ctx context.Context, order OrderInput) (map[string]any, error) {
+	func(ctx context.Context, order OrderInput) (ValidationResult, error) {
 		if order.OrderID == "" {
-			return nil, fmt.Errorf("order_id required")
+			return ValidationResult{}, fmt.Errorf("order_id required")
 		}
-		return map[string]any{"valid": true}, nil
+		return ValidationResult{Valid: true}, nil
 	},
 )
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (map[string]any, error) {
+	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
 		fmt.Printf("Processing $%.2f for %s\n", amount, orderID)
-		return map[string]any{"transaction_id": fmt.Sprintf("TXN-%s", orderID)}, nil
+		return PaymentResult{TransactionID: fmt.Sprintf("TXN-%s", orderID)}, nil
 	},
 )
 

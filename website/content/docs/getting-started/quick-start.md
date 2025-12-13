@@ -32,44 +32,62 @@ import (
 
 // Input type for the workflow
 type OnboardingInput struct {
-	UserID string
-	Email  string
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
+}
+
+// Result types for activities and workflow
+type ProfileResult struct {
+	UserID  string `json:"user_id"`
+	Email   string `json:"email"`
+	Created bool   `json:"created"`
+}
+
+type EmailResult struct {
+	Sent  bool   `json:"sent"`
+	Email string `json:"email"`
+}
+
+type OnboardingResult struct {
+	Status    string `json:"status"`
+	UserID    string `json:"user_id"`
+	EmailSent bool   `json:"email_sent"`
 }
 
 // Define activities
 var sendWelcomeEmail = romancy.DefineActivity("send_welcome_email",
-	func(ctx context.Context, email string) (map[string]any, error) {
+	func(ctx context.Context, email string) (EmailResult, error) {
 		fmt.Printf("Sending welcome email to %s\n", email)
-		return map[string]any{"sent": true, "email": email}, nil
+		return EmailResult{Sent: true, Email: email}, nil
 	},
 )
 
 var createUserProfile = romancy.DefineActivity("create_user_profile",
-	func(ctx context.Context, input OnboardingInput) (map[string]any, error) {
+	func(ctx context.Context, input OnboardingInput) (ProfileResult, error) {
 		fmt.Printf("Creating profile for user %s\n", input.UserID)
-		return map[string]any{"user_id": input.UserID, "email": input.Email, "created": true}, nil
+		return ProfileResult{UserID: input.UserID, Email: input.Email, Created: true}, nil
 	},
 )
 
 // Define workflow
 var userOnboarding = romancy.DefineWorkflow("user_onboarding",
-	func(ctx *romancy.WorkflowContext, input OnboardingInput) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input OnboardingInput) (OnboardingResult, error) {
 		// Step 1: Create profile
 		profile, err := createUserProfile.Execute(ctx, input)
 		if err != nil {
-			return nil, err
+			return OnboardingResult{}, err
 		}
 
 		// Step 2: Send welcome email
 		emailResult, err := sendWelcomeEmail.Execute(ctx, input.Email)
 		if err != nil {
-			return nil, err
+			return OnboardingResult{}, err
 		}
 
-		return map[string]any{
-			"status":     "completed",
-			"user_id":    profile["user_id"],
-			"email_sent": emailResult["sent"],
+		return OnboardingResult{
+			Status:    "completed",
+			UserID:    profile.UserID,
+			EmailSent: emailResult.Sent,
 		}, nil
 	},
 )
@@ -117,7 +135,7 @@ go run main.go
 Creating profile for user user_123
 Sending welcome email to newuser@example.com
 Workflow started with ID: <instance_id>
-Result: map[email_sent:true status:completed user_id:user_123]
+Result: {Status:completed UserID:user_123 EmailSent:true}
 ```
 
 ## Step 3: Understanding Crash Recovery
@@ -158,13 +176,14 @@ Workflows in special waiting states are handled differently:
 
 ### Production Behavior
 
-In production (use PostgreSQL for distributed systems):
+In production (use PostgreSQL or MySQL 8.0+ for distributed systems):
 
 ```go
 // For distributed systems (K8s, Docker Compose with multiple replicas)
-// Use PostgreSQL (NOT SQLite)
+// Use PostgreSQL or MySQL 8.0+ (NOT SQLite)
 app := romancy.NewApp(
 	romancy.WithDatabase("postgres://user:password@localhost/workflows"),
+	// or: romancy.WithDatabase("mysql://user:password@localhost:3306/workflows"),
 	romancy.WithWorkerID("worker-1"),
 )
 
@@ -174,7 +193,7 @@ app := romancy.NewApp(
 // - Deterministic replay
 ```
 
-**Important**: For distributed execution (multiple worker pods/containers), you **must** use PostgreSQL. SQLite's single-writer limitation makes it unsuitable for multi-pod deployments.
+**Important**: For distributed execution (multiple worker pods/containers), you **must** use PostgreSQL or MySQL 8.0+. SQLite's single-writer limitation makes it unsuitable for multi-pod deployments.
 
 **When a crash occurs:**
 
@@ -187,15 +206,41 @@ app := romancy.NewApp(
 
 This is **deterministic replay** - Romancy's core feature for durable execution.
 
+## Step 4: HTTP Server Integration (Optional)
+
+For event-driven workflows, Romancy can receive CloudEvents via HTTP. The `App` implements `http.Handler`, allowing integration with any HTTP server or router.
+
+### Standalone Mode
+
+```go
+// Start HTTP server that accepts CloudEvents
+app.ListenAndServe(":8080")
+```
+
+### Integration Mode
+
+```go
+// Mount as http.Handler for use with existing routers
+http.Handle("/events/", http.StripPrefix("/events", app.Handler()))
+http.ListenAndServe(":8080", nil)
+```
+
+This enables external systems to trigger workflows via CloudEvents. See [CloudEvents HTTP Binding](/docs/core-features/events/cloudevents-http-binding) for details.
+
 ## Key Concepts Demonstrated
 
 ### Activities
 
 ```go
+type EmailResult struct {
+	Sent  bool   `json:"sent"`
+	Email string `json:"email"`
+}
+
 var sendWelcomeEmail = romancy.DefineActivity("send_welcome_email",
-	func(ctx context.Context, email string) (map[string]any, error) {
+	func(ctx context.Context, email string) (EmailResult, error) {
 		// Business logic here
-		return map[string]any{"sent": true}, nil
+		return EmailResult{Sent: true, Email: email}, nil
 	},
 )
 ```
@@ -203,16 +248,23 @@ var sendWelcomeEmail = romancy.DefineActivity("send_welcome_email",
 - Activities perform actual work (database writes, API calls, etc.)
 - Activity results are **automatically saved in history**
 - On replay, activities return cached results
+- **Use struct types** for type-safe inputs and outputs
 
 ### Workflows
 
 ```go
+type OnboardingResult struct {
+	Status    string `json:"status"`
+	UserID    string `json:"user_id"`
+	EmailSent bool   `json:"email_sent"`
+}
+
 var userOnboarding = romancy.DefineWorkflow("user_onboarding",
-	func(ctx *romancy.WorkflowContext, userID, email string) (map[string]any, error) {
+	func(ctx *romancy.WorkflowContext, input OnboardingInput) (OnboardingResult, error) {
 		// Orchestration logic here
-		result1, err := activity1.Execute(ctx, ...)
-		result2, err := activity2.Execute(ctx, ...)
-		return result, nil
+		result1, err := activity1.Execute(ctx, input)
+		result2, err := activity2.Execute(ctx, input.Email)
+		return OnboardingResult{Status: "completed", ...}, nil
 	},
 )
 ```
@@ -220,11 +272,12 @@ var userOnboarding = romancy.DefineWorkflow("user_onboarding",
 - Workflows orchestrate activities
 - Workflows can be replayed after crashes
 - Workflows resume from the last checkpoint
+- **Use struct types** for compile-time type safety
 
 ### WorkflowContext
 
 ```go
-func(ctx *romancy.WorkflowContext, ...) (map[string]any, error) {
+func(ctx *romancy.WorkflowContext, input MyInput) (MyResult, error) {
 	// ctx provides workflow operations
 	// Automatically manages history and replay
 }

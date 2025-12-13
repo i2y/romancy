@@ -110,16 +110,16 @@ func main() {
 	}
 	defer server.Shutdown(ctx)
 
-	// Run on stdio transport (for Claude Desktop)
+	// Run on stdio transport (for MCP clients)
 	if err := server.RunStdio(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
 ```
 
-### 2. Configure Claude Desktop
+### 2. Configure MCP Client
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Add to your MCP client config (Claude Desktop, ChatGPT, Cursor, etc.). Refer to your client's documentation for the config file location.
 
 ```json
 {
@@ -274,6 +274,12 @@ func main() {
 	http.ListenAndServe(":8080", nil)
 }
 ```
+
+> **Note:** The MCP HTTP handler (`server.Handler()`) is separate from the CloudEvents handler (`app.Handler()`).
+> - **For CloudEvents:** Use `app.Handler()` or `app.ListenAndServe()`
+> - **For MCP tools:** Use `server.Handler()` or `server.RunStdio()`
+>
+> See [CloudEvents HTTP Binding](/docs/core-features/events/cloudevents-http-binding) for CloudEvents setup.
 
 ## Architecture
 
