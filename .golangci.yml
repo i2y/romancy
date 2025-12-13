@@ -23,45 +23,47 @@ linters:
     - unparam
     - whitespace
     - copyloopvar
-
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-      - performance
-    disabled-checks:
-      - whyNoLint
-      - hugeParam  # Often unavoidable with context and structs
-  misspell:
-    locale: US
+  # Linter-specific settings (was linters-settings in v1)
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - whyNoLint
+        - hugeParam  # Often unavoidable with context and structs
+    misspell:
+      locale: US
+  # Exclusion rules (was issues.exclude-rules in v1)
+  exclusions:
+    generated: lax
+    rules:
+      # Exclude some linters from running on tests files
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unparam
+          - gocritic
+      # Exclude some linters from running on examples
+      - path: examples/
+        linters:
+          - errcheck
+          - unparam
+      # Allow fmt.Print in examples and cmd
+      - path: (examples/|cmd/)
+        linters:
+          - forbidigo
+      # Exclude "err" shadows declaration
+      - linters:
+          - govet
+        text: "shadow: declaration of \"err\""
 
 issues:
   # Maximum issues count per linter
   max-issues-per-linter: 50
   # Maximum count of issues with same text
   max-same-issues: 5
-  # Excluding configuration
-  exclude-rules:
-    # Exclude some linters from running on tests files
-    - path: _test\.go
-      linters:
-        - errcheck
-        - unparam
-        - gocritic
-    # Exclude some linters from running on examples
-    - path: examples/
-      linters:
-        - errcheck
-        - unparam
-    # Allow fmt.Print in examples and cmd
-    - path: (examples/|cmd/)
-      linters:
-        - forbidigo
-    # Exclude "err" shadows declaration
-    - linters:
-        - govet
-      text: "shadow: declaration of \"err\""
 
 formatters:
   enable:
@@ -69,7 +71,8 @@ formatters:
     - goimports
   settings:
     goimports:
-      local-prefixes: github.com/i2y/romancy
+      local-prefixes:
+        - github.com/i2y/romancy
 
 output:
   # Sort results by file, line, column
