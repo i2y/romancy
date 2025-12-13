@@ -613,14 +613,14 @@ func (a *App) cancelWorkflow(ctx context.Context, instanceID, reason string) err
 		return &WorkflowNotFoundError{InstanceID: instanceID}
 	}
 
-	// Check if the workflow can be canceled
+	// Check if the workflow can be cancelled
 	switch instance.Status {
 	case storage.StatusCompleted:
 		return fmt.Errorf("cannot cancel completed workflow")
 	case storage.StatusFailed:
 		return fmt.Errorf("cannot cancel failed workflow")
 	case storage.StatusCancelled:
-		return nil // Already canceled, idempotent
+		return nil // Already cancelled, idempotent
 	}
 
 	// Try to acquire lock

@@ -35,6 +35,9 @@ linters:
         - hugeParam  # Often unavoidable with context and structs
     misspell:
       locale: US
+      ignore-rules:
+        - cancelled
+        - cancelling
   # Exclusion rules (was issues.exclude-rules in v1)
   exclusions:
     generated: lax
