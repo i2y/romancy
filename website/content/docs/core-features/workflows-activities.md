@@ -650,6 +650,106 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 )
 ```
 
+## Managing Workflow Instances
+
+Romancy provides several methods for querying and managing workflow instances.
+
+### Get a Specific Instance
+
+```go
+instance, err := app.GetInstance(ctx, "wf_abc123")
+if err != nil {
+    // Handle error
+}
+if instance == nil {
+    // Instance not found
+}
+fmt.Println(instance.Status, instance.WorkflowName)
+```
+
+### List Instances with Filters
+
+```go
+import "github.com/i2y/romancy/internal/storage"
+
+result, err := app.ListInstances(ctx, storage.ListInstancesOptions{
+    WorkflowNameFilter: "order",      // Partial match
+    StatusFilter:       "running",    // Exact match
+    InstanceIDFilter:   "order_",     // Partial match
+    Limit:             50,            // Page size (default: 50)
+})
+if err != nil {
+    // Handle error
+}
+
+for _, inst := range result.Instances {
+    fmt.Println(inst.InstanceID, inst.Status)
+}
+
+// Paginate
+if result.HasMore {
+    nextResult, _ := app.ListInstances(ctx, storage.ListInstancesOptions{
+        PageToken: result.NextPageToken,
+    })
+}
+```
+
+### Find Instances by Input Data
+
+Query workflow instances by values in their input data:
+
+```go
+// Find orders for a specific customer
+instances, err := app.FindInstances(ctx, map[string]any{
+    "customer_id": "cust_123",
+})
+
+// Find orders with specific status in input
+instances, err := app.FindInstances(ctx, map[string]any{
+    "order.status": "pending",
+    "order.priority": "high",
+})
+```
+
+#### JSON Path Syntax
+
+Input filters support dot-notation for nested fields:
+
+| Pattern | Matches |
+|---------|---------|
+| `"customer_id"` | Top-level field |
+| `"order.id"` | Nested field `{"order": {"id": ...}}` |
+| `"items.0.sku"` | Array access (if supported by DB) |
+
+#### Full Options
+
+```go
+result, err := app.FindInstancesWithOptions(ctx, storage.ListInstancesOptions{
+    InputFilters: map[string]any{
+        "customer.id": "cust_123",
+        "order.type": "subscription",
+    },
+    StatusFilter:       storage.StatusRunning,  // Optional: filter by status
+    WorkflowNameFilter: "order",                // Optional: filter by workflow name
+    Limit:              100,
+})
+```
+
+#### Supported Value Types
+
+- **Strings**: Exact match
+- **Numbers**: Numeric comparison
+- **Booleans**: True/false
+- **Null**: Null comparison
+
+#### Database Support
+
+| Database | JSON Path Support |
+|----------|-------------------|
+| SQLite | `json_extract()` |
+| PostgreSQL | `#>>` operator |
+| MySQL | `JSON_EXTRACT()` |
+
 ## Next Steps
 
 - **[Durable Execution](/docs/core-features/durable-execution/replay)**: Learn how Romancy ensures workflows never lose progress

@@ -372,6 +372,19 @@ func (s *MySQLStorage) ListInstances(ctx context.Context, opts ListInstancesOpti
 		args = append(args, opts.StartedBefore.UTC())
 	}
 
+	// Handle input filters
+	if len(opts.InputFilters) > 0 {
+		filterBuilder := NewInputFilterBuilder(s.driver)
+		filterConditions, filterArgs, err := filterBuilder.BuildFilterQuery(opts.InputFilters, len(args)+1)
+		if err != nil {
+			return nil, fmt.Errorf("invalid input filter: %w", err)
+		}
+		for _, cond := range filterConditions {
+			query += " AND " + cond
+		}
+		args = append(args, filterArgs...)
+	}
+
 	// Parse cursor token (format: "ISO_DATETIME||INSTANCE_ID")
 	if opts.PageToken != "" {
 		parts := strings.SplitN(opts.PageToken, "||", 2)
@@ -433,7 +446,10 @@ func (s *MySQLStorage) ListInstances(ctx context.Context, opts ListInstancesOpti
 
 // FindResumableWorkflows finds workflows with status='running' that don't have an active lock.
 // These are workflows that had a message delivered and are waiting for a worker to resume them.
-func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context) ([]*ResumableWorkflow, error) {
+func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context, limit int) ([]*ResumableWorkflow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	conn := s.getConn(ctx)
 	query := `
 		SELECT instance_id, workflow_name
@@ -441,10 +457,10 @@ func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context) ([]*Resumable
 		WHERE status = ?
 		AND (locked_by IS NULL OR locked_by = '')
 		ORDER BY updated_at ASC
-		LIMIT 100
+		LIMIT ?
 	`
 
-	rows, err := conn.QueryContext(ctx, query, StatusRunning)
+	rows, err := conn.QueryContext(ctx, query, StatusRunning, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -708,15 +724,18 @@ func (s *MySQLStorage) RemoveTimerSubscription(ctx context.Context, instanceID, 
 }
 
 // FindExpiredTimers finds expired timers.
-func (s *MySQLStorage) FindExpiredTimers(ctx context.Context) ([]*TimerSubscription, error) {
+func (s *MySQLStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*TimerSubscription, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
 		SELECT id, instance_id, timer_id, expires_at, step, created_at
 		FROM workflow_timer_subscriptions
 		WHERE expires_at <= NOW()
 		ORDER BY expires_at ASC
-		LIMIT 100
-	`)
+		LIMIT ?
+	`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1374,15 +1393,18 @@ func (s *MySQLStorage) CleanupOldChannelMessages(ctx context.Context, olderThan 
 }
 
 // FindExpiredChannelSubscriptions finds channel subscriptions that have timed out.
-func (s *MySQLStorage) FindExpiredChannelSubscriptions(ctx context.Context) ([]*ChannelSubscription, error) {
+func (s *MySQLStorage) FindExpiredChannelSubscriptions(ctx context.Context, limit int) ([]*ChannelSubscription, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
 		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
 		FROM channel_subscriptions
 		WHERE waiting = 1 AND timeout_at IS NOT NULL AND timeout_at < NOW()
 		ORDER BY timeout_at ASC
-		LIMIT 100
-	`)
+		LIMIT ?
+	`, limit)
 	if err != nil {
 		return nil, err
 	}

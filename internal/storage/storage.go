@@ -122,7 +122,8 @@ type InstanceManager interface {
 	// Returns workflows with status='running' that don't have an active lock.
 	// These are typically workflows that had a message delivered and are waiting
 	// for a worker to pick them up and resume execution.
-	FindResumableWorkflows(ctx context.Context) ([]*ResumableWorkflow, error)
+	// limit specifies the maximum number of workflows to return (0 = default 100).
+	FindResumableWorkflows(ctx context.Context, limit int) ([]*ResumableWorkflow, error)
 }
 
 // ListInstancesOptions defines options for listing instances.
@@ -137,6 +138,7 @@ type ListInstancesOptions struct {
 	InstanceIDFilter   string         // Filter by instance ID (partial match, case-insensitive)
 	StartedAfter       *time.Time     // Filter instances started after this time
 	StartedBefore      *time.Time     // Filter instances started before this time
+	InputFilters       map[string]any // Filter by JSON paths in input data (exact match)
 
 	// Deprecated: Use StatusFilter instead
 	Status WorkflowStatus
@@ -191,7 +193,8 @@ type TimerSubscriptionManager interface {
 	) error
 
 	// FindExpiredTimers finds timers that have expired.
-	FindExpiredTimers(ctx context.Context) ([]*TimerSubscription, error)
+	// limit specifies the maximum number of timers to return (0 = default 100).
+	FindExpiredTimers(ctx context.Context, limit int) ([]*TimerSubscription, error)
 
 	// RemoveTimerSubscription removes a timer subscription.
 	RemoveTimerSubscription(ctx context.Context, instanceID, timerID string) error
@@ -310,7 +313,8 @@ type ChannelManager interface {
 	CleanupOldChannelMessages(ctx context.Context, olderThan time.Duration) error
 
 	// FindExpiredChannelSubscriptions finds channel subscriptions that have timed out.
-	FindExpiredChannelSubscriptions(ctx context.Context) ([]*ChannelSubscription, error)
+	// limit specifies the maximum number of subscriptions to return (0 = default 100).
+	FindExpiredChannelSubscriptions(ctx context.Context, limit int) ([]*ChannelSubscription, error)
 }
 
 // ========================================

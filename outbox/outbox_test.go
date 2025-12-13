@@ -109,7 +109,7 @@ func (m *mockStorage) CancelInstance(ctx context.Context, instanceID string, rea
 func (m *mockStorage) ListInstances(ctx context.Context, opts storage.ListInstancesOptions) (*storage.PaginationResult, error) {
 	return &storage.PaginationResult{}, nil
 }
-func (m *mockStorage) FindResumableWorkflows(ctx context.Context) ([]*storage.ResumableWorkflow, error) {
+func (m *mockStorage) FindResumableWorkflows(ctx context.Context, limit int) ([]*storage.ResumableWorkflow, error) {
 	return nil, nil
 }
 
@@ -143,7 +143,7 @@ func (m *mockStorage) RegisterTimerSubscription(ctx context.Context, sub *storag
 func (m *mockStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Context, sub *storage.TimerSubscription, instanceID, workerID string) error {
 	return nil
 }
-func (m *mockStorage) FindExpiredTimers(ctx context.Context) ([]*storage.TimerSubscription, error) {
+func (m *mockStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*storage.TimerSubscription, error) {
 	return nil, nil
 }
 func (m *mockStorage) RemoveTimerSubscription(ctx context.Context, instanceID, timerID string) error {
@@ -207,7 +207,7 @@ func (m *mockStorage) GetPendingChannelMessagesForInstance(ctx context.Context, 
 func (m *mockStorage) CleanupOldChannelMessages(ctx context.Context, olderThan time.Duration) error {
 	return nil
 }
-func (m *mockStorage) FindExpiredChannelSubscriptions(ctx context.Context) ([]*storage.ChannelSubscription, error) {
+func (m *mockStorage) FindExpiredChannelSubscriptions(ctx context.Context, limit int) ([]*storage.ChannelSubscription, error) {
 	return nil, nil
 }
 

@@ -25,6 +25,10 @@ type appConfig struct {
 	outboxBatchSize int
 	brokerURL       string
 
+	// PostgreSQL LISTEN/NOTIFY
+	useListenNotify      *bool         // nil = auto-detect, true = force enable, false = force disable
+	notifyReconnectDelay time.Duration // Delay before reconnecting after connection failure
+
 	// Background task intervals
 	staleLockInterval          time.Duration
 	staleLockTimeout           time.Duration
@@ -40,6 +44,11 @@ type appConfig struct {
 	maxConcurrentResumptions int
 	maxConcurrentTimers      int
 	maxConcurrentMessages    int
+
+	// Batch sizes for background tasks
+	maxWorkflowsPerBatch int
+	maxTimersPerBatch    int
+	maxMessagesPerBatch  int
 
 	// Singleton task configuration
 	singletonStaleLockCleanup bool
@@ -61,6 +70,8 @@ func defaultConfig() *appConfig {
 		outboxEnabled:              false,
 		outboxInterval:             1 * time.Second,
 		outboxBatchSize:            100,
+		useListenNotify:            nil, // auto-detect
+		notifyReconnectDelay:       60 * time.Second,
 		staleLockInterval:          60 * time.Second,
 		staleLockTimeout:           300 * time.Second, // 5 minutes
 		timerCheckInterval:         10 * time.Second,
@@ -73,6 +84,9 @@ func defaultConfig() *appConfig {
 		maxConcurrentResumptions:   10,
 		maxConcurrentTimers:        10,
 		maxConcurrentMessages:      10,
+		maxWorkflowsPerBatch:       100,
+		maxTimersPerBatch:          100,
+		maxMessagesPerBatch:        100,
 		singletonStaleLockCleanup:  true,
 		singletonChannelCleanup:    true,
 		shutdownTimeout:            30 * time.Second,
@@ -269,5 +283,53 @@ func WithSingletonStaleLockCleanup(enabled bool) Option {
 func WithSingletonChannelCleanup(enabled bool) Option {
 	return func(c *appConfig) {
 		c.singletonChannelCleanup = enabled
+	}
+}
+
+// WithListenNotify configures PostgreSQL LISTEN/NOTIFY usage.
+// - nil (default): auto-detect based on database URL (enabled for PostgreSQL)
+// - true: force enable (fails if not PostgreSQL)
+// - false: force disable (use polling only)
+func WithListenNotify(enabled *bool) Option {
+	return func(c *appConfig) {
+		c.useListenNotify = enabled
+	}
+}
+
+// WithNotifyReconnectDelay sets the delay before reconnecting
+// after a LISTEN/NOTIFY connection failure. Default: 60 seconds.
+func WithNotifyReconnectDelay(d time.Duration) Option {
+	return func(c *appConfig) {
+		c.notifyReconnectDelay = d
+	}
+}
+
+// WithMaxWorkflowsPerBatch sets the maximum number of workflows
+// to process per polling cycle. Default: 100.
+func WithMaxWorkflowsPerBatch(n int) Option {
+	return func(c *appConfig) {
+		if n > 0 {
+			c.maxWorkflowsPerBatch = n
+		}
+	}
+}
+
+// WithMaxTimersPerBatch sets the maximum number of timers
+// to process per polling cycle. Default: 100.
+func WithMaxTimersPerBatch(n int) Option {
+	return func(c *appConfig) {
+		if n > 0 {
+			c.maxTimersPerBatch = n
+		}
+	}
+}
+
+// WithMaxMessagesPerBatch sets the maximum number of channel messages
+// to process per polling cycle. Default: 100.
+func WithMaxMessagesPerBatch(n int) Option {
+	return func(c *appConfig) {
+		if n > 0 {
+			c.maxMessagesPerBatch = n
+		}
 	}
 }

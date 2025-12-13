@@ -13,12 +13,14 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/i2y/romancy/internal/migrations"
+	"github.com/i2y/romancy/internal/notify"
 )
 
 // PostgresStorage implements the Storage interface using PostgreSQL.
 type PostgresStorage struct {
-	db     *sql.DB
-	driver Driver
+	db            *sql.DB
+	driver        Driver
+	notifyEnabled bool
 }
 
 // NewPostgresStorage creates a new PostgreSQL storage.
@@ -55,6 +57,30 @@ func (s *PostgresStorage) DB() *sql.DB {
 // Close closes the database connection.
 func (s *PostgresStorage) Close() error {
 	return s.db.Close()
+}
+
+// SetNotifyEnabled enables or disables PostgreSQL LISTEN/NOTIFY.
+// When enabled, the storage will send pg_notify() calls after key operations.
+func (s *PostgresStorage) SetNotifyEnabled(enabled bool) {
+	s.notifyEnabled = enabled
+}
+
+// IsNotifyEnabled returns whether PostgreSQL LISTEN/NOTIFY is enabled.
+func (s *PostgresStorage) IsNotifyEnabled() bool {
+	return s.notifyEnabled
+}
+
+// sendNotify sends a PostgreSQL notification if enabled.
+// Errors are logged but do not interrupt the main operation.
+func (s *PostgresStorage) sendNotify(ctx context.Context, channel notify.NotifyChannel, payload string) {
+	if !s.notifyEnabled {
+		return
+	}
+	conn := s.getConn(ctx)
+	_, err := conn.ExecContext(ctx, "SELECT pg_notify($1, $2)", string(channel), payload)
+	if err != nil {
+		slog.Debug("failed to send pg_notify", "channel", channel, "error", err)
+	}
 }
 
 // getConn returns the appropriate database handle based on context.
@@ -308,6 +334,20 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 		argN++
 	}
 
+	// Handle input filters
+	if len(opts.InputFilters) > 0 {
+		filterBuilder := NewInputFilterBuilder(s.driver)
+		filterConditions, filterArgs, err := filterBuilder.BuildFilterQuery(opts.InputFilters, argN)
+		if err != nil {
+			return nil, fmt.Errorf("invalid input filter: %w", err)
+		}
+		for _, cond := range filterConditions {
+			query += " AND " + cond
+		}
+		args = append(args, filterArgs...)
+		argN += len(filterArgs)
+	}
+
 	// Parse cursor token (format: "ISO_DATETIME||INSTANCE_ID")
 	if opts.PageToken != "" {
 		parts := strings.SplitN(opts.PageToken, "||", 2)
@@ -370,7 +410,10 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 
 // FindResumableWorkflows finds workflows with status='running' that don't have an active lock.
 // These are workflows that had a message delivered and are waiting for a worker to resume them.
-func (s *PostgresStorage) FindResumableWorkflows(ctx context.Context) ([]*ResumableWorkflow, error) {
+func (s *PostgresStorage) FindResumableWorkflows(ctx context.Context, limit int) ([]*ResumableWorkflow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	conn := s.getConn(ctx)
 	query := `
 		SELECT instance_id, workflow_name
@@ -378,10 +421,10 @@ func (s *PostgresStorage) FindResumableWorkflows(ctx context.Context) ([]*Resuma
 		WHERE status = $1
 		AND (locked_by IS NULL OR locked_by = '')
 		ORDER BY updated_at ASC
-		LIMIT 100
+		LIMIT $2
 	`
 
-	rows, err := conn.QueryContext(ctx, query, StatusRunning)
+	rows, err := conn.QueryContext(ctx, query, StatusRunning, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -574,7 +617,21 @@ func (s *PostgresStorage) RegisterTimerSubscription(ctx context.Context, sub *Ti
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (instance_id, timer_id) DO NOTHING
 	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.Step)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Send notification for timer registered
+	timerPayload := map[string]string{
+		"instance_id": sub.InstanceID,
+		"timer_id":    sub.TimerID,
+		"expires_at":  sub.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+	}
+	if payloadBytes, err := json.Marshal(timerPayload); err == nil {
+		s.sendNotify(ctx, notify.ChannelTimerExpired, string(payloadBytes))
+	}
+
+	return nil
 }
 
 // RegisterTimerSubscriptionAndReleaseLock atomically registers timer and releases lock.
@@ -633,6 +690,16 @@ func (s *PostgresStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Co
 		needTx = false
 	}
 
+	// Send notification for timer registered (after commit)
+	timerPayload := map[string]string{
+		"instance_id": sub.InstanceID,
+		"timer_id":    sub.TimerID,
+		"expires_at":  sub.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+	}
+	if payloadBytes, err := json.Marshal(timerPayload); err == nil {
+		s.sendNotify(ctx, notify.ChannelTimerExpired, string(payloadBytes))
+	}
+
 	return nil
 }
 
@@ -646,15 +713,18 @@ func (s *PostgresStorage) RemoveTimerSubscription(ctx context.Context, instanceI
 }
 
 // FindExpiredTimers finds expired timers.
-func (s *PostgresStorage) FindExpiredTimers(ctx context.Context) ([]*TimerSubscription, error) {
+func (s *PostgresStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*TimerSubscription, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
 		SELECT id, instance_id, timer_id, expires_at, step, created_at
 		FROM workflow_timer_subscriptions
 		WHERE expires_at <= NOW()
 		ORDER BY expires_at ASC
-		LIMIT 100
-	`)
+		LIMIT $1
+	`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -680,7 +750,17 @@ func (s *PostgresStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent
 		INSERT INTO workflow_outbox (event_id, event_type, event_source, event_data, data_type, content_type, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`, event.EventID, event.EventType, event.EventSource, string(event.EventData), event.DataType, event.ContentType, event.Status)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Send notification for outbox pending
+	outboxPayload := map[string]string{"event_id": event.EventID}
+	if payloadBytes, err := json.Marshal(outboxPayload); err == nil {
+		s.sendNotify(ctx, notify.ChannelOutboxPending, string(payloadBytes))
+	}
+
+	return nil
 }
 
 // GetPendingOutboxEvents retrieves pending outbox events.
@@ -843,7 +923,23 @@ func (s *PostgresStorage) PublishToChannel(ctx context.Context, channelName stri
 		VALUES ($1, $2, $3, $4)
 		RETURNING id
 	`, channelName, dataJSONStr, metadataStr, targetStr).Scan(&id)
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+
+	// Send notification for channel message
+	msgPayload := map[string]any{
+		"channel_name": channelName,
+		"message_id":   id,
+	}
+	if targetInstanceID != "" {
+		msgPayload["target_instance_id"] = targetInstanceID
+	}
+	if payloadBytes, err := json.Marshal(msgPayload); err == nil {
+		s.sendNotify(ctx, notify.ChannelChannelMessage, string(payloadBytes))
+	}
+
+	return id, nil
 }
 
 // SubscribeToChannel subscribes an instance to a channel.
@@ -1292,6 +1388,15 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 		return nil, fmt.Errorf("failed to release lock: %w", err)
 	}
 
+	// Send notification that workflow is resumable
+	wfPayload := map[string]string{
+		"instance_id":   instanceID,
+		"workflow_name": workflowName,
+	}
+	if payloadBytes, err := json.Marshal(wfPayload); err == nil {
+		s.sendNotify(ctx, notify.ChannelWorkflowResumable, string(payloadBytes))
+	}
+
 	return &ChannelDeliveryResult{
 		InstanceID:   instanceID,
 		WorkflowName: workflowName,
@@ -1310,15 +1415,18 @@ func (s *PostgresStorage) CleanupOldChannelMessages(ctx context.Context, olderTh
 }
 
 // FindExpiredChannelSubscriptions finds channel subscriptions that have timed out.
-func (s *PostgresStorage) FindExpiredChannelSubscriptions(ctx context.Context) ([]*ChannelSubscription, error) {
+func (s *PostgresStorage) FindExpiredChannelSubscriptions(ctx context.Context, limit int) ([]*ChannelSubscription, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
 		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
 		FROM channel_subscriptions
 		WHERE waiting = TRUE AND timeout_at IS NOT NULL AND timeout_at < NOW()
 		ORDER BY timeout_at ASC
-		LIMIT 100
-	`)
+		LIMIT $1
+	`, limit)
 	if err != nil {
 		return nil, err
 	}

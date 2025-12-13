@@ -16,6 +16,7 @@ import (
 
 	"github.com/i2y/romancy/hooks"
 	"github.com/i2y/romancy/internal/coordination"
+	"github.com/i2y/romancy/internal/notify"
 	"github.com/i2y/romancy/internal/replay"
 	"github.com/i2y/romancy/internal/storage"
 	"github.com/i2y/romancy/outbox"
@@ -31,6 +32,9 @@ type App struct {
 
 	// Outbox relayer (if enabled)
 	outboxRelayer *outbox.Relayer
+
+	// PostgreSQL LISTEN/NOTIFY listener (if enabled)
+	notifyListener *notify.Listener
 
 	// Registered workflows
 	workflows   map[string]any
@@ -144,6 +148,13 @@ func (a *App) Shutdown(ctx context.Context) error {
 		a.outboxRelayer.Stop()
 	}
 
+	// Stop LISTEN/NOTIFY listener if enabled
+	if a.notifyListener != nil {
+		if err := a.notifyListener.Stop(ctx); err != nil {
+			slog.Debug("error stopping LISTEN/NOTIFY listener", "error", err)
+		}
+	}
+
 	// Cancel background tasks
 	if a.cancel != nil {
 		a.cancel()
@@ -183,14 +194,22 @@ func (a *App) initStorage() error {
 
 	// Determine storage type based on URL
 	url := a.config.databaseURL
+	isPostgres := len(url) >= 8 && url[:8] == "postgres"
+
 	switch {
-	case len(url) >= 8 && url[:8] == "postgres":
+	case isPostgres:
 		// PostgreSQL
 		pgStorage, err := storage.NewPostgresStorage(url)
 		if err != nil {
 			return fmt.Errorf("failed to create PostgreSQL storage: %w", err)
 		}
 		a.storage = pgStorage
+
+		// Configure LISTEN/NOTIFY if enabled
+		if a.shouldEnableListenNotify(isPostgres) {
+			pgStorage.SetNotifyEnabled(true)
+			a.initNotifyListener(url)
+		}
 	case len(url) >= 5 && url[:5] == "mysql":
 		// MySQL
 		mysqlStorage, err := storage.NewMySQLStorage(url)
@@ -220,6 +239,141 @@ func (a *App) initStorage() error {
 	return nil
 }
 
+// shouldEnableListenNotify determines if LISTEN/NOTIFY should be enabled.
+// Returns true if:
+//   - useListenNotify is explicitly set to true, or
+//   - useListenNotify is nil (auto-detect) and isPostgres is true
+func (a *App) shouldEnableListenNotify(isPostgres bool) bool {
+	if a.config.useListenNotify != nil {
+		return *a.config.useListenNotify
+	}
+	// Auto-detect: enable for PostgreSQL by default
+	return isPostgres
+}
+
+// initNotifyListener initializes the PostgreSQL LISTEN/NOTIFY listener.
+func (a *App) initNotifyListener(connString string) {
+	a.notifyListener = notify.NewListener(
+		connString,
+		notify.WithReconnectDelay(a.config.notifyReconnectDelay),
+	)
+
+	// Register notification handlers
+	a.notifyListener.OnNotification(notify.ChannelWorkflowResumable, a.handleWorkflowResumableNotify)
+	a.notifyListener.OnNotification(notify.ChannelTimerExpired, a.handleTimerExpiredNotify)
+	a.notifyListener.OnNotification(notify.ChannelChannelMessage, a.handleChannelMessageNotify)
+	a.notifyListener.OnNotification(notify.ChannelOutboxPending, a.handleOutboxPendingNotify)
+
+	slog.Info("PostgreSQL LISTEN/NOTIFY configured",
+		"reconnect_delay", a.config.notifyReconnectDelay)
+}
+
+// handleWorkflowResumableNotify handles workflow resumable notifications.
+func (a *App) handleWorkflowResumableNotify(ctx context.Context, channel notify.NotifyChannel, payload string) {
+	n, err := notify.ParseWorkflowNotification(payload)
+	if err != nil {
+		slog.Debug("failed to parse workflow notification", "payload", payload, "error", err)
+		return
+	}
+
+	slog.Debug("received workflow resumable notification", "instance_id", n.InstanceID)
+
+	// Trigger immediate workflow resumption
+	if err := a.resumptionSem.Acquire(ctx, 1); err != nil {
+		return
+	}
+	go func() {
+		defer a.resumptionSem.Release(1)
+		if err := a.resumeWorkflow(ctx, n.InstanceID); err != nil {
+			slog.Debug("error resuming workflow from notify", "instance_id", n.InstanceID, "error", err)
+		}
+	}()
+}
+
+// handleTimerExpiredNotify handles timer expired notifications.
+func (a *App) handleTimerExpiredNotify(ctx context.Context, channel notify.NotifyChannel, payload string) {
+	// Timer notifications are informational - the timer check loop will pick them up
+	// We just log for debugging
+	slog.Debug("received timer notification", "payload", payload)
+}
+
+// handleChannelMessageNotify handles channel message notifications.
+func (a *App) handleChannelMessageNotify(ctx context.Context, channel notify.NotifyChannel, payload string) {
+	n, err := notify.ParseChannelMessageNotification(payload)
+	if err != nil {
+		slog.Debug("failed to parse channel message notification", "payload", payload, "error", err)
+		return
+	}
+
+	slog.Debug("received channel message notification",
+		"channel_name", n.ChannelName, "message_id", n.MessageID, "target", n.TargetInstanceID)
+
+	// Trigger immediate message delivery
+	go a.wakeWaitingChannelSubscribersForNotify(ctx, n.ChannelName, n.TargetInstanceID)
+}
+
+// handleOutboxPendingNotify handles outbox pending notifications.
+func (a *App) handleOutboxPendingNotify(ctx context.Context, channel notify.NotifyChannel, payload string) {
+	// Outbox notifications are informational - the outbox relayer handles polling
+	// We could trigger immediate relay here if needed
+	slog.Debug("received outbox notification", "payload", payload)
+}
+
+// wakeWaitingChannelSubscribersForNotify triggers message delivery for waiting subscribers.
+func (a *App) wakeWaitingChannelSubscribersForNotify(ctx context.Context, channelName, targetInstanceID string) {
+	if a.storage == nil {
+		return
+	}
+
+	// If targeted message, only wake the target subscriber
+	if targetInstanceID != "" {
+		a.deliverToWaitingSubscriber(ctx, targetInstanceID, channelName)
+		return
+	}
+
+	// Get waiting subscribers for this channel
+	subs, err := a.storage.GetChannelSubscribersWaiting(ctx, channelName)
+	if err != nil {
+		slog.Debug("error getting waiting subscribers", "channel", channelName, "error", err)
+		return
+	}
+
+	for _, sub := range subs {
+		if ctx.Err() != nil {
+			break
+		}
+		a.deliverToWaitingSubscriber(ctx, sub.InstanceID, channelName)
+	}
+}
+
+// deliverToWaitingSubscriber attempts to deliver messages to a single waiting subscriber.
+func (a *App) deliverToWaitingSubscriber(ctx context.Context, instanceID, channelName string) {
+	if err := a.messageSem.Acquire(ctx, 1); err != nil {
+		return
+	}
+	go func() {
+		defer a.messageSem.Release(1)
+
+		messages, err := a.storage.GetPendingChannelMessagesForInstance(ctx, instanceID, channelName)
+		if err != nil || len(messages) == 0 {
+			return
+		}
+
+		msg := messages[0]
+		result, err := a.storage.DeliverChannelMessageWithLock(
+			ctx, instanceID, channelName, msg,
+			a.config.workerID, int(a.config.staleLockTimeout.Seconds()))
+		if err != nil {
+			slog.Debug("failed to deliver message from notify", "instance_id", instanceID, "error", err)
+			return
+		}
+		if result != nil {
+			slog.Debug("delivered message from notify",
+				"instance_id", instanceID, "channel", channelName, "message_id", msg.ID)
+		}
+	}()
+}
+
 // addJitter adds random jitter (±25%) to a duration to prevent thundering herd.
 // This helps distribute load when multiple workers start simultaneously.
 func addJitter(d time.Duration) time.Duration {
@@ -231,6 +385,13 @@ func addJitter(d time.Duration) time.Duration {
 
 // startBackgroundTasks starts all background goroutines.
 func (a *App) startBackgroundTasks() {
+	// Start PostgreSQL LISTEN/NOTIFY listener if configured
+	if a.notifyListener != nil {
+		if err := a.notifyListener.Start(a.ctx); err != nil {
+			slog.Error("failed to start LISTEN/NOTIFY listener", "error", err)
+		}
+	}
+
 	// Stale lock cleanup
 	a.wg.Add(1)
 	go a.runStaleLockCleanup()
@@ -255,7 +416,7 @@ func (a *App) startBackgroundTasks() {
 	a.wg.Add(1)
 	go a.runChannelCleanup()
 
-	// Workflow resumption (for load balancing)
+	// Workflow resumption (for load balancing / fallback when LISTEN/NOTIFY unavailable)
 	a.wg.Add(1)
 	go a.runWorkflowResumption()
 
@@ -362,7 +523,7 @@ func (a *App) checkExpiredTimers() error {
 		return nil
 	}
 
-	timers, err := a.storage.FindExpiredTimers(a.ctx)
+	timers, err := a.storage.FindExpiredTimers(a.ctx, a.config.maxTimersPerBatch)
 	if err != nil {
 		return err
 	}
@@ -394,6 +555,31 @@ func (a *App) checkExpiredTimers() error {
 
 // handleExpiredTimer handles a single expired timer.
 func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
+	// Get instance to find workflow name
+	instance, err := a.storage.GetInstance(a.ctx, timer.InstanceID)
+	if err != nil {
+		return err
+	}
+	if instance == nil {
+		// Instance not found, skip (already deleted or invalid)
+		return nil
+	}
+
+	// Check if we have this workflow registered
+	// If not, skip and let another worker handle it
+	a.workflowRunnersMu.RLock()
+	_, registered := a.workflowRunners[instance.WorkflowName]
+	a.workflowRunnersMu.RUnlock()
+
+	if !registered {
+		// This worker doesn't have the workflow registered, skip
+		slog.Debug("skipping timer for unregistered workflow",
+			"instance_id", timer.InstanceID,
+			"workflow_name", instance.WorkflowName,
+			"timer_id", timer.TimerID)
+		return nil
+	}
+
 	// Try to acquire lock
 	acquired, err := a.storage.TryAcquireLock(
 		a.ctx,
@@ -427,14 +613,9 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 	}
 
 	// Call OnTimerFired hook
-	instance, _ := a.storage.GetInstance(a.ctx, timer.InstanceID)
-	workflowName := ""
-	if instance != nil {
-		workflowName = instance.WorkflowName
-	}
 	a.hooks.OnTimerFired(a.ctx, hooks.TimerFiredInfo{
 		InstanceID:   timer.InstanceID,
-		WorkflowName: workflowName,
+		WorkflowName: instance.WorkflowName,
 		TimerID:      timer.TimerID,
 		FiredAt:      time.Now(),
 	})
@@ -596,6 +777,47 @@ func (a *App) GetInstance(ctx context.Context, instanceID string) (*storage.Work
 	}
 
 	return instance, nil
+}
+
+// FindInstances searches for workflow instances with input filters.
+// This is a convenience method for searching workflows by their input data.
+//
+// The inputFilters parameter maps JSON paths to expected values:
+//   - "customer.id" -> "12345" matches input like {"customer": {"id": "12345"}}
+//   - "status" -> "active" matches input like {"status": "active"}
+//
+// Values are compared with exact match. Supported value types:
+//   - string: Exact string match
+//   - int/float64: Numeric comparison
+//   - bool: Boolean comparison
+//   - nil: Matches null values
+//
+// Example:
+//
+//	instances, err := app.FindInstances(ctx, map[string]any{
+//	    "order.customer_id": "cust_123",
+//	    "order.status": "pending",
+//	})
+func (a *App) FindInstances(ctx context.Context, inputFilters map[string]any) ([]*storage.WorkflowInstance, error) {
+	return a.FindInstancesWithOptions(ctx, storage.ListInstancesOptions{
+		InputFilters: inputFilters,
+	})
+}
+
+// FindInstancesWithOptions searches for workflow instances with full options.
+// Use this when you need pagination, status filters, or other advanced options
+// in addition to input filters.
+func (a *App) FindInstancesWithOptions(ctx context.Context, opts storage.ListInstancesOptions) ([]*storage.WorkflowInstance, error) {
+	if a.storage == nil {
+		return nil, fmt.Errorf("storage not initialized")
+	}
+
+	result, err := a.storage.ListInstances(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.Instances, nil
 }
 
 // cancelWorkflow cancels a running workflow and executes compensations.
@@ -1081,7 +1303,7 @@ func (a *App) checkChannelTimeouts() error {
 	}
 
 	// Check for expired channel subscriptions
-	expiredSubs, err := a.storage.FindExpiredChannelSubscriptions(a.ctx)
+	expiredSubs, err := a.storage.FindExpiredChannelSubscriptions(a.ctx, a.config.maxMessagesPerBatch)
 	if err != nil {
 		return fmt.Errorf("failed to find expired channel subscriptions: %w", err)
 	}
@@ -1310,7 +1532,7 @@ func (a *App) resumeResumableWorkflows() error {
 	}
 
 	// Find resumable workflows (status='running', no lock)
-	workflows, err := a.storage.FindResumableWorkflows(a.ctx)
+	workflows, err := a.storage.FindResumableWorkflows(a.ctx, a.config.maxWorkflowsPerBatch)
 	if err != nil {
 		return fmt.Errorf("failed to find resumable workflows: %w", err)
 	}

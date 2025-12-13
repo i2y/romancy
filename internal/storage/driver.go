@@ -30,6 +30,16 @@ type Driver interface {
 	// ReturningClause returns the RETURNING clause for insert/update.
 	// SQLite: "", PostgreSQL: "RETURNING id"
 	ReturningClause(columns ...string) string
+
+	// JSONExtract returns the SQL expression to extract a value from a JSON column.
+	// The path is a dot-separated path like "order.customer.id".
+	// The returned expression extracts the value as text.
+	JSONExtract(column, path string) string
+
+	// JSONCompare returns the SQL expression to compare a JSON-extracted value
+	// with a given value, handling type coercion appropriately.
+	// Returns the comparison expression and any additional args needed.
+	JSONCompare(extractExpr string, value any, placeholderNum int) (expr string, args []any)
 }
 
 // SQLiteDriver implements Driver for SQLite.
