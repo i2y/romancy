@@ -307,14 +307,14 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 	if s.InTransaction(ctx.Context()) {
 		// Capture variables for closure
 		wfCtx := ctx
-		storage := s
+		store := s
 		chName := channelName
 		msgID := messageID
 		dJSON := dataJSON
 		mJSON := metadataJSON
 
 		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
-			wakeWaitingSubscribers(wfCtx, storage, chName, msgID, dJSON, mJSON, "")
+			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON, "")
 			return nil
 		})
 	} else {
@@ -455,7 +455,7 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 	if s.InTransaction(ctx.Context()) {
 		// Capture variables for closure
 		wfCtx := ctx
-		storage := s
+		store := s
 		chName := channelName
 		msgID := messageID
 		dJSON := dataJSON
@@ -463,7 +463,7 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 		targetID := targetInstanceID
 
 		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
-			wakeWaitingSubscribers(wfCtx, storage, chName, msgID, dJSON, mJSON, targetID)
+			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON, targetID)
 			return nil
 		})
 	} else {

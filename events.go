@@ -93,10 +93,11 @@ func convertToReceivedEvent[T any](msg *ReceivedMessage[map[string]any]) (*Recei
 	if specVersion, ok := msg.Data["specversion"].(string); ok {
 		event.SpecVersion = specVersion
 	}
-	if t, ok := msg.Data["time"].(*time.Time); ok {
+	switch t := msg.Data["time"].(type) {
+	case *time.Time:
 		event.Time = t
-	} else if tStr, ok := msg.Data["time"].(string); ok {
-		if parsed, err := time.Parse(time.RFC3339, tStr); err == nil {
+	case string:
+		if parsed, err := time.Parse(time.RFC3339, t); err == nil {
 			event.Time = &parsed
 		}
 	}

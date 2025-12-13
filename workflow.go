@@ -211,6 +211,6 @@ func GetWorkflowResult[O any](ctx context.Context, app *App, instanceID string) 
 }
 
 // CancelWorkflow cancels a running workflow instance.
-func CancelWorkflow(ctx context.Context, app *App, instanceID string, reason string) error {
+func CancelWorkflow(ctx context.Context, app *App, instanceID, reason string) error {
 	return app.cancelWorkflow(ctx, instanceID, reason)
 }

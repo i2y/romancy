@@ -539,7 +539,7 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 }
 
 // runWorkflow executes a workflow instance.
-func (a *App) runWorkflow(ctx context.Context, instanceID string, workflowName string) error {
+func (a *App) runWorkflow(ctx context.Context, instanceID, workflowName string) error {
 	// Get the runner for this workflow
 	a.workflowRunnersMu.RLock()
 	runner, ok := a.workflowRunners[workflowName]
@@ -599,7 +599,7 @@ func (a *App) GetInstance(ctx context.Context, instanceID string) (*storage.Work
 }
 
 // cancelWorkflow cancels a running workflow and executes compensations.
-func (a *App) cancelWorkflow(ctx context.Context, instanceID string, reason string) error {
+func (a *App) cancelWorkflow(ctx context.Context, instanceID, reason string) error {
 	if a.storage == nil {
 		return fmt.Errorf("storage not initialized")
 	}

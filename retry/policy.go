@@ -61,11 +61,11 @@ func Fixed(maxAttempts int, interval time.Duration) *Policy {
 }
 
 // Exponential returns an exponential backoff policy.
-func Exponential(maxAttempts int, initial, max time.Duration, multiplier float64) *Policy {
+func Exponential(maxAttempts int, initial, maxInterval time.Duration, multiplier float64) *Policy {
 	return &Policy{
 		MaxAttempts:         maxAttempts,
 		InitialInterval:     initial,
-		MaxInterval:         max,
+		MaxInterval:         maxInterval,
 		Multiplier:          multiplier,
 		RandomizationFactor: 0.5,
 	}

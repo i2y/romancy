@@ -886,7 +886,7 @@ func (s *MySQLStorage) MarkCompensationFailed(ctx context.Context, id int64) err
 // ========================================
 
 // PublishToChannel publishes a message to a channel.
-func (s *MySQLStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte, targetInstanceID string) (int64, error) {
+func (s *MySQLStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON, metadata []byte, targetInstanceID string) (int64, error) {
 	conn := s.getConn(ctx)
 	var dataJSONStr, metadataStr, targetStr sql.NullString
 	if dataJSON != nil {

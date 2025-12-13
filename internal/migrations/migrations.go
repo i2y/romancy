@@ -80,7 +80,7 @@ func (m *Migrator) Down() error {
 
 // Version returns the current migration version.
 // Returns (version, dirty, error).
-func (m *Migrator) Version() (uint, bool, error) {
+func (m *Migrator) Version() (version uint, dirty bool, err error) {
 	migrator, err := m.createMigrate()
 	if err != nil {
 		return 0, false, fmt.Errorf("failed to create migrator: %w", err)

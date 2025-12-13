@@ -145,7 +145,7 @@ func TestCancelCompletedWorkflow(t *testing.T) {
 	// Try to cancel - should fail
 	err := romancy.CancelWorkflow(ctx, app, "completed-123", "user request")
 	if err == nil {
-		t.Error("Expected error when cancelling completed workflow")
+		t.Error("Expected error when canceling completed workflow")
 	}
 }
 
@@ -178,7 +178,7 @@ func TestCancelIdempotent(t *testing.T) {
 	// Cancel again - should succeed (idempotent)
 	err := romancy.CancelWorkflow(ctx, app, "cancelled-123", "user request")
 	if err != nil {
-		t.Errorf("Expected no error when cancelling already cancelled workflow, got: %v", err)
+		t.Errorf("Expected no error when canceling already canceled workflow, got: %v", err)
 	}
 }
 

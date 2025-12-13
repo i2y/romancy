@@ -86,10 +86,10 @@ var BookFlight = romancy.DefineActivity(
 		return bookingID, nil
 	},
 	romancy.WithCompensation[BookingDetails, string](func(ctx context.Context, details BookingDetails) error {
-		log.Printf("[Compensation] Cancelling flight booking for user %s", details.UserID)
+		log.Printf("[Compensation] Canceling flight booking for user %s", details.UserID)
 		log.Printf("[Compensation] Refunding flight from %s to %s", details.Origin, details.Destination)
 		time.Sleep(50 * time.Millisecond) // Simulate cancellation
-		log.Printf("[Compensation] Flight booking cancelled successfully")
+		log.Printf("[Compensation] Flight booking canceled successfully")
 		return nil
 	}),
 )
@@ -107,10 +107,10 @@ var ReserveHotel = romancy.DefineActivity(
 		return reservationID, nil
 	},
 	romancy.WithCompensation[BookingDetails, string](func(ctx context.Context, details BookingDetails) error {
-		log.Printf("[Compensation] Cancelling hotel reservation for user %s", details.UserID)
+		log.Printf("[Compensation] Canceling hotel reservation for user %s", details.UserID)
 		log.Printf("[Compensation] Releasing room in %s", details.Destination)
 		time.Sleep(50 * time.Millisecond) // Simulate cancellation
-		log.Printf("[Compensation] Hotel reservation cancelled successfully")
+		log.Printf("[Compensation] Hotel reservation canceled successfully")
 		return nil
 	}),
 )
@@ -128,10 +128,10 @@ var RentCar = romancy.DefineActivity(
 		return rentalID, nil
 	},
 	romancy.WithCompensation[BookingDetails, string](func(ctx context.Context, details BookingDetails) error {
-		log.Printf("[Compensation] Cancelling car rental for user %s", details.UserID)
+		log.Printf("[Compensation] Canceling car rental for user %s", details.UserID)
 		log.Printf("[Compensation] Releasing car reservation in %s", details.Destination)
 		time.Sleep(50 * time.Millisecond) // Simulate cancellation
-		log.Printf("[Compensation] Car rental cancelled successfully")
+		log.Printf("[Compensation] Car rental canceled successfully")
 		return nil
 	}),
 )

@@ -153,7 +153,7 @@ func printUsage() {
 	fmt.Println("  --page-token <tok>  Pagination token for next page (for list command)")
 	fmt.Println()
 	fmt.Println("Status Values:")
-	fmt.Println("  pending, running, completed, failed, cancelled,")
+	fmt.Println("  pending, running, completed, failed, canceled,")
 	fmt.Println("  waiting_event, waiting_timer, waiting_message, recurred, compensating")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -425,7 +425,7 @@ func cmdMigrate(action string, args []string, dbType string) error {
 func cmdCancel(instanceID string) error {
 	url := fmt.Sprintf("%s/cancel/%s", baseURL, instanceID)
 
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	req, err := http.NewRequest(http.MethodPost, url, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -442,7 +442,7 @@ func cmdCancel(instanceID string) error {
 		return fmt.Errorf("server returned error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	fmt.Printf("✓ Workflow cancelled: %s\n", instanceID)
+	fmt.Printf("✓ Workflow canceled: %s\n", instanceID)
 
 	return nil
 }
@@ -466,7 +466,7 @@ func statusEmoji(status storage.WorkflowStatus) string {
 	case storage.StatusFailed:
 		return "❌ failed"
 	case storage.StatusCancelled:
-		return "🚫 cancelled"
+		return "🚫 canceled"
 	case storage.StatusRecurred:
 		return "🔄 recurred"
 	case storage.StatusCompensating:
@@ -493,7 +493,7 @@ func parseStatus(s string) storage.WorkflowStatus {
 		return storage.StatusCompleted
 	case "failed":
 		return storage.StatusFailed
-	case "cancelled":
+	case "canceled":
 		return storage.StatusCancelled
 	case "recurred":
 		return storage.StatusRecurred
