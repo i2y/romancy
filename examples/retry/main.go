@@ -139,95 +139,89 @@ var RateLimitedAPICall = romancy.DefineActivity(
 
 // ----- Workflows -----
 
-// FlakyAPIWorkflow calls a flaky API with automatic retries.
-type FlakyAPIWorkflow struct{}
+// flakyAPIWorkflow calls a flaky API with automatic retries.
+var flakyAPIWorkflow = romancy.DefineWorkflow("flaky_api_workflow",
+	func(ctx *romancy.WorkflowContext, input APICallInput) (APICallResult, error) {
+		log.Printf("[Workflow] Starting flaky API workflow for: %s", input.Endpoint)
 
-func (w *FlakyAPIWorkflow) Name() string { return "flaky_api_workflow" }
+		result := APICallResult{
+			Endpoint: input.Endpoint,
+			Status:   "processing",
+		}
 
-func (w *FlakyAPIWorkflow) Execute(ctx *romancy.WorkflowContext, input APICallInput) (APICallResult, error) {
-	log.Printf("[Workflow] Starting flaky API workflow for: %s", input.Endpoint)
+		// Reset counter for this workflow
+		atomic.StoreInt64(&flakyCallAttempts, 0)
 
-	result := APICallResult{
-		Endpoint: input.Endpoint,
-		Status:   "processing",
-	}
+		// Call the flaky API (will retry automatically)
+		responseCode, err := FlakyAPICall.Execute(ctx, input.Endpoint)
+		if err != nil {
+			result.Status = "failed"
+			result.Attempts = int(atomic.LoadInt64(&flakyCallAttempts))
+			return result, err
+		}
 
-	// Reset counter for this workflow
-	atomic.StoreInt64(&flakyCallAttempts, 0)
-
-	// Call the flaky API (will retry automatically)
-	responseCode, err := FlakyAPICall.Execute(ctx, input.Endpoint)
-	if err != nil {
-		result.Status = "failed"
+		result.ResponseCode = responseCode
 		result.Attempts = int(atomic.LoadInt64(&flakyCallAttempts))
-		return result, err
-	}
+		result.Status = "success"
 
-	result.ResponseCode = responseCode
-	result.Attempts = int(atomic.LoadInt64(&flakyCallAttempts))
-	result.Status = "success"
+		log.Printf("[Workflow] Completed after %d attempts", result.Attempts)
+		return result, nil
+	},
+)
 
-	log.Printf("[Workflow] Completed after %d attempts", result.Attempts)
-	return result, nil
-}
+// nonRetryableWorkflow demonstrates non-retryable errors.
+var nonRetryableWorkflow = romancy.DefineWorkflow("non_retryable_workflow",
+	func(ctx *romancy.WorkflowContext, input APICallInput) (APICallResult, error) {
+		log.Printf("[Workflow] Starting non-retryable workflow for: %s", input.Endpoint)
 
-// NonRetryableWorkflow demonstrates non-retryable errors.
-type NonRetryableWorkflow struct{}
+		result := APICallResult{
+			Endpoint: input.Endpoint,
+			Status:   "processing",
+		}
 
-func (w *NonRetryableWorkflow) Name() string { return "non_retryable_workflow" }
+		// Reset counter for this workflow
+		atomic.StoreInt64(&failingCallAttempts, 0)
 
-func (w *NonRetryableWorkflow) Execute(ctx *romancy.WorkflowContext, input APICallInput) (APICallResult, error) {
-	log.Printf("[Workflow] Starting non-retryable workflow for: %s", input.Endpoint)
+		// Call the API with bad request (should NOT retry)
+		responseCode, err := BadRequestAPICall.Execute(ctx, input.Endpoint)
+		if err != nil {
+			result.Status = "failed_immediately"
+			result.Attempts = int(atomic.LoadInt64(&failingCallAttempts))
+			log.Printf("[Workflow] Failed immediately without retries (as expected)")
+			return result, err
+		}
 
-	result := APICallResult{
-		Endpoint: input.Endpoint,
-		Status:   "processing",
-	}
-
-	// Reset counter for this workflow
-	atomic.StoreInt64(&failingCallAttempts, 0)
-
-	// Call the API with bad request (should NOT retry)
-	responseCode, err := BadRequestAPICall.Execute(ctx, input.Endpoint)
-	if err != nil {
-		result.Status = "failed_immediately"
+		result.ResponseCode = responseCode
 		result.Attempts = int(atomic.LoadInt64(&failingCallAttempts))
-		log.Printf("[Workflow] Failed immediately without retries (as expected)")
-		return result, err
-	}
+		result.Status = "success"
+		return result, nil
+	},
+)
 
-	result.ResponseCode = responseCode
-	result.Attempts = int(atomic.LoadInt64(&failingCallAttempts))
-	result.Status = "success"
-	return result, nil
-}
+// rateLimitedWorkflow handles rate-limited APIs.
+var rateLimitedWorkflow = romancy.DefineWorkflow("rate_limited_workflow",
+	func(ctx *romancy.WorkflowContext, input APICallInput) (APICallResult, error) {
+		log.Printf("[Workflow] Starting rate-limited workflow for: %s", input.Endpoint)
 
-// RateLimitedWorkflow handles rate-limited APIs.
-type RateLimitedWorkflow struct{}
+		result := APICallResult{
+			Endpoint: input.Endpoint,
+			Status:   "processing",
+		}
 
-func (w *RateLimitedWorkflow) Name() string { return "rate_limited_workflow" }
+		// Call the rate-limited API (will retry with fixed interval)
+		responseCode, err := RateLimitedAPICall.Execute(ctx, input.Endpoint)
+		if err != nil {
+			result.Status = "failed"
+			return result, err
+		}
 
-func (w *RateLimitedWorkflow) Execute(ctx *romancy.WorkflowContext, input APICallInput) (APICallResult, error) {
-	log.Printf("[Workflow] Starting rate-limited workflow for: %s", input.Endpoint)
+		result.ResponseCode = responseCode
+		result.Status = "success"
 
-	result := APICallResult{
-		Endpoint: input.Endpoint,
-		Status:   "processing",
-	}
-
-	// Call the rate-limited API (will retry with fixed interval)
-	responseCode, err := RateLimitedAPICall.Execute(ctx, input.Endpoint)
-	if err != nil {
-		result.Status = "failed"
-		return result, err
-	}
-
-	result.ResponseCode = responseCode
-	result.Status = "success"
-
-	log.Printf("[Workflow] Completed successfully")
-	return result, nil
-}
+		log.Printf("[Workflow] Completed successfully")
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -302,9 +296,9 @@ func main() {
 	app := romancy.NewApp(opts...)
 
 	// Register workflows
-	romancy.RegisterWorkflow[APICallInput, APICallResult](app, &FlakyAPIWorkflow{})
-	romancy.RegisterWorkflow[APICallInput, APICallResult](app, &NonRetryableWorkflow{})
-	romancy.RegisterWorkflow[APICallInput, APICallResult](app, &RateLimitedWorkflow{})
+	romancy.RegisterWorkflow[APICallInput, APICallResult](app, flakyAPIWorkflow)
+	romancy.RegisterWorkflow[APICallInput, APICallResult](app, nonRetryableWorkflow)
+	romancy.RegisterWorkflow[APICallInput, APICallResult](app, rateLimitedWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -327,7 +321,7 @@ func main() {
 		Endpoint:   "/api/v1/flaky",
 		MaxRetries: 5,
 	}
-	flakyID, _ := romancy.StartWorkflow(ctx, app, &FlakyAPIWorkflow{}, flakyInput)
+	flakyID, _ := romancy.StartWorkflow(ctx, app, flakyAPIWorkflow, flakyInput)
 	log.Printf("Started flaky API workflow: %s", flakyID)
 
 	// Wait for completion
@@ -346,7 +340,7 @@ func main() {
 		Endpoint:   "/api/v1/bad-request",
 		MaxRetries: 5,
 	}
-	badRequestID, _ := romancy.StartWorkflow(ctx, app, &NonRetryableWorkflow{}, badRequestInput)
+	badRequestID, _ := romancy.StartWorkflow(ctx, app, nonRetryableWorkflow, badRequestInput)
 	log.Printf("Started non-retryable workflow: %s", badRequestID)
 
 	// Wait for completion
@@ -364,7 +358,7 @@ func main() {
 		Endpoint:   "/api/v1/rate-limited",
 		MaxRetries: 5,
 	}
-	rateLimitID, _ := romancy.StartWorkflow(ctx, app, &RateLimitedWorkflow{}, rateLimitInput)
+	rateLimitID, _ := romancy.StartWorkflow(ctx, app, rateLimitedWorkflow, rateLimitInput)
 	log.Printf("Started rate-limited workflow: %s", rateLimitID)
 
 	// Wait for completion

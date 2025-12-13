@@ -92,53 +92,51 @@ var ProcessShipment = romancy.DefineActivity(
 
 // ----- Workflow -----
 
-// OrderWorkflow processes an order through the complete lifecycle.
-type OrderWorkflow struct{}
+// orderWorkflow processes an order through the complete lifecycle.
+var orderWorkflow = romancy.DefineWorkflow("order_workflow",
+	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
+		result := OrderResult{
+			OrderID: input.OrderID,
+			Status:  "processing",
+		}
 
-func (w *OrderWorkflow) Name() string { return "order_workflow" }
+		// Step 1: Reserve inventory
+		log.Printf("[Workflow] Step 1: Reserving inventory for order %s", input.OrderID)
+		reservationID, err := ReserveInventory.Execute(ctx, input.OrderID)
+		if err != nil {
+			result.Status = "failed"
+			return result, fmt.Errorf("failed to reserve inventory: %w", err)
+		}
+		result.ReservationID = reservationID
 
-func (w *OrderWorkflow) Execute(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
-	result := OrderResult{
-		OrderID: input.OrderID,
-		Status:  "processing",
-	}
+		// Step 2: Wait for payment confirmation
+		log.Printf("[Workflow] Step 2: Waiting for payment confirmation...")
+		log.Printf("[Workflow] Send payment event with: romancy event %s payment.completed '{\"transaction_id\":\"TX-123\"}'", ctx.InstanceID())
 
-	// Step 1: Reserve inventory
-	log.Printf("[Workflow] Step 1: Reserving inventory for order %s", input.OrderID)
-	reservationID, err := ReserveInventory.Execute(ctx, input.OrderID)
-	if err != nil {
-		result.Status = "failed"
-		return result, fmt.Errorf("failed to reserve inventory: %w", err)
-	}
-	result.ReservationID = reservationID
+		event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed", romancy.WithEventTimeout(5*time.Minute))
+		if err != nil {
+			// If waiting for event, the engine will suspend the workflow
+			// and resume it when the event arrives
+			result.Status = "waiting_for_payment"
+			return result, err
+		}
+		result.TransactionID = event.Data.TransactionID
+		log.Printf("[Workflow] Payment received: %s", event.Data.TransactionID)
 
-	// Step 2: Wait for payment confirmation
-	log.Printf("[Workflow] Step 2: Waiting for payment confirmation...")
-	log.Printf("[Workflow] Send payment event with: romancy event %s payment.completed '{\"transaction_id\":\"TX-123\"}'", ctx.InstanceID())
+		// Step 3: Process shipment
+		log.Printf("[Workflow] Step 3: Processing shipment...")
+		shipmentID, err := ProcessShipment.Execute(ctx, input.OrderID)
+		if err != nil {
+			result.Status = "shipment_failed"
+			return result, fmt.Errorf("failed to process shipment: %w", err)
+		}
+		result.ShipmentID = shipmentID
 
-	event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed", romancy.WithEventTimeout(5*time.Minute))
-	if err != nil {
-		// If waiting for event, the engine will suspend the workflow
-		// and resume it when the event arrives
-		result.Status = "waiting_for_payment"
-		return result, err
-	}
-	result.TransactionID = event.Data.TransactionID
-	log.Printf("[Workflow] Payment received: %s", event.Data.TransactionID)
-
-	// Step 3: Process shipment
-	log.Printf("[Workflow] Step 3: Processing shipment...")
-	shipmentID, err := ProcessShipment.Execute(ctx, input.OrderID)
-	if err != nil {
-		result.Status = "shipment_failed"
-		return result, fmt.Errorf("failed to process shipment: %w", err)
-	}
-	result.ShipmentID = shipmentID
-
-	result.Status = "completed"
-	log.Printf("[Workflow] Order %s completed successfully!", input.OrderID)
-	return result, nil
-}
+		result.Status = "completed"
+		log.Printf("[Workflow] Order %s completed successfully!", input.OrderID)
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -213,7 +211,7 @@ func main() {
 	app := romancy.NewApp(opts...)
 
 	// Register the workflow
-	romancy.RegisterWorkflow[OrderInput, OrderResult](app, &OrderWorkflow{})
+	romancy.RegisterWorkflow[OrderInput, OrderResult](app, orderWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -233,7 +231,7 @@ func main() {
 		Amount:     99.99,
 	}
 
-	instanceID, err := romancy.StartWorkflow(ctx, app, &OrderWorkflow{}, orderInput)
+	instanceID, err := romancy.StartWorkflow(ctx, app, orderWorkflow, orderInput)
 	if err != nil {
 		log.Printf("Failed to start workflow: %v", err)
 		return

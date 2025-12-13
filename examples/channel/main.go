@@ -92,114 +92,110 @@ type ChatMessage struct {
 
 // ----- Workflows -----
 
-// ConsumerWorkflow subscribes to a channel and receives messages.
-type ConsumerWorkflow struct{}
+// consumerWorkflow subscribes to a channel and receives messages.
+var consumerWorkflow = romancy.DefineWorkflow("channel_consumer",
+	func(ctx *romancy.WorkflowContext, input ConsumerInput) (ConsumerResult, error) {
+		log.Printf("[Consumer %s] Starting consumer workflow", input.ConsumerID)
 
-func (w *ConsumerWorkflow) Name() string { return "channel_consumer" }
+		result := ConsumerResult{
+			ConsumerID:       input.ConsumerID,
+			MessagesReceived: []string{},
+			Status:           "running",
+		}
 
-func (w *ConsumerWorkflow) Execute(ctx *romancy.WorkflowContext, input ConsumerInput) (ConsumerResult, error) {
-	log.Printf("[Consumer %s] Starting consumer workflow", input.ConsumerID)
+		// Determine channel mode
+		mode := romancy.ModeBroadcast
+		if input.Mode == "competing" {
+			mode = romancy.ModeCompeting
+		}
 
-	result := ConsumerResult{
-		ConsumerID:       input.ConsumerID,
-		MessagesReceived: []string{},
-		Status:           "running",
-	}
+		// Subscribe to the notifications channel
+		channelName := "notifications"
+		log.Printf("[Consumer %s] Subscribing to channel '%s' in %s mode", input.ConsumerID, channelName, input.Mode)
+		if err := romancy.Subscribe(ctx, channelName, mode); err != nil {
+			result.Status = "subscription_failed"
+			return result, fmt.Errorf("failed to subscribe: %w", err)
+		}
 
-	// Determine channel mode
-	mode := romancy.ModeBroadcast
-	if input.Mode == "competing" {
-		mode = romancy.ModeCompeting
-	}
+		log.Printf("[Consumer %s] Subscribed! Draining all pending messages...", input.ConsumerID)
+		log.Printf("[Consumer %s] Instance ID: %s", input.ConsumerID, ctx.InstanceID())
 
-	// Subscribe to the notifications channel
-	channelName := "notifications"
-	log.Printf("[Consumer %s] Subscribing to channel '%s' in %s mode", input.ConsumerID, channelName, input.Mode)
-	if err := romancy.Subscribe(ctx, channelName, mode); err != nil {
-		result.Status = "subscription_failed"
-		return result, fmt.Errorf("failed to subscribe: %w", err)
-	}
+		// Drain all pending messages with a short timeout (2 seconds)
+		// This will consume all existing messages until the channel is empty
+		for {
+			log.Printf("[Consumer %s] Waiting for message (count: %d)...", input.ConsumerID, len(result.MessagesReceived))
 
-	log.Printf("[Consumer %s] Subscribed! Draining all pending messages...", input.ConsumerID)
-	log.Printf("[Consumer %s] Instance ID: %s", input.ConsumerID, ctx.InstanceID())
-
-	// Drain all pending messages with a short timeout (2 seconds)
-	// This will consume all existing messages until the channel is empty
-	for {
-		log.Printf("[Consumer %s] Waiting for message (count: %d)...", input.ConsumerID, len(result.MessagesReceived))
-
-		// Wait for a message with 2-second timeout to detect empty channel
-		msg, err := romancy.Receive[ChatMessage](ctx, channelName, romancy.WithReceiveTimeout(2*time.Second))
-		if err != nil {
-			// Check if this is a suspend signal (normal workflow pause)
-			if romancy.IsSuspendSignal(err) {
-				return result, err
+			// Wait for a message with 2-second timeout to detect empty channel
+			msg, err := romancy.Receive[ChatMessage](ctx, channelName, romancy.WithReceiveTimeout(2*time.Second))
+			if err != nil {
+				// Check if this is a suspend signal (normal workflow pause)
+				if romancy.IsSuspendSignal(err) {
+					return result, err
+				}
+				// Check for timeout error - channel is empty
+				var timeoutErr *romancy.ChannelMessageTimeoutError
+				if errors.As(err, &timeoutErr) {
+					log.Printf("[Consumer %s] Channel empty (timeout), finished draining", input.ConsumerID)
+					result.Status = "drained"
+					break
+				}
+				result.Status = "receive_failed"
+				return result, fmt.Errorf("failed to receive message: %w", err)
 			}
-			// Check for timeout error - channel is empty
-			var timeoutErr *romancy.ChannelMessageTimeoutError
-			if errors.As(err, &timeoutErr) {
-				log.Printf("[Consumer %s] Channel empty (timeout), finished draining", input.ConsumerID)
-				result.Status = "drained"
-				break
+
+			log.Printf("[Consumer %s] Received message from %s: %s", input.ConsumerID, msg.Data.From, msg.Data.Content)
+			result.MessagesReceived = append(result.MessagesReceived, fmt.Sprintf("%s: %s", msg.Data.From, msg.Data.Content))
+		}
+
+		log.Printf("[Consumer %s] Finished draining %d messages", input.ConsumerID, len(result.MessagesReceived))
+		return result, nil
+	},
+)
+
+// producerWorkflow sends multiple messages to a channel.
+var producerWorkflow = romancy.DefineWorkflow("channel_producer",
+	func(ctx *romancy.WorkflowContext, input ProducerInput) (ProducerResult, error) {
+		log.Printf("[Producer %s] Starting producer workflow", input.ProducerID)
+
+		result := ProducerResult{
+			ProducerID: input.ProducerID,
+			Status:     "running",
+		}
+
+		channelName := input.Channel
+		if channelName == "" {
+			channelName = "notifications"
+		}
+
+		// Subscribe to receive replies (optional, for bi-directional communication)
+		if err := romancy.Subscribe(ctx, "replies", romancy.ModeBroadcast); err != nil {
+			log.Printf("[Producer %s] Warning: failed to subscribe to replies: %v", input.ProducerID, err)
+		}
+
+		// Send all messages
+		for i, content := range input.Messages {
+			msg := ChatMessage{
+				From:      input.ProducerID,
+				Content:   content,
+				Timestamp: time.Now(),
 			}
-			result.Status = "receive_failed"
-			return result, fmt.Errorf("failed to receive message: %w", err)
+
+			log.Printf("[Producer %s] Publishing message %d/%d: %s", input.ProducerID, i+1, len(input.Messages), content)
+			if err := romancy.Publish(ctx, channelName, msg); err != nil {
+				result.Status = "publish_failed"
+				return result, fmt.Errorf("failed to publish message: %w", err)
+			}
+			result.MessagesSent++
+
+			// Small delay between messages
+			time.Sleep(100 * time.Millisecond)
 		}
 
-		log.Printf("[Consumer %s] Received message from %s: %s", input.ConsumerID, msg.Data.From, msg.Data.Content)
-		result.MessagesReceived = append(result.MessagesReceived, fmt.Sprintf("%s: %s", msg.Data.From, msg.Data.Content))
-	}
-
-	log.Printf("[Consumer %s] Finished draining %d messages", input.ConsumerID, len(result.MessagesReceived))
-	return result, nil
-}
-
-// ProducerWorkflow sends multiple messages to a channel.
-type ProducerWorkflow struct{}
-
-func (w *ProducerWorkflow) Name() string { return "channel_producer" }
-
-func (w *ProducerWorkflow) Execute(ctx *romancy.WorkflowContext, input ProducerInput) (ProducerResult, error) {
-	log.Printf("[Producer %s] Starting producer workflow", input.ProducerID)
-
-	result := ProducerResult{
-		ProducerID: input.ProducerID,
-		Status:     "running",
-	}
-
-	channelName := input.Channel
-	if channelName == "" {
-		channelName = "notifications"
-	}
-
-	// Subscribe to receive replies (optional, for bi-directional communication)
-	if err := romancy.Subscribe(ctx, "replies", romancy.ModeBroadcast); err != nil {
-		log.Printf("[Producer %s] Warning: failed to subscribe to replies: %v", input.ProducerID, err)
-	}
-
-	// Send all messages
-	for i, content := range input.Messages {
-		msg := ChatMessage{
-			From:      input.ProducerID,
-			Content:   content,
-			Timestamp: time.Now(),
-		}
-
-		log.Printf("[Producer %s] Publishing message %d/%d: %s", input.ProducerID, i+1, len(input.Messages), content)
-		if err := romancy.Publish(ctx, channelName, msg); err != nil {
-			result.Status = "publish_failed"
-			return result, fmt.Errorf("failed to publish message: %w", err)
-		}
-		result.MessagesSent++
-
-		// Small delay between messages
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	result.Status = "completed"
-	log.Printf("[Producer %s] Finished sending %d messages", input.ProducerID, result.MessagesSent)
-	return result, nil
-}
+		result.Status = "completed"
+		log.Printf("[Producer %s] Finished sending %d messages", input.ProducerID, result.MessagesSent)
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -256,7 +252,7 @@ func StartConsumerHandler(w http.ResponseWriter, r *http.Request) {
 		input.Mode = "broadcast"
 	}
 
-	instanceID, err := romancy.StartWorkflow(r.Context(), app, &ConsumerWorkflow{}, input)
+	instanceID, err := romancy.StartWorkflow(r.Context(), app, consumerWorkflow, input)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to start consumer: %v", err), http.StatusInternalServerError)
 		return
@@ -293,7 +289,7 @@ func StartProducerHandler(w http.ResponseWriter, r *http.Request) {
 		input.Channel = "notifications"
 	}
 
-	instanceID, err := romancy.StartWorkflow(r.Context(), app, &ProducerWorkflow{}, input)
+	instanceID, err := romancy.StartWorkflow(r.Context(), app, producerWorkflow, input)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to start producer: %v", err), http.StatusInternalServerError)
 		return
@@ -340,7 +336,7 @@ func PublishHandler(w http.ResponseWriter, r *http.Request) {
 		Channel:    req.Channel,
 	}
 
-	instanceID, err := romancy.StartWorkflow(r.Context(), app, &ProducerWorkflow{}, input)
+	instanceID, err := romancy.StartWorkflow(r.Context(), app, producerWorkflow, input)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to publish: %v", err), http.StatusInternalServerError)
 		return
@@ -392,8 +388,8 @@ func main() {
 	app = romancy.NewApp(opts...)
 
 	// Register workflows
-	romancy.RegisterWorkflow[ConsumerInput, ConsumerResult](app, &ConsumerWorkflow{})
-	romancy.RegisterWorkflow[ProducerInput, ProducerResult](app, &ProducerWorkflow{})
+	romancy.RegisterWorkflow[ConsumerInput, ConsumerResult](app, consumerWorkflow)
+	romancy.RegisterWorkflow[ProducerInput, ProducerResult](app, producerWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {

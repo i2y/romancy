@@ -85,40 +85,38 @@ var FormatMessage = romancy.DefineActivity(
 
 // ----- Workflow -----
 
-// GreetingWorkflow creates a personalized greeting.
-type GreetingWorkflow struct{}
+// greetingWorkflow creates a personalized greeting.
+var greetingWorkflow = romancy.DefineWorkflow("greeting_workflow",
+	func(ctx *romancy.WorkflowContext, input GreetingInput) (GreetingResult, error) {
+		log.Printf("[Workflow] Starting greeting workflow for: %s", input.Name)
 
-func (w *GreetingWorkflow) Name() string { return "greeting_workflow" }
+		// Step 1: Get the greeting based on language
+		greeting, err := GetGreeting.Execute(ctx, input.Language)
+		if err != nil {
+			return GreetingResult{}, fmt.Errorf("failed to get greeting: %w", err)
+		}
 
-func (w *GreetingWorkflow) Execute(ctx *romancy.WorkflowContext, input GreetingInput) (GreetingResult, error) {
-	log.Printf("[Workflow] Starting greeting workflow for: %s", input.Name)
+		// Step 2: Format the message with the name
+		message, err := FormatMessage.Execute(ctx, struct {
+			Greeting string
+			Name     string
+		}{
+			Greeting: greeting,
+			Name:     input.Name,
+		})
+		if err != nil {
+			return GreetingResult{}, fmt.Errorf("failed to format message: %w", err)
+		}
 
-	// Step 1: Get the greeting based on language
-	greeting, err := GetGreeting.Execute(ctx, input.Language)
-	if err != nil {
-		return GreetingResult{}, fmt.Errorf("failed to get greeting: %w", err)
-	}
+		result := GreetingResult{
+			Message:   message,
+			Timestamp: time.Now().Format(time.RFC3339),
+		}
 
-	// Step 2: Format the message with the name
-	message, err := FormatMessage.Execute(ctx, struct {
-		Greeting string
-		Name     string
-	}{
-		Greeting: greeting,
-		Name:     input.Name,
-	})
-	if err != nil {
-		return GreetingResult{}, fmt.Errorf("failed to format message: %w", err)
-	}
-
-	result := GreetingResult{
-		Message:   message,
-		Timestamp: time.Now().Format(time.RFC3339),
-	}
-
-	log.Printf("[Workflow] Completed: %s", result.Message)
-	return result, nil
-}
+		log.Printf("[Workflow] Completed: %s", result.Message)
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -199,7 +197,7 @@ func main() {
 	app := romancy.NewApp(opts...)
 
 	// Register the workflow
-	romancy.RegisterWorkflow[GreetingInput, GreetingResult](app, &GreetingWorkflow{})
+	romancy.RegisterWorkflow[GreetingInput, GreetingResult](app, greetingWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -234,7 +232,7 @@ func main() {
 
 		log.Printf("\n--- Starting workflow for %s (%s) ---", l.name, l.lang)
 
-		instanceID, err := romancy.StartWorkflow(ctx, app, &GreetingWorkflow{}, input)
+		instanceID, err := romancy.StartWorkflow(ctx, app, greetingWorkflow, input)
 		if err != nil {
 			log.Printf("Failed to start workflow: %v", err)
 			continue

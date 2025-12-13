@@ -121,58 +121,56 @@ var ScheduleShipping = romancy.DefineActivity(
 
 // ----- Workflow -----
 
-// OrderWorkflow processes a customer order.
-type OrderWorkflow struct{}
+// orderWorkflow processes a customer order.
+var orderWorkflow = romancy.DefineWorkflow("order_workflow",
+	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
+		log.Printf("[Workflow] Processing order %s for customer %s", input.OrderID, input.CustomerID)
 
-func (w *OrderWorkflow) Name() string { return "order_workflow" }
+		result := OrderResult{
+			OrderID: input.OrderID,
+			Status:  "processing",
+			Total:   input.Amount,
+		}
 
-func (w *OrderWorkflow) Execute(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
-	log.Printf("[Workflow] Processing order %s for customer %s", input.OrderID, input.CustomerID)
+		// Step 1: Validate the order
+		log.Printf("[Workflow] Step 1: Validating order...")
+		valid, err := ValidateOrder.Execute(ctx, input)
+		if err != nil || !valid {
+			result.Status = "validation_failed"
+			return result, fmt.Errorf("order validation failed: %w", err)
+		}
 
-	result := OrderResult{
-		OrderID: input.OrderID,
-		Status:  "processing",
-		Total:   input.Amount,
-	}
+		// Step 2: Process payment
+		log.Printf("[Workflow] Step 2: Processing payment...")
+		confirmation, err := ProcessPayment.Execute(ctx, struct {
+			OrderID string
+			Amount  float64
+		}{
+			OrderID: input.OrderID,
+			Amount:  input.Amount,
+		})
+		if err != nil {
+			result.Status = "payment_failed"
+			return result, fmt.Errorf("payment processing failed: %w", err)
+		}
+		result.Confirmation = confirmation
 
-	// Step 1: Validate the order
-	log.Printf("[Workflow] Step 1: Validating order...")
-	valid, err := ValidateOrder.Execute(ctx, input)
-	if err != nil || !valid {
-		result.Status = "validation_failed"
-		return result, fmt.Errorf("order validation failed: %w", err)
-	}
+		// Step 3: Schedule shipping
+		log.Printf("[Workflow] Step 3: Scheduling shipping...")
+		eta, err := ScheduleShipping.Execute(ctx, input.OrderID)
+		if err != nil {
+			result.Status = "shipping_failed"
+			return result, fmt.Errorf("shipping scheduling failed: %w", err)
+		}
+		result.ShippingETA = eta
 
-	// Step 2: Process payment
-	log.Printf("[Workflow] Step 2: Processing payment...")
-	confirmation, err := ProcessPayment.Execute(ctx, struct {
-		OrderID string
-		Amount  float64
-	}{
-		OrderID: input.OrderID,
-		Amount:  input.Amount,
-	})
-	if err != nil {
-		result.Status = "payment_failed"
-		return result, fmt.Errorf("payment processing failed: %w", err)
-	}
-	result.Confirmation = confirmation
+		result.Status = "confirmed"
+		log.Printf("[Workflow] Order %s completed! Confirmation: %s, ETA: %s",
+			input.OrderID, result.Confirmation, result.ShippingETA)
 
-	// Step 3: Schedule shipping
-	log.Printf("[Workflow] Step 3: Scheduling shipping...")
-	eta, err := ScheduleShipping.Execute(ctx, input.OrderID)
-	if err != nil {
-		result.Status = "shipping_failed"
-		return result, fmt.Errorf("shipping scheduling failed: %w", err)
-	}
-	result.ShippingETA = eta
-
-	result.Status = "confirmed"
-	log.Printf("[Workflow] Order %s completed! Confirmation: %s, ETA: %s",
-		input.OrderID, result.Confirmation, result.ShippingETA)
-
-	return result, nil
-}
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -258,7 +256,7 @@ func main() {
 	// - order_workflow_status
 	// - order_workflow_result
 	// - order_workflow_cancel
-	mcp.RegisterWorkflow[OrderInput, OrderResult](server, &OrderWorkflow{},
+	mcp.RegisterWorkflow[OrderInput, OrderResult](server, orderWorkflow,
 		mcp.WithDescription("Process customer orders with payment and shipping"),
 	)
 

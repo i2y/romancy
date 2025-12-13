@@ -85,83 +85,79 @@ var ExecuteScheduledTask = romancy.DefineActivity(
 
 // ----- Workflows -----
 
-// ReminderWorkflow sends a reminder after a delay.
-type ReminderWorkflow struct{}
+// reminderWorkflow sends a reminder after a delay.
+var reminderWorkflow = romancy.DefineWorkflow("reminder_workflow",
+	func(ctx *romancy.WorkflowContext, input ReminderInput) (ReminderResult, error) {
+		log.Printf("[Workflow] Starting reminder workflow for user %s", input.UserID)
+		log.Printf("[Workflow] Will wait %d seconds before sending reminder", input.DelaySeconds)
 
-func (w *ReminderWorkflow) Name() string { return "reminder_workflow" }
+		result := ReminderResult{
+			UserID:  input.UserID,
+			Message: input.Message,
+			Status:  "waiting",
+		}
 
-func (w *ReminderWorkflow) Execute(ctx *romancy.WorkflowContext, input ReminderInput) (ReminderResult, error) {
-	log.Printf("[Workflow] Starting reminder workflow for user %s", input.UserID)
-	log.Printf("[Workflow] Will wait %d seconds before sending reminder", input.DelaySeconds)
+		// Sleep for the specified duration
+		log.Printf("[Workflow] Sleeping for %d seconds...", input.DelaySeconds)
+		if err := romancy.Sleep(ctx, time.Duration(input.DelaySeconds)*time.Second); err != nil {
+			return result, err // SuspendSignal is returned as normal workflow suspension
+		}
 
-	result := ReminderResult{
-		UserID:  input.UserID,
-		Message: input.Message,
-		Status:  "waiting",
-	}
+		log.Printf("[Workflow] Sleep completed, sending reminder...")
 
-	// Sleep for the specified duration
-	log.Printf("[Workflow] Sleeping for %d seconds...", input.DelaySeconds)
-	if err := romancy.Sleep(ctx, time.Duration(input.DelaySeconds)*time.Second); err != nil {
-		return result, err // SuspendSignal is returned as normal workflow suspension
-	}
+		// Send the reminder
+		sentInfo, err := SendReminder.Execute(ctx, struct {
+			UserID  string
+			Message string
+		}{
+			UserID:  input.UserID,
+			Message: input.Message,
+		})
+		if err != nil {
+			result.Status = "send_failed"
+			return result, fmt.Errorf("failed to send reminder: %w", err)
+		}
 
-	log.Printf("[Workflow] Sleep completed, sending reminder...")
+		result.SentAt = sentInfo
+		result.Status = "sent"
 
-	// Send the reminder
-	sentInfo, err := SendReminder.Execute(ctx, struct {
-		UserID  string
-		Message string
-	}{
-		UserID:  input.UserID,
-		Message: input.Message,
-	})
-	if err != nil {
-		result.Status = "send_failed"
-		return result, fmt.Errorf("failed to send reminder: %w", err)
-	}
+		log.Printf("[Workflow] Reminder sent successfully!")
+		return result, nil
+	},
+)
 
-	result.SentAt = sentInfo
-	result.Status = "sent"
+// scheduledTaskWorkflow executes a task at a specific time.
+var scheduledTaskWorkflow = romancy.DefineWorkflow("scheduled_task_workflow",
+	func(ctx *romancy.WorkflowContext, input ScheduledTaskInput) (ScheduledTaskResult, error) {
+		log.Printf("[Workflow] Scheduling task %s for %s", input.TaskID, input.ScheduledAt.Format(time.RFC3339))
 
-	log.Printf("[Workflow] Reminder sent successfully!")
-	return result, nil
-}
+		result := ScheduledTaskResult{
+			TaskID: input.TaskID,
+			Status: "scheduled",
+		}
 
-// ScheduledTaskWorkflow executes a task at a specific time.
-type ScheduledTaskWorkflow struct{}
+		// Sleep until the specified time using SleepUntil
+		log.Printf("[Workflow] Sleeping until %s...", input.ScheduledAt.Format(time.RFC3339))
+		if err := romancy.SleepUntil(ctx, input.ScheduledAt); err != nil {
+			return result, err // SuspendSignal is returned as normal workflow suspension
+		}
 
-func (w *ScheduledTaskWorkflow) Name() string { return "scheduled_task_workflow" }
+		log.Printf("[Workflow] Scheduled time reached, executing task...")
 
-func (w *ScheduledTaskWorkflow) Execute(ctx *romancy.WorkflowContext, input ScheduledTaskInput) (ScheduledTaskResult, error) {
-	log.Printf("[Workflow] Scheduling task %s for %s", input.TaskID, input.ScheduledAt.Format(time.RFC3339))
+		// Execute the task
+		execResult, err := ExecuteScheduledTask.Execute(ctx, input.TaskID)
+		if err != nil {
+			result.Status = "execution_failed"
+			return result, fmt.Errorf("failed to execute task: %w", err)
+		}
 
-	result := ScheduledTaskResult{
-		TaskID: input.TaskID,
-		Status: "scheduled",
-	}
+		result.ExecutedAt = time.Now().Format(time.RFC3339)
+		result.Status = execResult
 
-	// Sleep until the specified time using SleepUntil
-	log.Printf("[Workflow] Sleeping until %s...", input.ScheduledAt.Format(time.RFC3339))
-	if err := romancy.SleepUntil(ctx, input.ScheduledAt); err != nil {
-		return result, err // SuspendSignal is returned as normal workflow suspension
-	}
-
-	log.Printf("[Workflow] Scheduled time reached, executing task...")
-
-	// Execute the task
-	execResult, err := ExecuteScheduledTask.Execute(ctx, input.TaskID)
-	if err != nil {
-		result.Status = "execution_failed"
-		return result, fmt.Errorf("failed to execute task: %w", err)
-	}
-
-	result.ExecutedAt = time.Now().Format(time.RFC3339)
-	result.Status = execResult
-
-	log.Printf("[Workflow] Scheduled task completed!")
-	return result, nil
-}
+		log.Printf("[Workflow] Scheduled task completed!")
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -229,8 +225,8 @@ func main() {
 	app := romancy.NewApp(opts...)
 
 	// Register workflows
-	romancy.RegisterWorkflow[ReminderInput, ReminderResult](app, &ReminderWorkflow{})
-	romancy.RegisterWorkflow[ScheduledTaskInput, ScheduledTaskResult](app, &ScheduledTaskWorkflow{})
+	romancy.RegisterWorkflow[ReminderInput, ReminderResult](app, reminderWorkflow)
+	romancy.RegisterWorkflow[ScheduledTaskInput, ScheduledTaskResult](app, scheduledTaskWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -251,7 +247,7 @@ func main() {
 		DelaySeconds: 5, // 5 seconds delay
 	}
 
-	reminderInstanceID, err := romancy.StartWorkflow(ctx, app, &ReminderWorkflow{}, reminderInput)
+	reminderInstanceID, err := romancy.StartWorkflow(ctx, app, reminderWorkflow, reminderInput)
 	if err != nil {
 		log.Printf("Failed to start reminder workflow: %v", err)
 		return
@@ -267,7 +263,7 @@ func main() {
 		ScheduledAt: scheduledTime,
 	}
 
-	taskInstanceID, err := romancy.StartWorkflow(ctx, app, &ScheduledTaskWorkflow{}, taskInput)
+	taskInstanceID, err := romancy.StartWorkflow(ctx, app, scheduledTaskWorkflow, taskInput)
 	if err != nil {
 		log.Printf("Failed to start scheduled task workflow: %v", err)
 		return

@@ -159,90 +159,88 @@ var ProcessPayment = romancy.DefineActivity(
 
 // ----- Workflow -----
 
-// TripBookingWorkflow orchestrates the entire trip booking process.
-type TripBookingWorkflow struct{}
+// tripBookingWorkflow orchestrates the entire trip booking process.
+var tripBookingWorkflow = romancy.DefineWorkflow("trip_booking_workflow",
+	func(ctx *romancy.WorkflowContext, input TripBookingInput) (TripBookingResult, error) {
+		log.Printf("[Workflow] Starting trip booking for user %s", input.UserID)
+		log.Printf("[Workflow] Trip: %s -> %s (%s to %s)",
+			input.Origin, input.Destination, input.StartDate, input.EndDate)
 
-func (w *TripBookingWorkflow) Name() string { return "trip_booking_workflow" }
+		result := TripBookingResult{
+			UserID: input.UserID,
+			Status: "processing",
+		}
 
-func (w *TripBookingWorkflow) Execute(ctx *romancy.WorkflowContext, input TripBookingInput) (TripBookingResult, error) {
-	log.Printf("[Workflow] Starting trip booking for user %s", input.UserID)
-	log.Printf("[Workflow] Trip: %s -> %s (%s to %s)",
-		input.Origin, input.Destination, input.StartDate, input.EndDate)
+		details := BookingDetails{
+			UserID:      input.UserID,
+			Origin:      input.Origin,
+			Destination: input.Destination,
+			StartDate:   input.StartDate,
+			EndDate:     input.EndDate,
+		}
 
-	result := TripBookingResult{
-		UserID: input.UserID,
-		Status: "processing",
-	}
+		// Step 1: Book flight (with compensation registered)
+		log.Printf("\n[Workflow] Step 1: Booking flight...")
+		flightID, err := BookFlight.Execute(ctx, details)
+		if err != nil {
+			result.Status = "flight_booking_failed"
+			return result, fmt.Errorf("failed to book flight: %w", err)
+		}
+		result.FlightBookingID = flightID
+		log.Printf("[Workflow] Flight booked: %s", flightID)
 
-	details := BookingDetails{
-		UserID:      input.UserID,
-		Origin:      input.Origin,
-		Destination: input.Destination,
-		StartDate:   input.StartDate,
-		EndDate:     input.EndDate,
-	}
+		// Step 2: Reserve hotel (with compensation registered)
+		log.Printf("\n[Workflow] Step 2: Reserving hotel...")
+		hotelID, err := ReserveHotel.Execute(ctx, details)
+		if err != nil {
+			// Flight compensation will be executed automatically
+			result.Status = "hotel_reservation_failed"
+			return result, fmt.Errorf("failed to reserve hotel: %w", err)
+		}
+		result.HotelReservation = hotelID
+		log.Printf("[Workflow] Hotel reserved: %s", hotelID)
 
-	// Step 1: Book flight (with compensation registered)
-	log.Printf("\n[Workflow] Step 1: Booking flight...")
-	flightID, err := BookFlight.Execute(ctx, details)
-	if err != nil {
-		result.Status = "flight_booking_failed"
-		return result, fmt.Errorf("failed to book flight: %w", err)
-	}
-	result.FlightBookingID = flightID
-	log.Printf("[Workflow] Flight booked: %s", flightID)
+		// Step 3: Rent car (with compensation registered)
+		log.Printf("\n[Workflow] Step 3: Renting car...")
+		carID, err := RentCar.Execute(ctx, details)
+		if err != nil {
+			// Hotel and flight compensations will be executed automatically
+			result.Status = "car_rental_failed"
+			return result, fmt.Errorf("failed to rent car: %w", err)
+		}
+		result.CarRentalID = carID
+		log.Printf("[Workflow] Car rented: %s", carID)
 
-	// Step 2: Reserve hotel (with compensation registered)
-	log.Printf("\n[Workflow] Step 2: Reserving hotel...")
-	hotelID, err := ReserveHotel.Execute(ctx, details)
-	if err != nil {
-		// Flight compensation will be executed automatically
-		result.Status = "hotel_reservation_failed"
-		return result, fmt.Errorf("failed to reserve hotel: %w", err)
-	}
-	result.HotelReservation = hotelID
-	log.Printf("[Workflow] Hotel reserved: %s", hotelID)
+		// Step 4: Process payment (may fail)
+		log.Printf("\n[Workflow] Step 4: Processing payment...")
+		paymentID, err := ProcessPayment.Execute(ctx, struct {
+			UserID     string
+			ShouldFail bool
+		}{
+			UserID:     input.UserID,
+			ShouldFail: input.ShouldFail,
+		})
+		if err != nil {
+			// All compensations (car, hotel, flight) will be executed in LIFO order!
+			result.Status = "payment_failed"
+			result.CompensationNotes = "All bookings will be automatically canceled"
+			log.Printf("[Workflow] Payment failed! Compensations will be executed...")
+			return result, fmt.Errorf("payment failed: %w", err)
+		}
+		result.PaymentID = paymentID
+		log.Printf("[Workflow] Payment processed: %s", paymentID)
 
-	// Step 3: Rent car (with compensation registered)
-	log.Printf("\n[Workflow] Step 3: Renting car...")
-	carID, err := RentCar.Execute(ctx, details)
-	if err != nil {
-		// Hotel and flight compensations will be executed automatically
-		result.Status = "car_rental_failed"
-		return result, fmt.Errorf("failed to rent car: %w", err)
-	}
-	result.CarRentalID = carID
-	log.Printf("[Workflow] Car rented: %s", carID)
+		result.Status = "completed"
+		log.Printf("\n[Workflow] Trip booking completed successfully!")
+		log.Printf("[Workflow] Summary:")
+		log.Printf("  - Flight: %s", result.FlightBookingID)
+		log.Printf("  - Hotel: %s", result.HotelReservation)
+		log.Printf("  - Car: %s", result.CarRentalID)
+		log.Printf("  - Payment: %s", result.PaymentID)
 
-	// Step 4: Process payment (may fail)
-	log.Printf("\n[Workflow] Step 4: Processing payment...")
-	paymentID, err := ProcessPayment.Execute(ctx, struct {
-		UserID     string
-		ShouldFail bool
-	}{
-		UserID:     input.UserID,
-		ShouldFail: input.ShouldFail,
-	})
-	if err != nil {
-		// All compensations (car, hotel, flight) will be executed in LIFO order!
-		result.Status = "payment_failed"
-		result.CompensationNotes = "All bookings will be automatically canceled"
-		log.Printf("[Workflow] Payment failed! Compensations will be executed...")
-		return result, fmt.Errorf("payment failed: %w", err)
-	}
-	result.PaymentID = paymentID
-	log.Printf("[Workflow] Payment processed: %s", paymentID)
-
-	result.Status = "completed"
-	log.Printf("\n[Workflow] Trip booking completed successfully!")
-	log.Printf("[Workflow] Summary:")
-	log.Printf("  - Flight: %s", result.FlightBookingID)
-	log.Printf("  - Hotel: %s", result.HotelReservation)
-	log.Printf("  - Car: %s", result.CarRentalID)
-	log.Printf("  - Payment: %s", result.PaymentID)
-
-	return result, nil
-}
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -317,7 +315,7 @@ func main() {
 	app := romancy.NewApp(opts...)
 
 	// Register the workflow
-	romancy.RegisterWorkflow(app, &TripBookingWorkflow{})
+	romancy.RegisterWorkflow[TripBookingInput, TripBookingResult](app, tripBookingWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -345,7 +343,7 @@ func main() {
 		ShouldFail:  false,
 	}
 
-	successID, _ := romancy.StartWorkflow(ctx, app, &TripBookingWorkflow{}, successInput)
+	successID, _ := romancy.StartWorkflow(ctx, app, tripBookingWorkflow, successInput)
 	log.Printf("Started successful booking workflow: %s", successID)
 
 	time.Sleep(1 * time.Second)
@@ -372,7 +370,7 @@ func main() {
 		ShouldFail:  true, // This will trigger compensation!
 	}
 
-	failID, _ := romancy.StartWorkflow(ctx, app, &TripBookingWorkflow{}, failInput)
+	failID, _ := romancy.StartWorkflow(ctx, app, tripBookingWorkflow, failInput)
 	log.Printf("Started failing booking workflow: %s", failID)
 
 	time.Sleep(2 * time.Second)

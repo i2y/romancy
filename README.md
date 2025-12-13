@@ -31,7 +31,11 @@ Romancy is a Go port of [Edda](https://github.com/i2y/edda) (Python), providing 
 - 🤖 **MCP Integration**: Expose workflows as MCP tools for AI assistants like Claude Desktop
 - 📬 **Channel Messaging**: Broadcast and competing message delivery between workflows
 - 🔄 **Recur Pattern**: Erlang-style tail recursion for long-running workflows
-- 👥 **Group Membership**: Erlang pg-style process groups for workflow coordination
+- 📡 **PostgreSQL LISTEN/NOTIFY**: Real-time event delivery without polling
+
+## Documentation
+
+📚 **Full documentation**: https://i2y.github.io/romancy/
 
 ## Architecture
 
@@ -317,7 +321,7 @@ var callExternalAPI = romancy.DefineActivity("call_api",
         resp, err := http.Get(url)
         // ...
     },
-    romancy.WithTransactional[string, map[string]any](false),
+    romancy.WithTransactional(false),
 )
 ```
 
@@ -441,55 +445,6 @@ var counterWorkflow = romancy.DefineWorkflow("counter",
 - `continued_from` field tracks workflow lineage
 - Prevents memory/storage issues with long-running workflows
 
-### Group Membership
-
-Workflows can join named groups for coordination and broadcast messaging:
-
-```go
-type ChatMessage struct {
-    Text string `json:"text"`
-}
-
-type ChatResult struct {
-    Left bool `json:"left"`
-}
-
-var chatMemberWorkflow = romancy.DefineWorkflow("chat_member",
-    func(ctx *romancy.WorkflowContext, userID string) (ChatResult, error) {
-        // Join the chat room group
-        if err := romancy.JoinGroup(ctx, "chat-room-123"); err != nil {
-            return ChatResult{}, err
-        }
-
-        // Subscribe to room messages
-        if err := romancy.Subscribe(ctx, "chat-room-123", romancy.ModeBroadcast); err != nil {
-            return ChatResult{}, err
-        }
-
-        // Wait for messages
-        for {
-            msg, err := romancy.Receive[ChatMessage](ctx, "chat-room-123")
-            if err != nil {
-                break
-            }
-            log.Printf("User %s received: %s", userID, msg.Data.Text)
-        }
-
-        return ChatResult{Left: true}, nil
-    },
-)
-
-// Get all members in a group (from outside workflow context)
-func listGroupMembers(ctx context.Context, app *romancy.App, groupName string) error {
-    members, err := romancy.GetGroupMembers(ctx, app.Storage(), groupName)
-    if err != nil {
-        return err
-    }
-    log.Printf("Group %s has %d members", groupName, len(members))
-    return nil
-}
-```
-
 ## HTTP Integration
 
 ### Using with net/http
@@ -561,18 +516,16 @@ type OrderResult struct {
 }
 
 // Define workflow
-type OrderWorkflow struct{}
-
-func (w *OrderWorkflow) Name() string { return "order_workflow" }
-
-func (w *OrderWorkflow) Execute(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
-	// Workflow logic here
-	return OrderResult{
-		OrderID:      input.OrderID,
-		Status:       "confirmed",
-		Confirmation: "CONF-123",
-	}, nil
-}
+var orderWorkflow = romancy.DefineWorkflow("order_workflow",
+	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
+		// Workflow logic here
+		return OrderResult{
+			OrderID:      input.OrderID,
+			Status:       "confirmed",
+			Confirmation: "CONF-123",
+		}, nil
+	},
+)
 
 func main() {
 	// Create Romancy app
@@ -589,7 +542,7 @@ func main() {
 	// - order_workflow_status
 	// - order_workflow_result
 	// - order_workflow_cancel
-	mcp.RegisterWorkflow[OrderInput, OrderResult](server, &OrderWorkflow{},
+	mcp.RegisterWorkflow[OrderInput, OrderResult](server, orderWorkflow,
 		mcp.WithDescription("Process customer orders"),
 	)
 
@@ -633,21 +586,6 @@ When you register a workflow, Romancy automatically generates four MCP tools:
 | `{workflow}_result` | Get the result of a completed workflow |
 | `{workflow}_cancel` | Cancel a running workflow instance |
 
-## Comparison with Python Edda
-
-| Feature | Python Edda | Romancy (Go) |
-|---------|-------------|--------------|
-| Language | Python 3.11+ | Go 1.24+ |
-| Async Model | async/await (asyncio) | Goroutines |
-| Type System | Pydantic optional | Go generics |
-| HTTP Framework | ASGI (uvicorn) | net/http compatible |
-| Database | SQLAlchemy async | database/sql |
-| MCP Integration | ✅ Yes | ✅ Yes |
-| Channel Messaging | ✅ Yes | ✅ Yes |
-| Recur Pattern | ✅ Yes | ✅ Yes |
-| Group Membership | ✅ Yes | ✅ Yes |
-| Viewer UI | ✅ Yes | ❌ Not yet |
-
 ## Development
 
 ### Running Tests
@@ -681,4 +619,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Related Projects
 
 - **[Edda](https://github.com/i2y/edda)**: The original Python implementation
-- **[Temporal](https://temporal.io/)**: Enterprise-grade workflow orchestration (requires separate server)

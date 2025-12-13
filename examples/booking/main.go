@@ -148,117 +148,115 @@ var NotifyEmployee = romancy.DefineActivity(
 
 // ----- Workflow -----
 
-// ExpenseApprovalWorkflow handles the expense approval process.
-type ExpenseApprovalWorkflow struct{}
+// expenseApprovalWorkflow handles the expense approval process.
+var expenseApprovalWorkflow = romancy.DefineWorkflow("expense_approval_workflow",
+	func(ctx *romancy.WorkflowContext, input ExpenseInput) (ExpenseResult, error) {
+		log.Printf("[Workflow] Starting expense approval for: %s", input.ExpenseID)
+		log.Printf("[Workflow] Employee: %s, Amount: $%.2f, Category: %s",
+			input.EmployeeID, input.Amount, input.Category)
 
-func (w *ExpenseApprovalWorkflow) Name() string { return "expense_approval_workflow" }
-
-func (w *ExpenseApprovalWorkflow) Execute(ctx *romancy.WorkflowContext, input ExpenseInput) (ExpenseResult, error) {
-	log.Printf("[Workflow] Starting expense approval for: %s", input.ExpenseID)
-	log.Printf("[Workflow] Employee: %s, Amount: $%.2f, Category: %s",
-		input.EmployeeID, input.Amount, input.Category)
-
-	result := ExpenseResult{
-		ExpenseID: input.ExpenseID,
-		Status:    "pending",
-	}
-
-	// Step 1: Validate the expense
-	log.Printf("\n[Workflow] Step 1: Validating expense...")
-	valid, err := ValidateExpense.Execute(ctx, input)
-	if err != nil || !valid {
-		result.Status = "validation_failed"
-		return result, fmt.Errorf("expense validation failed: %w", err)
-	}
-
-	// Step 2: Notify approver
-	log.Printf("\n[Workflow] Step 2: Notifying approver...")
-	_, err = NotifyApprover.Execute(ctx, struct {
-		ExpenseID   string
-		EmployeeID  string
-		Amount      float64
-		Description string
-	}{
-		ExpenseID:   input.ExpenseID,
-		EmployeeID:  input.EmployeeID,
-		Amount:      input.Amount,
-		Description: input.Description,
-	})
-	if err != nil {
-		result.Status = "notification_failed"
-		return result, fmt.Errorf("failed to notify approver: %w", err)
-	}
-
-	// Step 3: Wait for approval response (with timeout)
-	log.Printf("\n[Workflow] Step 3: Waiting for approval response...")
-	log.Printf("[Workflow] Instance ID: %s", ctx.InstanceID())
-	log.Printf("[Workflow] To approve, run:")
-	log.Printf(`  go run ./cmd/romancy/ event %s approval.response '{"approved": true, "approver": "manager@example.com"}' --db booking_demo.db`, ctx.InstanceID())
-	log.Printf("[Workflow] To reject, run:")
-	log.Printf(`  go run ./cmd/romancy/ event %s approval.response '{"approved": false, "approver": "manager@example.com", "reason": "Over budget"}' --db booking_demo.db`, ctx.InstanceID())
-
-	result.Status = "waiting_for_approval"
-
-	// Wait for approval event with 24 hour timeout (for demo, we'll use shorter timeout)
-	event, err := romancy.WaitEvent[ApprovalResponse](ctx, "approval.response",
-		romancy.WithEventTimeout(24*time.Hour)) // In real scenario, this would be longer
-	if err != nil {
-		// SuspendSignal is returned as normal workflow suspension when waiting for event
-		result.Status = "waiting_for_approval"
-		return result, err
-	}
-
-	log.Printf("\n[Workflow] Received approval response from: %s", event.Data.Approver)
-
-	// Step 4: Process based on approval decision
-	if event.Data.Approved {
-		log.Printf("[Workflow] Step 4: Processing approved expense...")
-
-		// Process the approved expense
-		_, err := ProcessApprovedExpense.Execute(ctx, struct {
-			ExpenseID  string
-			EmployeeID string
-			Amount     float64
-		}{
-			ExpenseID:  input.ExpenseID,
-			EmployeeID: input.EmployeeID,
-			Amount:     input.Amount,
-		})
-		if err != nil {
-			result.Status = "processing_failed"
-			return result, fmt.Errorf("failed to process expense: %w", err)
+		result := ExpenseResult{
+			ExpenseID: input.ExpenseID,
+			Status:    "pending",
 		}
 
-		result.Status = "approved"
-		result.ApprovedBy = event.Data.Approver
-		result.ProcessedAt = time.Now().Format(time.RFC3339)
+		// Step 1: Validate the expense
+		log.Printf("\n[Workflow] Step 1: Validating expense...")
+		valid, err := ValidateExpense.Execute(ctx, input)
+		if err != nil || !valid {
+			result.Status = "validation_failed"
+			return result, fmt.Errorf("expense validation failed: %w", err)
+		}
 
-		log.Printf("[Workflow] Expense approved and processed!")
-	} else {
-		log.Printf("[Workflow] Step 4: Processing rejection...")
-		result.Status = "rejected"
-		result.RejectedBy = event.Data.Approver
-		result.RejectionReason = event.Data.Reason
-		log.Printf("[Workflow] Expense rejected. Reason: %s", event.Data.Reason)
-	}
+		// Step 2: Notify approver
+		log.Printf("\n[Workflow] Step 2: Notifying approver...")
+		_, err = NotifyApprover.Execute(ctx, struct {
+			ExpenseID   string
+			EmployeeID  string
+			Amount      float64
+			Description string
+		}{
+			ExpenseID:   input.ExpenseID,
+			EmployeeID:  input.EmployeeID,
+			Amount:      input.Amount,
+			Description: input.Description,
+		})
+		if err != nil {
+			result.Status = "notification_failed"
+			return result, fmt.Errorf("failed to notify approver: %w", err)
+		}
 
-	// Step 5: Notify employee about the decision
-	log.Printf("\n[Workflow] Step 5: Notifying employee...")
-	_, _ = NotifyEmployee.Execute(ctx, struct {
-		EmployeeID string
-		ExpenseID  string
-		Approved   bool
-		Reason     string
-	}{
-		EmployeeID: input.EmployeeID,
-		ExpenseID:  input.ExpenseID,
-		Approved:   event.Data.Approved,
-		Reason:     event.Data.Reason,
-	})
+		// Step 3: Wait for approval response (with timeout)
+		log.Printf("\n[Workflow] Step 3: Waiting for approval response...")
+		log.Printf("[Workflow] Instance ID: %s", ctx.InstanceID())
+		log.Printf("[Workflow] To approve, run:")
+		log.Printf(`  go run ./cmd/romancy/ event %s approval.response '{"approved": true, "approver": "manager@example.com"}' --db booking_demo.db`, ctx.InstanceID())
+		log.Printf("[Workflow] To reject, run:")
+		log.Printf(`  go run ./cmd/romancy/ event %s approval.response '{"approved": false, "approver": "manager@example.com", "reason": "Over budget"}' --db booking_demo.db`, ctx.InstanceID())
 
-	log.Printf("\n[Workflow] Expense approval workflow completed!")
-	return result, nil
-}
+		result.Status = "waiting_for_approval"
+
+		// Wait for approval event with 24 hour timeout (for demo, we'll use shorter timeout)
+		event, err := romancy.WaitEvent[ApprovalResponse](ctx, "approval.response",
+			romancy.WithEventTimeout(24*time.Hour)) // In real scenario, this would be longer
+		if err != nil {
+			// SuspendSignal is returned as normal workflow suspension when waiting for event
+			result.Status = "waiting_for_approval"
+			return result, err
+		}
+
+		log.Printf("\n[Workflow] Received approval response from: %s", event.Data.Approver)
+
+		// Step 4: Process based on approval decision
+		if event.Data.Approved {
+			log.Printf("[Workflow] Step 4: Processing approved expense...")
+
+			// Process the approved expense
+			_, err := ProcessApprovedExpense.Execute(ctx, struct {
+				ExpenseID  string
+				EmployeeID string
+				Amount     float64
+			}{
+				ExpenseID:  input.ExpenseID,
+				EmployeeID: input.EmployeeID,
+				Amount:     input.Amount,
+			})
+			if err != nil {
+				result.Status = "processing_failed"
+				return result, fmt.Errorf("failed to process expense: %w", err)
+			}
+
+			result.Status = "approved"
+			result.ApprovedBy = event.Data.Approver
+			result.ProcessedAt = time.Now().Format(time.RFC3339)
+
+			log.Printf("[Workflow] Expense approved and processed!")
+		} else {
+			log.Printf("[Workflow] Step 4: Processing rejection...")
+			result.Status = "rejected"
+			result.RejectedBy = event.Data.Approver
+			result.RejectionReason = event.Data.Reason
+			log.Printf("[Workflow] Expense rejected. Reason: %s", event.Data.Reason)
+		}
+
+		// Step 5: Notify employee about the decision
+		log.Printf("\n[Workflow] Step 5: Notifying employee...")
+		_, _ = NotifyEmployee.Execute(ctx, struct {
+			EmployeeID string
+			ExpenseID  string
+			Approved   bool
+			Reason     string
+		}{
+			EmployeeID: input.EmployeeID,
+			ExpenseID:  input.ExpenseID,
+			Approved:   event.Data.Approved,
+			Reason:     event.Data.Reason,
+		})
+
+		log.Printf("\n[Workflow] Expense approval workflow completed!")
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -331,7 +329,7 @@ func main() {
 	app := romancy.NewApp(opts...)
 
 	// Register the workflow
-	romancy.RegisterWorkflow[ExpenseInput, ExpenseResult](app, &ExpenseApprovalWorkflow{})
+	romancy.RegisterWorkflow[ExpenseInput, ExpenseResult](app, expenseApprovalWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -353,7 +351,7 @@ func main() {
 		Category:    "travel",
 	}
 
-	instanceID, err := romancy.StartWorkflow(ctx, app, &ExpenseApprovalWorkflow{}, expenseInput)
+	instanceID, err := romancy.StartWorkflow(ctx, app, expenseApprovalWorkflow, expenseInput)
 	if err != nil {
 		log.Printf("Failed to start workflow: %v", err)
 		return

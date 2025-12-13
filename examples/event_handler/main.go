@@ -163,126 +163,122 @@ var SendOrderNotification = romancy.DefineActivity(
 
 // ----- Workflows -----
 
-// UserSignupWorkflow handles new user signups.
+// userSignupWorkflow handles new user signups.
 // It is triggered automatically when a "user.signup" CloudEvent is received.
-type UserSignupWorkflow struct{}
+var userSignupWorkflow = romancy.DefineWorkflow("user.signup", // Matches CloudEvent type
+	func(ctx *romancy.WorkflowContext, input UserSignupEvent) (UserSignupResult, error) {
+		log.Printf("[Workflow] Processing user signup: %s (%s)", input.Name, input.Email)
 
-func (w *UserSignupWorkflow) Name() string { return "user.signup" } // Matches CloudEvent type
+		result := UserSignupResult{
+			UserID: input.UserID,
+			Status: "processing",
+		}
 
-func (w *UserSignupWorkflow) Execute(ctx *romancy.WorkflowContext, input UserSignupEvent) (UserSignupResult, error) {
-	log.Printf("[Workflow] Processing user signup: %s (%s)", input.Name, input.Email)
+		// Step 1: Send welcome email
+		log.Printf("[Workflow] Step 1: Sending welcome email...")
+		emailSent, err := SendWelcomeEmail.Execute(ctx, struct {
+			Email string
+			Name  string
+		}{
+			Email: input.Email,
+			Name:  input.Name,
+		})
+		if err != nil {
+			result.Status = "email_failed"
+			return result, fmt.Errorf("failed to send welcome email: %w", err)
+		}
+		result.WelcomeEmailSent = emailSent
 
-	result := UserSignupResult{
-		UserID: input.UserID,
-		Status: "processing",
-	}
+		// Step 2: Create user profile
+		log.Printf("[Workflow] Step 2: Creating user profile...")
+		profileCreated, err := CreateUserProfile.Execute(ctx, struct {
+			UserID string
+			Name   string
+			Email  string
+		}{
+			UserID: input.UserID,
+			Name:   input.Name,
+			Email:  input.Email,
+		})
+		if err != nil {
+			result.Status = "profile_creation_failed"
+			return result, fmt.Errorf("failed to create profile: %w", err)
+		}
+		result.ProfileCreated = profileCreated
 
-	// Step 1: Send welcome email
-	log.Printf("[Workflow] Step 1: Sending welcome email...")
-	emailSent, err := SendWelcomeEmail.Execute(ctx, struct {
-		Email string
-		Name  string
-	}{
-		Email: input.Email,
-		Name:  input.Name,
-	})
-	if err != nil {
-		result.Status = "email_failed"
-		return result, fmt.Errorf("failed to send welcome email: %w", err)
-	}
-	result.WelcomeEmailSent = emailSent
+		// Step 3: Track analytics
+		log.Printf("[Workflow] Step 3: Tracking analytics...")
+		analyticsTracked, err := TrackUserSignup.Execute(ctx, input.UserID)
+		if err != nil {
+			// Non-critical, continue even if analytics fails
+			log.Printf("[Workflow] Analytics tracking failed (non-critical): %v", err)
+		}
+		result.AnalyticsTracked = analyticsTracked
 
-	// Step 2: Create user profile
-	log.Printf("[Workflow] Step 2: Creating user profile...")
-	profileCreated, err := CreateUserProfile.Execute(ctx, struct {
-		UserID string
-		Name   string
-		Email  string
-	}{
-		UserID: input.UserID,
-		Name:   input.Name,
-		Email:  input.Email,
-	})
-	if err != nil {
-		result.Status = "profile_creation_failed"
-		return result, fmt.Errorf("failed to create profile: %w", err)
-	}
-	result.ProfileCreated = profileCreated
+		result.Status = "completed"
+		log.Printf("[Workflow] User signup processing completed for %s", input.UserID)
+		return result, nil
+	},
+)
 
-	// Step 3: Track analytics
-	log.Printf("[Workflow] Step 3: Tracking analytics...")
-	analyticsTracked, err := TrackUserSignup.Execute(ctx, input.UserID)
-	if err != nil {
-		// Non-critical, continue even if analytics fails
-		log.Printf("[Workflow] Analytics tracking failed (non-critical): %v", err)
-	}
-	result.AnalyticsTracked = analyticsTracked
-
-	result.Status = "completed"
-	log.Printf("[Workflow] User signup processing completed for %s", input.UserID)
-	return result, nil
-}
-
-// OrderCreatedWorkflow handles new order processing.
+// orderCreatedWorkflow handles new order processing.
 // It is triggered automatically when an "order.created" CloudEvent is received.
-type OrderCreatedWorkflow struct{}
+var orderCreatedWorkflow = romancy.DefineWorkflow("order.created", // Matches CloudEvent type
+	func(ctx *romancy.WorkflowContext, input OrderCreatedEvent) (OrderProcessingResult, error) {
+		log.Printf("[Workflow] Processing new order: %s (Customer: %s, Amount: $%.2f)",
+			input.OrderID, input.CustomerID, input.Amount)
 
-func (w *OrderCreatedWorkflow) Name() string { return "order.created" } // Matches CloudEvent type
+		result := OrderProcessingResult{
+			OrderID: input.OrderID,
+			Status:  "processing",
+		}
 
-func (w *OrderCreatedWorkflow) Execute(ctx *romancy.WorkflowContext, input OrderCreatedEvent) (OrderProcessingResult, error) {
-	log.Printf("[Workflow] Processing new order: %s (Customer: %s, Amount: $%.2f)",
-		input.OrderID, input.CustomerID, input.Amount)
+		// Step 1: Check inventory
+		log.Printf("[Workflow] Step 1: Checking inventory...")
+		inventoryOK, err := CheckInventory.Execute(ctx, input.OrderID)
+		if err != nil {
+			result.Status = "inventory_check_failed"
+			return result, fmt.Errorf("inventory check failed: %w", err)
+		}
+		result.InventoryChecked = inventoryOK
 
-	result := OrderProcessingResult{
-		OrderID: input.OrderID,
-		Status:  "processing",
-	}
+		// Step 2: Process payment
+		log.Printf("[Workflow] Step 2: Processing payment...")
+		paymentOK, err := ProcessOrderPayment.Execute(ctx, struct {
+			OrderID    string
+			CustomerID string
+			Amount     float64
+		}{
+			OrderID:    input.OrderID,
+			CustomerID: input.CustomerID,
+			Amount:     input.Amount,
+		})
+		if err != nil {
+			result.Status = "payment_failed"
+			return result, fmt.Errorf("payment failed: %w", err)
+		}
+		result.PaymentProcessed = paymentOK
 
-	// Step 1: Check inventory
-	log.Printf("[Workflow] Step 1: Checking inventory...")
-	inventoryOK, err := CheckInventory.Execute(ctx, input.OrderID)
-	if err != nil {
-		result.Status = "inventory_check_failed"
-		return result, fmt.Errorf("inventory check failed: %w", err)
-	}
-	result.InventoryChecked = inventoryOK
+		// Step 3: Send notification
+		log.Printf("[Workflow] Step 3: Sending notification...")
+		notificationSent, err := SendOrderNotification.Execute(ctx, struct {
+			OrderID    string
+			CustomerID string
+		}{
+			OrderID:    input.OrderID,
+			CustomerID: input.CustomerID,
+		})
+		if err != nil {
+			// Non-critical
+			log.Printf("[Workflow] Notification failed (non-critical): %v", err)
+		}
+		result.NotificationSent = notificationSent
 
-	// Step 2: Process payment
-	log.Printf("[Workflow] Step 2: Processing payment...")
-	paymentOK, err := ProcessOrderPayment.Execute(ctx, struct {
-		OrderID    string
-		CustomerID string
-		Amount     float64
-	}{
-		OrderID:    input.OrderID,
-		CustomerID: input.CustomerID,
-		Amount:     input.Amount,
-	})
-	if err != nil {
-		result.Status = "payment_failed"
-		return result, fmt.Errorf("payment failed: %w", err)
-	}
-	result.PaymentProcessed = paymentOK
-
-	// Step 3: Send notification
-	log.Printf("[Workflow] Step 3: Sending notification...")
-	notificationSent, err := SendOrderNotification.Execute(ctx, struct {
-		OrderID    string
-		CustomerID string
-	}{
-		OrderID:    input.OrderID,
-		CustomerID: input.CustomerID,
-	})
-	if err != nil {
-		// Non-critical
-		log.Printf("[Workflow] Notification failed (non-critical): %v", err)
-	}
-	result.NotificationSent = notificationSent
-
-	result.Status = "completed"
-	log.Printf("[Workflow] Order processing completed for %s", input.OrderID)
-	return result, nil
-}
+		result.Status = "completed"
+		log.Printf("[Workflow] Order processing completed for %s", input.OrderID)
+		return result, nil
+	},
+)
 
 // ----- OpenTelemetry Setup -----
 
@@ -352,10 +348,10 @@ func main() {
 	// Register workflows with event handler option
 	// These workflows will be automatically started when matching CloudEvents are received
 	romancy.RegisterWorkflow[UserSignupEvent, UserSignupResult](
-		app, &UserSignupWorkflow{}, romancy.WithEventHandler(true),
+		app, userSignupWorkflow, romancy.WithEventHandler(true),
 	)
 	romancy.RegisterWorkflow[OrderCreatedEvent, OrderProcessingResult](
-		app, &OrderCreatedWorkflow{}, romancy.WithEventHandler(true),
+		app, orderCreatedWorkflow, romancy.WithEventHandler(true),
 	)
 
 	// Start the application
