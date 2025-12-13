@@ -28,7 +28,7 @@ Romancy is a Go port of [Edda](https://github.com/i2y/edda) (Python), providing 
 - ⏱️ **Event & Timer Waiting**: Free up worker resources while waiting for events or timers
 - 🌍 **net/http Integration**: Use with any Go HTTP router (chi, gorilla/mux, standard library)
 - 🔒 **Automatic Transactions**: Activities run in transactions by default with ctx.Session() access
-- 🤖 **MCP Integration**: Expose workflows as MCP tools for AI assistants like Claude Desktop
+- 🤖 **MCP Integration**: Expose workflows as MCP tools for AI assistants
 - 📬 **Channel Messaging**: Broadcast and competing message delivery between workflows
 - 🔄 **Recur Pattern**: Erlang-style tail recursion for long-running workflows
 - 📡 **PostgreSQL LISTEN/NOTIFY**: Real-time event delivery without polling
@@ -413,6 +413,19 @@ var dispatcherWorkflow = romancy.DefineWorkflow("dispatcher",
 )
 ```
 
+```go
+// Send a direct message to a specific workflow instance
+romancy.SendTo(ctx, targetInstanceID, "channel", data)
+
+// Unsubscribe from a channel
+romancy.Unsubscribe(ctx, "channel")
+
+// Publish with metadata
+romancy.Publish(ctx, "channel", data, romancy.WithMetadata(map[string]any{
+    "priority": "high",
+}))
+```
+
 ### Recur Pattern
 
 Long-running workflows can use Erlang-style tail recursion to prevent unbounded history growth:
@@ -487,7 +500,7 @@ curl -X POST http://localhost:8001/ \
 
 ## MCP Integration
 
-Romancy provides [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) integration, allowing you to expose workflows as MCP tools for AI assistants like Claude Desktop.
+Romancy provides [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) integration, allowing you to expose workflows as MCP tools for AI assistants.
 
 ### Quick Start
 
@@ -553,25 +566,10 @@ func main() {
 	}
 	defer server.Shutdown(ctx)
 
-	// Run on stdio transport (for Claude Desktop)
+	// Run on stdio transport
 	if err := server.RunStdio(ctx); err != nil {
 		log.Fatal(err)
 	}
-}
-```
-
-### Claude Desktop Configuration
-
-Add to your Claude Desktop settings:
-
-```json
-{
-  "mcpServers": {
-    "order-service": {
-      "command": "go",
-      "args": ["run", "./examples/mcp/"]
-    }
-  }
 }
 ```
 
