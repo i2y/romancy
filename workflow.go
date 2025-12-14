@@ -99,6 +99,11 @@ func RegisterWorkflow[I, O any](app *App, workflow Workflow[I, O], opts ...Workf
 		// Create WorkflowContext from ExecutionContext
 		wfCtx := NewWorkflowContextFromExecution(execCtx)
 
+		// Set LLM defaults from app configuration
+		if llmDefaults := app.LLMDefaults(); llmDefaults != nil {
+			wfCtx.SetLLMDefaults(llmDefaults)
+		}
+
 		// Execute the workflow
 		return workflow.Execute(wfCtx, input)
 	}
