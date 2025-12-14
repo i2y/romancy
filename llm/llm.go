@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	bucephalus "github.com/i2y/bucephalus/llm"
 	"github.com/i2y/romancy"
+
+	bucephalus "github.com/i2y/bucephalus/llm"
 )
 
 // Message types re-exported from bucephalus for convenience.
@@ -37,13 +38,6 @@ const (
 	RoleTool      = bucephalus.RoleTool
 )
 
-// llmCallInput is the input for an LLM call activity.
-type llmCallInput struct {
-	Prompt   string    `json:"prompt,omitempty"`
-	Messages []Message `json:"messages,omitempty"`
-	Config   *config   `json:"config"`
-}
-
 // Call makes an LLM call and returns the response.
 // The call is automatically wrapped as a durable activity, so replay will
 // return the cached result without re-invoking the LLM API.
@@ -52,7 +46,7 @@ type llmCallInput struct {
 //
 //	response, err := llm.Call(ctx, "What is the capital of France?",
 //	    llm.WithProvider("anthropic"),
-//	    llm.WithModel("claude-sonnet-4-20250514"),
+//	    llm.WithModel("claude-sonnet-4-5-20250929"),
 //	)
 //	if err != nil {
 //	    return err
@@ -103,7 +97,7 @@ func Call(ctx *romancy.WorkflowContext, prompt string, opts ...Option) (*Durable
 //	book, err := llm.CallParse[BookRecommendation](ctx,
 //	    "Recommend a science fiction book",
 //	    llm.WithProvider("anthropic"),
-//	    llm.WithModel("claude-sonnet-4-20250514"),
+//	    llm.WithModel("claude-sonnet-4-5-20250929"),
 //	)
 func CallParse[T any](ctx *romancy.WorkflowContext, prompt string, opts ...Option) (*T, error) {
 	cfg := buildConfig(ctx, opts...)
@@ -157,7 +151,7 @@ func CallParse[T any](ctx *romancy.WorkflowContext, prompt string, opts ...Optio
 //
 //	response, err := llm.CallMessages(ctx, messages,
 //	    llm.WithProvider("anthropic"),
-//	    llm.WithModel("claude-sonnet-4-20250514"),
+//	    llm.WithModel("claude-sonnet-4-5-20250929"),
 //	)
 func CallMessages(ctx *romancy.WorkflowContext, messages []Message, opts ...Option) (*DurableResponse, error) {
 	cfg := buildConfig(ctx, opts...)
@@ -292,22 +286,7 @@ func cachedToParsedResult[T any](cached any) (*T, error) {
 // GetLLMDefaults retrieves LLM defaults from the workflow context.
 // Returns nil if no defaults are set.
 func GetLLMDefaults(ctx *romancy.WorkflowContext) []Option {
-	// Get defaults from WorkflowContext (set by romancy.App)
-	defaults := ctx.LLMDefaults()
-	if defaults == nil {
-		return nil
-	}
-
-	// Convert []any to []Option
-	opts := make([]Option, 0, len(defaults))
-	for _, d := range defaults {
-		if opt, ok := d.(Option); ok {
-			opts = append(opts, opt)
-		}
-	}
-
-	if len(opts) == 0 {
-		return nil
-	}
-	return opts
+	// Get defaults from the App via WorkflowContext
+	app := ctx.App()
+	return getAppDefaults(app)
 }

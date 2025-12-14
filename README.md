@@ -32,6 +32,7 @@ Romancy is a Go port of [Edda](https://github.com/i2y/edda) (Python), providing 
 - 📬 **Channel Messaging**: Broadcast and competing message delivery between workflows
 - 🔄 **Recur Pattern**: Erlang-style tail recursion for long-running workflows
 - 📡 **PostgreSQL LISTEN/NOTIFY**: Real-time event delivery without polling
+- 🤖 **LLM Integration**: Durable LLM calls via bucephalus with automatic caching for replay
 
 ## Documentation
 
@@ -584,6 +585,93 @@ When you register a workflow, Romancy automatically generates four MCP tools:
 | `{workflow}_result` | Get the result of a completed workflow |
 | `{workflow}_cancel` | Cancel a running workflow instance |
 
+## LLM Integration
+
+Romancy provides durable LLM calls via the [bucephalus](https://github.com/i2y/bucephalus) library. All LLM calls are automatically cached as activities, so workflow replay returns cached results without re-invoking the LLM API.
+
+### Quick Start
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/i2y/romancy"
+	"github.com/i2y/romancy/llm"
+
+	// Import the provider you want to use
+	_ "github.com/i2y/bucephalus/anthropic"
+)
+
+type SummaryInput struct {
+	Text string `json:"text"`
+}
+
+type SummaryResult struct {
+	Summary string `json:"summary"`
+}
+
+var summarizeWorkflow = romancy.DefineWorkflow("summarize",
+	func(ctx *romancy.WorkflowContext, input SummaryInput) (SummaryResult, error) {
+		// LLM call is cached for replay
+		response, err := llm.Call(ctx, input.Text,
+			llm.WithSystemMessage("Summarize the following text concisely."),
+		)
+		if err != nil {
+			return SummaryResult{}, err
+		}
+		return SummaryResult{Summary: response.Text}, nil
+	},
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Create app
+	app := romancy.NewApp(romancy.WithDatabase("workflow.db"))
+
+	// Set LLM defaults for the app
+	llm.SetAppDefaults(app,
+		llm.WithProvider("anthropic"),
+		llm.WithModel("claude-sonnet-4-5-20250929"),
+		llm.WithMaxTokens(1024),
+	)
+
+	romancy.RegisterWorkflow(app, summarizeWorkflow)
+
+	if err := app.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	defer app.Shutdown(ctx)
+
+	instanceID, _ := romancy.StartWorkflow(ctx, app, summarizeWorkflow, SummaryInput{
+		Text: "Long article text here...",
+	})
+	fmt.Println("Started:", instanceID)
+}
+```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| `llm.Call()` | Ad-hoc LLM call with automatic caching |
+| `llm.CallParse[T]()` | Parse response into a struct |
+| `llm.CallMessages()` | Multi-turn conversation |
+| `llm.DefineDurableCall()` | Reusable LLM definition |
+| `llm.DurableAgent[T]` | Stateful multi-turn agent |
+| `llm.SetAppDefaults()` | App-level default configuration |
+
+### Supported Providers
+
+Via bucephalus, Romancy supports:
+- **Anthropic** (Claude models)
+- **OpenAI** (GPT models)
+- **Google Gemini**
+
 ## Development
 
 ### Running Tests
@@ -605,6 +693,7 @@ romancy/
 ├── hooks/           # Observability hooks
 ├── outbox/          # Transactional outbox
 ├── mcp/             # MCP (Model Context Protocol) integration
+├── llm/             # LLM integration (via bucephalus)
 └── internal/
     ├── storage/     # Database abstraction
     └── replay/      # Deterministic replay engine

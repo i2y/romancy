@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	bucephalus "github.com/i2y/bucephalus/llm"
 	"github.com/i2y/romancy"
+
+	bucephalus "github.com/i2y/bucephalus/llm"
 )
 
 // AgentContext holds the state for a durable agent, including dependencies
@@ -54,7 +55,7 @@ func (c *AgentContext[T]) AddSystemMessage(content string) {
 //
 //	agent := llm.NewDurableAgent[MyDeps]("research_agent",
 //	    llm.WithProvider("anthropic"),
-//	    llm.WithModel("claude-sonnet-4-20250514"),
+//	    llm.WithModel("claude-sonnet-4-5-20250929"),
 //	).WithBuildPrompt(func(ctx *llm.AgentContext[MyDeps], message string) []llm.Message {
 //	    return []llm.Message{
 //	        llm.SystemMessage("You are a research assistant with access to: " + strings.Join(ctx.Deps.Documents, ", ")),

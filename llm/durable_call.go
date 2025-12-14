@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	bucephalus "github.com/i2y/bucephalus/llm"
 	"github.com/i2y/romancy"
+
+	bucephalus "github.com/i2y/bucephalus/llm"
 )
 
 // DurableCall represents a reusable LLM call configuration.
@@ -16,7 +17,7 @@ import (
 //
 //	var summarizer = llm.DefineDurableCall("summarize",
 //	    llm.WithProvider("anthropic"),
-//	    llm.WithModel("claude-sonnet-4-20250514"),
+//	    llm.WithModel("claude-sonnet-4-5-20250929"),
 //	    llm.WithSystemMessage("Summarize the given text concisely"),
 //	    llm.WithMaxTokens(500),
 //	)

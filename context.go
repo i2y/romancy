@@ -67,8 +67,8 @@ type WorkflowContext struct {
 	// Reference to the replay execution context (when using replay engine)
 	execCtx *replay.ExecutionContext
 
-	// LLM defaults (stored as []any to avoid circular dependency)
-	llmDefaults []any
+	// Reference to the App for accessing app-level configuration
+	app *App
 }
 
 // NewWorkflowContext creates a new WorkflowContext.
@@ -294,14 +294,14 @@ func (c *WorkflowContext) Hooks() hooks.WorkflowHooks {
 	return nil
 }
 
-// SetLLMDefaults sets the LLM defaults for this workflow context.
-// This is typically called internally by the App when creating the context.
-func (c *WorkflowContext) SetLLMDefaults(defaults []any) {
-	c.llmDefaults = defaults
+// SetApp sets the App reference for this workflow context.
+// This is typically called internally when creating the context.
+func (c *WorkflowContext) SetApp(app *App) {
+	c.app = app
 }
 
-// LLMDefaults returns the LLM defaults for this workflow context.
-// Returns nil if no defaults are set.
-func (c *WorkflowContext) LLMDefaults() []any {
-	return c.llmDefaults
+// App returns the App reference for this workflow context.
+// Returns nil if not set.
+func (c *WorkflowContext) App() *App {
+	return c.app
 }

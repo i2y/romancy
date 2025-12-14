@@ -1273,12 +1273,6 @@ func (a *App) WorkerID() string {
 	return a.config.workerID
 }
 
-// LLMDefaults returns the LLM defaults configured for this app.
-// Returns nil if no defaults are set.
-func (a *App) LLMDefaults() []any {
-	return a.config.llmDefaults
-}
-
 // ========================================
 // Channel Message Handling
 // ========================================

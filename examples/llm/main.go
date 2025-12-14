@@ -5,7 +5,7 @@
 //   - Structured output with llm.CallParse()
 //   - Multi-turn conversations with llm.CallMessages()
 //   - Reusable LLM definitions with llm.DefineDurableCall()
-//   - App-level LLM defaults with romancy.WithLLMDefaults()
+//   - App-level LLM defaults with llm.SetAppDefaults()
 //
 // The key benefit is that all LLM calls are automatically cached as activities,
 // so workflow replay will return cached results without re-invoking the LLM API.
@@ -123,21 +123,30 @@ var conversationWorkflow = romancy.DefineWorkflow("conversation",
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	// Check for API key
 	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		log.Fatal("ANTHROPIC_API_KEY environment variable is required")
+		return fmt.Errorf("ANTHROPIC_API_KEY environment variable is required")
 	}
 
 	ctx := context.Background()
 
-	// Create app with LLM defaults
+	// Create app
 	app := romancy.NewApp(
 		romancy.WithDatabase("file:llm_example.db"),
-		romancy.WithLLMDefaults(
-			llm.WithProvider("anthropic"),
-			llm.WithModel("claude-sonnet-4-20250514"),
-			llm.WithMaxTokens(1024),
-		),
+	)
+
+	// Set LLM defaults for the app
+	// Note: Use claude-sonnet-4-5 for structured output support (CallParse)
+	llm.SetAppDefaults(app,
+		llm.WithProvider("anthropic"),
+		llm.WithModel("claude-sonnet-4-5-20250929"),
+		llm.WithMaxTokens(1024),
 	)
 
 	// Register workflows
@@ -148,7 +157,7 @@ func main() {
 
 	// Start the app
 	if err := app.Start(ctx); err != nil {
-		log.Fatalf("Failed to start app: %v", err)
+		return fmt.Errorf("failed to start app: %w", err)
 	}
 	defer func() {
 		if err := app.Shutdown(ctx); err != nil {
@@ -168,7 +177,7 @@ func main() {
 
 	instanceID, err := romancy.StartWorkflow(ctx, app, summarizeWorkflow, SummaryInput{Text: sampleText})
 	if err != nil {
-		log.Fatalf("Failed to start workflow: %v", err)
+		return fmt.Errorf("failed to start workflow: %w", err)
 	}
 	fmt.Printf("Started summarize workflow: %s\n", instanceID)
 
@@ -176,14 +185,14 @@ func main() {
 	for {
 		result, err := romancy.GetWorkflowResult[SummaryResult](ctx, app, instanceID)
 		if err != nil {
-			log.Fatalf("Failed to get result: %v", err)
+			return fmt.Errorf("failed to get result: %w", err)
 		}
 		if result.Status == "completed" {
 			fmt.Printf("Summary: %s\n\n", result.Output.Summary)
 			break
 		}
 		if result.Status == "failed" {
-			log.Fatalf("Workflow failed: %v", result.Error)
+			return fmt.Errorf("workflow failed: %v", result.Error)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -192,7 +201,7 @@ func main() {
 	fmt.Println("=== Example 2: Book Recommendation ===")
 	instanceID2, err := romancy.StartWorkflow(ctx, app, recommendBookWorkflow, "science fiction")
 	if err != nil {
-		log.Fatalf("Failed to start workflow: %v", err)
+		return fmt.Errorf("failed to start workflow: %w", err)
 	}
 	fmt.Printf("Started recommend_book workflow: %s\n", instanceID2)
 
@@ -200,7 +209,7 @@ func main() {
 	for {
 		result, err := romancy.GetWorkflowResult[*BookRecommendation](ctx, app, instanceID2)
 		if err != nil {
-			log.Fatalf("Failed to get result: %v", err)
+			return fmt.Errorf("failed to get result: %w", err)
 		}
 		if result.Status == "completed" {
 			fmt.Printf("Recommended Book:\n")
@@ -210,7 +219,7 @@ func main() {
 			break
 		}
 		if result.Status == "failed" {
-			log.Fatalf("Workflow failed: %v", result.Error)
+			return fmt.Errorf("workflow failed: %v", result.Error)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -219,7 +228,7 @@ func main() {
 	fmt.Println("=== Example 3: Multi-turn Conversation ===")
 	instanceID3, err := romancy.StartWorkflow(ctx, app, conversationWorkflow, "goroutines in Go")
 	if err != nil {
-		log.Fatalf("Failed to start workflow: %v", err)
+		return fmt.Errorf("failed to start workflow: %w", err)
 	}
 	fmt.Printf("Started conversation workflow: %s\n", instanceID3)
 
@@ -227,17 +236,18 @@ func main() {
 	for {
 		result, err := romancy.GetWorkflowResult[string](ctx, app, instanceID3)
 		if err != nil {
-			log.Fatalf("Failed to get result: %v", err)
+			return fmt.Errorf("failed to get result: %w", err)
 		}
 		if result.Status == "completed" {
 			fmt.Printf("Final response: %s\n", result.Output)
 			break
 		}
 		if result.Status == "failed" {
-			log.Fatalf("Workflow failed: %v", result.Error)
+			return fmt.Errorf("workflow failed: %v", result.Error)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	fmt.Println("\nAll examples completed!")
+	return nil
 }

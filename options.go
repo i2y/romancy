@@ -59,9 +59,6 @@ type appConfig struct {
 
 	// Shutdown
 	shutdownTimeout time.Duration
-
-	// LLM defaults (stored as []any to avoid circular dependency with llm package)
-	llmDefaults []any
 }
 
 // defaultConfig returns the default configuration.
@@ -334,25 +331,5 @@ func WithMaxMessagesPerBatch(n int) Option {
 		if n > 0 {
 			c.maxMessagesPerBatch = n
 		}
-	}
-}
-
-// WithLLMDefaults sets default LLM options for all LLM calls in workflows.
-// The options are passed as any type to avoid circular dependency with the llm package.
-// Use llm.Option values from the github.com/i2y/romancy/llm package.
-//
-// Example:
-//
-//	app := romancy.NewApp(
-//	    romancy.WithDatabase("workflow.db"),
-//	    romancy.WithLLMDefaults(
-//	        llm.WithProvider("anthropic"),
-//	        llm.WithModel("claude-sonnet-4-20250514"),
-//	        llm.WithMaxTokens(1024),
-//	    ),
-//	)
-func WithLLMDefaults(opts ...any) Option {
-	return func(c *appConfig) {
-		c.llmDefaults = opts
 	}
 }

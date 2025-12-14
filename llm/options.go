@@ -81,7 +81,7 @@ func WithProvider(provider string) Option {
 	}
 }
 
-// WithModel sets the model name (e.g., "claude-sonnet-4-20250514", "gpt-4o").
+// WithModel sets the model name (e.g., "claude-sonnet-4-5-20250929", "gpt-4o").
 func WithModel(model string) Option {
 	return func(c *config) {
 		c.model = model
@@ -144,47 +144,4 @@ func WithStopSequences(seqs ...string) Option {
 	return func(c *config) {
 		c.stopSequences = seqs
 	}
-}
-
-// mergeConfigs merges multiple configs, with later configs taking precedence.
-func mergeConfigs(configs ...*config) *config {
-	result := newConfig()
-
-	for _, c := range configs {
-		if c == nil {
-			continue
-		}
-		if c.provider != "" {
-			result.provider = c.provider
-		}
-		if c.model != "" {
-			result.model = c.model
-		}
-		if c.temperature != nil {
-			result.temperature = c.temperature
-		}
-		if c.maxTokens != nil {
-			result.maxTokens = c.maxTokens
-		}
-		if c.topP != nil {
-			result.topP = c.topP
-		}
-		if c.topK != nil {
-			result.topK = c.topK
-		}
-		if c.seed != nil {
-			result.seed = c.seed
-		}
-		if c.systemMessage != "" {
-			result.systemMessage = c.systemMessage
-		}
-		if len(c.tools) > 0 {
-			result.tools = c.tools
-		}
-		if len(c.stopSequences) > 0 {
-			result.stopSequences = c.stopSequences
-		}
-	}
-
-	return result
 }
