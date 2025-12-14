@@ -2,7 +2,6 @@ baseURL = "https://i2y.github.io/romancy/"
 title = "Romancy"
 languageCode = "en"
 defaultContentLanguage = "en"
-copyright = "© 2025 Yasushi Itoh"
 
 # Hugo modules
 [module]
@@ -23,7 +22,6 @@ width = "wide"
 [params.footer]
 displayCopyright = true
 displayPoweredBy = true
-copyright = "© 2025 Yasushi Itoh"
 
 [params.editURL]
 enable = true
