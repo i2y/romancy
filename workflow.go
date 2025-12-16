@@ -196,9 +196,11 @@ func GetWorkflowResult[O any](ctx context.Context, app *App, instanceID string) 
 		Status:     string(instance.Status),
 	}
 
-	// Parse error if present
-	if instance.ErrorMessage != "" {
-		result.Error = fmt.Errorf("%s", instance.ErrorMessage)
+	// Get error from history events if workflow failed
+	if instance.Status == storage.StatusFailed {
+		if errMsg := getWorkflowErrorFromHistory(ctx, app.Storage(), instanceID); errMsg != "" {
+			result.Error = fmt.Errorf("%s", errMsg)
+		}
 	}
 
 	// Deserialize output if present and workflow completed
@@ -211,6 +213,28 @@ func GetWorkflowResult[O any](ctx context.Context, app *App, instanceID string) 
 	}
 
 	return result, nil
+}
+
+// getWorkflowErrorFromHistory retrieves the error message from history events.
+func getWorkflowErrorFromHistory(ctx context.Context, s storage.Storage, instanceID string) string {
+	history, _, err := s.GetHistoryPaginated(ctx, instanceID, 0, 1000)
+	if err != nil {
+		return ""
+	}
+	// Search from the end for the most recent WorkflowFailed event
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].EventType == storage.HistoryWorkflowFailed {
+			// EventData is JSON-encoded, parse it
+			var eventData map[string]any
+			if err := json.Unmarshal(history[i].EventData, &eventData); err != nil {
+				continue
+			}
+			if errMsg, ok := eventData["error"].(string); ok {
+				return errMsg
+			}
+		}
+	}
+	return ""
 }
 
 // CancelWorkflow cancels a running workflow instance.

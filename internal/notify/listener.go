@@ -16,13 +16,13 @@ type NotifyChannel string
 
 const (
 	// ChannelWorkflowResumable is notified when a workflow becomes resumable.
-	ChannelWorkflowResumable NotifyChannel = "romancy_workflow_resumable"
+	ChannelWorkflowResumable NotifyChannel = "workflow_resumable"
 	// ChannelTimerExpired is notified when a timer is registered.
-	ChannelTimerExpired NotifyChannel = "romancy_timer_expired"
+	ChannelTimerExpired NotifyChannel = "workflow_timer_expired"
 	// ChannelChannelMessage is notified when a channel message is published.
-	ChannelChannelMessage NotifyChannel = "romancy_channel_message"
+	ChannelChannelMessage NotifyChannel = "workflow_channel_message"
 	// ChannelOutboxPending is notified when an outbox event is added.
-	ChannelOutboxPending NotifyChannel = "romancy_outbox_pending"
+	ChannelOutboxPending NotifyChannel = "workflow_outbox_pending"
 )
 
 // AllChannels returns all notification channels.

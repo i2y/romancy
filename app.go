@@ -236,6 +236,15 @@ func (a *App) initStorage() error {
 	// Create the replay engine
 	a.engine = replay.NewEngine(a.storage, a.hooks, a.config.workerID)
 
+	// Set up compensation runner to execute compensations via the global registry
+	a.engine.SetCompensationRunner(func(ctx context.Context, funcName string, arg []byte) error {
+		executor, ok := GetCompensationExecutor(funcName)
+		if !ok {
+			return fmt.Errorf("compensation executor not found for %s", funcName)
+		}
+		return executor(ctx, arg)
+	})
+
 	return nil
 }
 
@@ -691,7 +700,7 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 		WorkflowName: workflowName,
 		Status:       storage.StatusPending,
 		InputData:    inputData,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 
@@ -882,15 +891,16 @@ func (a *App) cancelWorkflow(ctx context.Context, instanceID, reason string) err
 		InstanceID:   instanceID,
 		WorkflowName: instance.WorkflowName,
 		Reason:       reason,
-		Duration:     time.Since(instance.CreatedAt),
+		Duration:     time.Since(instance.StartedAt),
 	})
 
 	return nil
 }
 
 // executeCompensations executes all pending compensations for a workflow in LIFO order.
+// Status is tracked via history events (CompensationExecuted, CompensationFailed).
 func (a *App) executeCompensations(ctx context.Context, instanceID string) error {
-	// Get pending compensations (ordered by Order DESC - LIFO)
+	// Get pending compensations (ordered by created_at DESC - LIFO)
 	compensations, err := a.storage.GetCompensations(ctx, instanceID)
 	if err != nil {
 		return fmt.Errorf("failed to get compensations: %w", err)
@@ -900,35 +910,104 @@ func (a *App) executeCompensations(ctx context.Context, instanceID string) error
 		return nil
 	}
 
+	// Get executed compensation IDs from history
+	executedIDs, err := a.getExecutedCompensationIDs(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to get executed compensations: %w", err)
+	}
+
 	var lastErr error
 	for _, comp := range compensations {
-		if comp.Status != "pending" {
-			continue // Skip already executed compensations
+		// Skip already executed compensations
+		if _, executed := executedIDs[comp.ID]; executed {
+			continue
 		}
 
 		// Get the compensation executor
-		executor, ok := GetCompensationExecutor(comp.CompensationFn)
+		executor, ok := GetCompensationExecutor(comp.ActivityName)
 		if !ok {
-			slog.Warn("compensation executor not found", "activity", comp.CompensationFn)
-			_ = a.storage.MarkCompensationFailed(ctx, comp.ID)
+			slog.Warn("compensation executor not found", "activity", comp.ActivityName)
+			_ = a.recordCompensationResult(ctx, instanceID, comp, false, "executor not found")
 			continue
 		}
 
 		// Execute the compensation
-		if err := executor(ctx, comp.CompensationArg); err != nil {
-			slog.Error("compensation failed", "activity", comp.CompensationFn, "error", err)
-			_ = a.storage.MarkCompensationFailed(ctx, comp.ID)
+		if err := executor(ctx, comp.Args); err != nil {
+			slog.Error("compensation failed", "activity", comp.ActivityName, "error", err)
+			_ = a.recordCompensationResult(ctx, instanceID, comp, false, err.Error())
 			lastErr = err
 			continue
 		}
 
-		// Mark as executed
-		if err := a.storage.MarkCompensationExecuted(ctx, comp.ID); err != nil {
-			slog.Error("failed to mark compensation as executed", "error", err)
+		// Record success in history
+		if err := a.recordCompensationResult(ctx, instanceID, comp, true, ""); err != nil {
+			slog.Error("failed to record compensation result", "error", err)
 		}
 	}
 
 	return lastErr
+}
+
+// getExecutedCompensationIDs returns a set of compensation IDs that have been executed.
+func (a *App) getExecutedCompensationIDs(ctx context.Context, instanceID string) (map[int64]bool, error) {
+	executed := make(map[int64]bool)
+
+	// Iterate through all history events to find compensation results
+	var afterID int64
+	const pageSize = 100
+	for {
+		events, hasMore, err := a.storage.GetHistoryPaginated(ctx, instanceID, afterID, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			if event.EventType == storage.HistoryCompensationExecuted ||
+				event.EventType == storage.HistoryCompensationFailed {
+				// Parse compensation_id from event data
+				var eventData map[string]any
+				if err := json.Unmarshal(event.EventData, &eventData); err == nil {
+					if id, ok := eventData["compensation_id"].(float64); ok {
+						executed[int64(id)] = true
+					}
+				}
+			}
+			afterID = event.ID
+		}
+		if !hasMore {
+			break
+		}
+	}
+	return executed, nil
+}
+
+// recordCompensationResult records a compensation execution result to history.
+func (a *App) recordCompensationResult(ctx context.Context, instanceID string, entry *storage.CompensationEntry, success bool, errorMsg string) error {
+	eventType := storage.HistoryCompensationExecuted
+	if !success {
+		eventType = storage.HistoryCompensationFailed
+	}
+
+	eventData := map[string]any{
+		"compensation_id": entry.ID,
+		"activity_id":     entry.ActivityID,
+		"activity_name":   entry.ActivityName,
+	}
+	if errorMsg != "" {
+		eventData["error"] = errorMsg
+	}
+
+	eventDataBytes, err := json.Marshal(eventData)
+	if err != nil {
+		return err
+	}
+
+	return a.storage.AppendHistory(ctx, &storage.HistoryEvent{
+		InstanceID: instanceID,
+		ActivityID: fmt.Sprintf("compensation:%d", entry.ID),
+		EventType:  eventType,
+		EventData:  eventDataBytes,
+		DataType:   "json",
+	})
 }
 
 // Handler returns an http.Handler for CloudEvents and health endpoints.
@@ -1140,28 +1219,34 @@ func (a *App) deliverEventToWaitingWorkflows(ctx context.Context, event *CloudEv
 		targetInstanceID = id
 	}
 
+	// Determine channel name: use dynamic channel name for targeted messages (Edda approach)
+	channelName := event.Type
+	if targetInstanceID != "" {
+		channelName = fmt.Sprintf("%s:%s", event.Type, targetInstanceID)
+	}
+
 	// Publish to channel using event.Type as channel name
-	messageID, err := a.storage.PublishToChannel(ctx, event.Type, dataJSON, nil, targetInstanceID)
+	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, nil)
 	if err != nil {
 		return fmt.Errorf("failed to publish event to channel: %w", err)
 	}
 
 	// Wake up waiting subscribers using the unified channel system
 	// This uses DeliverChannelMessageWithLock which handles locking and history recording
-	a.wakeWaitingChannelSubscribers(ctx, event.Type, messageID, dataJSON, nil, targetInstanceID)
+	a.wakeWaitingChannelSubscribers(ctx, channelName, messageID, dataJSON, nil)
 
 	return nil
 }
 
 // wakeWaitingChannelSubscribers delivers a message to waiting channel subscribers.
 // This is the App-level version of wakeWaitingSubscribers from channels.go.
+// Targeted delivery is handled via dynamic channel names (e.g., "channel:instance_id").
 func (a *App) wakeWaitingChannelSubscribers(
 	ctx context.Context,
 	channelName string,
 	messageID int64,
 	dataJSON []byte,
 	metadataJSON []byte,
-	targetInstanceID string,
 ) {
 	// Find waiting subscribers
 	waitingSubs, err := a.storage.GetChannelSubscribersWaiting(ctx, channelName)
@@ -1176,20 +1261,15 @@ func (a *App) wakeWaitingChannelSubscribers(
 
 	// Create message for delivery
 	message := &storage.ChannelMessage{
-		ID:          messageID,
-		ChannelName: channelName,
-		DataJSON:    dataJSON,
-		Metadata:    metadataJSON,
+		ID:       messageID,
+		Channel:  channelName,
+		Data:     dataJSON,
+		Metadata: metadataJSON,
 	}
 
 	lockTimeoutSec := int(a.config.staleLockTimeout.Seconds())
 
 	for _, sub := range waitingSubs {
-		// If targetInstanceID is specified, only deliver to that instance
-		if targetInstanceID != "" && sub.InstanceID != targetInstanceID {
-			continue
-		}
-
 		// Deliver using Lock-First pattern
 		result, err := a.storage.DeliverChannelMessageWithLock(
 			ctx,
@@ -1360,19 +1440,19 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 	a.hooks.OnEventTimeout(a.ctx, hooks.EventTimeoutInfo{
 		InstanceID:   sub.InstanceID,
 		WorkflowName: workflowName,
-		EventType:    sub.ChannelName,
+		EventType:    sub.Channel,
 	})
 
 	// Record timeout error in history using the activity_id from the subscription
 	// This allows Receive to return the timeout error when the workflow resumes
 	activityID := sub.ActivityID
 	if activityID == "" {
-		activityID = fmt.Sprintf("receive_%s:timeout", sub.ChannelName)
+		activityID = fmt.Sprintf("receive_%s:timeout", sub.Channel)
 	}
 
 	timeoutErr := &ChannelMessageTimeoutError{
 		InstanceID:  sub.InstanceID,
-		ChannelName: sub.ChannelName,
+		ChannelName: sub.Channel,
 	}
 	errJSON, _ := json.Marshal(timeoutErr.Error())
 
@@ -1389,7 +1469,7 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 	}
 
 	// Clear waiting state
-	if err := a.storage.ClearChannelWaitingState(a.ctx, sub.InstanceID, sub.ChannelName); err != nil {
+	if err := a.storage.ClearChannelWaitingState(a.ctx, sub.InstanceID, sub.Channel); err != nil {
 		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, a.config.workerID)
 		return err
 	}

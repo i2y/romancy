@@ -207,7 +207,7 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 
 		// Deserialize the message
 		var data T
-		if err := json.Unmarshal(msg.DataJSON, &data); err != nil {
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
 			return nil, fmt.Errorf("failed to deserialize message data: %w", err)
 		}
 
@@ -223,7 +223,7 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 			ChannelName: channelName,
 			Data:        data,
 			Metadata:    metadata,
-			CreatedAt:   msg.CreatedAt,
+			CreatedAt:   msg.PublishedAt,
 		}
 
 		// Record to history for replay (synchronous message processing)
@@ -297,7 +297,7 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 		return fmt.Errorf("storage not available")
 	}
 
-	messageID, err := s.PublishToChannel(ctx.Context(), channelName, dataJSON, metadataJSON, "")
+	messageID, err := s.PublishToChannel(ctx.Context(), channelName, dataJSON, metadataJSON)
 	if err != nil {
 		return fmt.Errorf("failed to publish to channel: %w", err)
 	}
@@ -314,12 +314,12 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 		mJSON := metadataJSON
 
 		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
-			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON, "")
+			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON)
 			return nil
 		})
 	} else {
 		// Deliver immediately
-		wakeWaitingSubscribers(ctx, s, channelName, messageID, dataJSON, metadataJSON, "")
+		wakeWaitingSubscribers(ctx, s, channelName, messageID, dataJSON, metadataJSON)
 	}
 
 	// Record for replay
@@ -335,6 +335,8 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 // 3. The runWorkflowResumption task will pick up the workflow
 // For competing mode, only one subscriber is woken up.
 // For broadcast mode, all subscribers are woken up.
+// Note: SendTo uses dynamic channel names (e.g., "channel:instance_id") to ensure
+// only the target instance receives the message, so no filtering is needed here.
 func wakeWaitingSubscribers(
 	ctx *WorkflowContext,
 	s storage.Storage,
@@ -342,7 +344,6 @@ func wakeWaitingSubscribers(
 	messageID int64,
 	dataJSON []byte,
 	metadataJSON []byte,
-	targetInstanceID string,
 ) {
 	// Find waiting subscribers
 	waitingSubs, err := s.GetChannelSubscribersWaiting(ctx.Context(), channelName)
@@ -358,21 +359,16 @@ func wakeWaitingSubscribers(
 
 	// Create message for delivery
 	message := &storage.ChannelMessage{
-		ID:          messageID,
-		ChannelName: channelName,
-		DataJSON:    dataJSON,
-		Metadata:    metadataJSON,
+		ID:       messageID,
+		Channel:  channelName,
+		Data:     dataJSON,
+		Metadata: metadataJSON,
 	}
 
 	workerID := ctx.WorkerID()
 	lockTimeoutSec := 300 // 5 minutes
 
 	for _, sub := range waitingSubs {
-		// If targetInstanceID is specified (SendTo), only deliver to that instance
-		if targetInstanceID != "" && sub.InstanceID != targetInstanceID {
-			continue
-		}
-
 		// Deliver using Lock-First pattern
 		result, err := s.DeliverChannelMessageWithLock(
 			ctx.Context(),
@@ -410,6 +406,8 @@ func WithMetadata(metadata map[string]any) PublishOption {
 
 // SendTo sends a direct message to a specific workflow instance.
 // The target instance must be subscribed to the channel.
+// Uses dynamic channel names (Edda approach): publishes to "channel:instance_id"
+// so only the target instance receives the message.
 func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, data T, opts ...PublishOption) error {
 	options := &publishOptions{}
 	for _, opt := range opts {
@@ -439,13 +437,15 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 		}
 	}
 
-	// Publish with target
+	// Publish to direct channel (Edda approach: dynamic channel names)
+	// This ensures only the target instance can receive the message
 	s := ctx.Storage()
 	if s == nil {
 		return fmt.Errorf("storage not available")
 	}
 
-	messageID, err := s.PublishToChannel(ctx.Context(), channelName, dataJSON, metadataJSON, targetInstanceID)
+	directChannel := fmt.Sprintf("%s:%s", channelName, targetInstanceID)
+	messageID, err := s.PublishToChannel(ctx.Context(), directChannel, dataJSON, metadataJSON)
 	if err != nil {
 		return fmt.Errorf("failed to send to instance: %w", err)
 	}
@@ -456,19 +456,18 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 		// Capture variables for closure
 		wfCtx := ctx
 		store := s
-		chName := channelName
+		chName := directChannel
 		msgID := messageID
 		dJSON := dataJSON
 		mJSON := metadataJSON
-		targetID := targetInstanceID
 
 		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
-			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON, targetID)
+			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON)
 			return nil
 		})
 	} else {
 		// Deliver immediately
-		wakeWaitingSubscribers(ctx, s, channelName, messageID, dataJSON, metadataJSON, targetInstanceID)
+		wakeWaitingSubscribers(ctx, s, directChannel, messageID, dataJSON, metadataJSON)
 	}
 
 	// Record for replay

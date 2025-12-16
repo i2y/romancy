@@ -108,9 +108,8 @@ type StatusOutput struct {
 	InstanceID   string `json:"instance_id" jsonschema:"The workflow instance ID"`
 	Status       string `json:"status" jsonschema:"Current status: pending, running, completed, failed, cancelled"`
 	WorkflowName string `json:"workflow_name" jsonschema:"The name of the workflow"`
-	CreatedAt    string `json:"created_at" jsonschema:"When the workflow was created in RFC3339 format"`
+	StartedAt    string `json:"started_at" jsonschema:"When the workflow was started in RFC3339 format"`
 	UpdatedAt    string `json:"updated_at" jsonschema:"When the workflow was last updated in RFC3339 format"`
-	ErrorMessage string `json:"error_message,omitempty" jsonschema:"Error message if the workflow failed"`
 }
 
 // registerStatusTool registers the {workflow}_status tool.
@@ -132,9 +131,8 @@ func registerStatusTool(server *Server, prefix string, config *workflowToolConfi
 			InstanceID:   instance.InstanceID,
 			Status:       string(instance.Status),
 			WorkflowName: instance.WorkflowName,
-			CreatedAt:    instance.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			StartedAt:    instance.StartedAt.Format("2006-01-02T15:04:05Z07:00"),
 			UpdatedAt:    instance.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			ErrorMessage: instance.ErrorMessage,
 		}, nil
 	}
 

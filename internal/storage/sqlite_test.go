@@ -37,7 +37,7 @@ func TestSQLiteStorage(t *testing.T) {
 			WorkflowName: "test-workflow",
 			Status:       StatusPending,
 			InputData:    []byte(`{"name":"test"}`),
-			CreatedAt:    time.Now(),
+			StartedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 		}
 
@@ -363,7 +363,7 @@ func TestSQLiteStorage(t *testing.T) {
 			WorkflowName: "test-broadcast-workflow",
 			Status:       StatusRunning,
 			InputData:    []byte(`{}`),
-			CreatedAt:    time.Now(),
+			StartedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 		}
 		if err := storage.CreateInstance(ctx, instance); err != nil {
@@ -390,7 +390,7 @@ func TestSQLiteStorage(t *testing.T) {
 
 		// 4. Publish a message to the channel
 		data := []byte(`{"content": "test broadcast message"}`)
-		_, err = storage.PublishToChannel(ctx, channelName, data, nil, "")
+		_, err = storage.PublishToChannel(ctx, channelName, data, nil)
 		if err != nil {
 			t.Fatalf("failed to publish message: %v", err)
 		}
@@ -489,7 +489,7 @@ func TestSQLiteStorage_InputFilters(t *testing.T) {
 			WorkflowName: "filter_test_workflow",
 			Status:       StatusPending,
 			InputData:    []byte(inst.input),
-			CreatedAt:    time.Now(),
+			StartedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 		}
 		if err := storage.CreateInstance(ctx, instance); err != nil {

@@ -147,13 +147,17 @@ func (s *SQLiteStorage) RegisterPostCommitCallback(ctx context.Context, cb func(
 // CreateInstance creates a new workflow instance.
 func (s *SQLiteStorage) CreateInstance(ctx context.Context, instance *WorkflowInstance) error {
 	conn := s.getConn(ctx)
+	framework := instance.Framework
+	if framework == "" {
+		framework = "go" // Default framework
+	}
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
-			instance_id, workflow_name, status, input_data, source_code, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, instance.InstanceID, instance.WorkflowName, instance.Status,
-		string(instance.InputData), instance.SourceCode,
-		instance.CreatedAt.UTC().Format("2006-01-02 15:04:05"),
+			instance_id, workflow_name, framework, status, input_data, source_code, source_hash, owner_service, started_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, instance.InstanceID, instance.WorkflowName, framework, instance.Status,
+		string(instance.InputData), instance.SourceCode, instance.SourceHash, instance.OwnerService,
+		instance.StartedAt.UTC().Format("2006-01-02 15:04:05"),
 		instance.UpdatedAt.UTC().Format("2006-01-02 15:04:05"))
 	return err
 }
@@ -162,24 +166,25 @@ func (s *SQLiteStorage) CreateInstance(ctx context.Context, instance *WorkflowIn
 func (s *SQLiteStorage) GetInstance(ctx context.Context, instanceID string) (*WorkflowInstance, error) {
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
-		SELECT instance_id, workflow_name, status, input_data, output_data,
-			   error_message, current_activity_id, source_code,
+		SELECT instance_id, workflow_name, framework, status, input_data, output_data,
+			   current_activity_id, source_code, source_hash, owner_service,
 			   locked_by, locked_at, lock_timeout_seconds, lock_expires_at,
-			   created_at, updated_at
+			   started_at, updated_at
 		FROM workflow_instances WHERE instance_id = ?
 	`, instanceID)
 
 	var inst WorkflowInstance
-	var inputData, outputData, errorMsg, activityID, sourceCode sql.NullString
+	var inputData, outputData, framework, activityID, sourceCode, sourceHash, ownerService sql.NullString
 	var lockedBy sql.NullString
-	var lockedAt, lockExpiresAt sql.NullTime
+	var lockedAt, lockExpiresAt sql.NullString // SQLite stores datetime as TEXT
+	var startedAt, updatedAt sql.NullString    // SQLite stores datetime as TEXT
 	var lockTimeout sql.NullInt64
 
 	err := row.Scan(
-		&inst.InstanceID, &inst.WorkflowName, &inst.Status,
-		&inputData, &outputData, &errorMsg, &activityID, &sourceCode,
+		&inst.InstanceID, &inst.WorkflowName, &framework, &inst.Status,
+		&inputData, &outputData, &activityID, &sourceCode, &sourceHash, &ownerService,
 		&lockedBy, &lockedAt, &lockTimeout, &lockExpiresAt,
-		&inst.CreatedAt, &inst.UpdatedAt,
+		&startedAt, &updatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -194,8 +199,8 @@ func (s *SQLiteStorage) GetInstance(ctx context.Context, instanceID string) (*Wo
 	if outputData.Valid {
 		inst.OutputData = []byte(outputData.String)
 	}
-	if errorMsg.Valid {
-		inst.ErrorMessage = errorMsg.String
+	if framework.Valid {
+		inst.Framework = framework.String
 	}
 	if activityID.Valid {
 		inst.CurrentActivityID = activityID.String
@@ -203,31 +208,53 @@ func (s *SQLiteStorage) GetInstance(ctx context.Context, instanceID string) (*Wo
 	if sourceCode.Valid {
 		inst.SourceCode = sourceCode.String
 	}
+	if sourceHash.Valid {
+		inst.SourceHash = sourceHash.String
+	}
+	if ownerService.Valid {
+		inst.OwnerService = ownerService.String
+	}
 	if lockedBy.Valid {
 		inst.LockedBy = lockedBy.String
 	}
 	if lockedAt.Valid {
-		inst.LockedAt = &lockedAt.Time
+		if t, err := time.Parse("2006-01-02 15:04:05", lockedAt.String); err == nil {
+			inst.LockedAt = &t
+		}
 	}
 	if lockTimeout.Valid {
 		timeout := int(lockTimeout.Int64)
 		inst.LockTimeoutSec = &timeout
 	}
 	if lockExpiresAt.Valid {
-		inst.LockExpiresAt = &lockExpiresAt.Time
+		if t, err := time.Parse("2006-01-02 15:04:05", lockExpiresAt.String); err == nil {
+			inst.LockExpiresAt = &t
+		}
+	}
+	if startedAt.Valid {
+		if t, err := time.Parse("2006-01-02 15:04:05", startedAt.String); err == nil {
+			inst.StartedAt = t
+		}
+	}
+	if updatedAt.Valid {
+		if t, err := time.Parse("2006-01-02 15:04:05", updatedAt.String); err == nil {
+			inst.UpdatedAt = t
+		}
 	}
 
 	return &inst, nil
 }
 
 // UpdateInstanceStatus updates the status of a workflow instance.
+// Note: errorMsg parameter is kept for interface compatibility but is ignored.
+// Error messages are tracked via history events (WorkflowFailed).
 func (s *SQLiteStorage) UpdateInstanceStatus(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
-		SET status = ?, error_message = ?, updated_at = datetime('now')
+		SET status = ?, updated_at = datetime('now')
 		WHERE instance_id = ?
-	`, status, errorMsg, instanceID)
+	`, status, instanceID)
 	return err
 }
 
@@ -255,13 +282,15 @@ func (s *SQLiteStorage) UpdateInstanceOutput(ctx context.Context, instanceID str
 
 // CancelInstance cancels a workflow instance.
 // Returns ErrWorkflowNotCancellable if the workflow is already completed, cancelled, failed, or does not exist.
+// Note: reason parameter is kept for interface compatibility but is ignored.
+// Cancellation reasons are tracked via history events.
 func (s *SQLiteStorage) CancelInstance(ctx context.Context, instanceID, reason string) error {
 	conn := s.getConn(ctx)
 	result, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
-		SET status = 'cancelled', error_message = ?, updated_at = datetime('now')
+		SET status = 'cancelled', updated_at = datetime('now')
 		WHERE instance_id = ? AND status IN ('pending', 'running', 'waiting_for_event', 'waiting_for_timer', 'waiting_for_message', 'recurred')
-	`, reason, instanceID)
+	`, instanceID)
 	if err != nil {
 		return err
 	}
@@ -278,7 +307,7 @@ func (s *SQLiteStorage) CancelInstance(ctx context.Context, instanceID, reason s
 // ListInstances lists workflow instances with cursor-based pagination and filters.
 func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOptions) (*PaginationResult, error) {
 	conn := s.getConn(ctx)
-	query := "SELECT instance_id, workflow_name, status, created_at, updated_at FROM workflow_instances WHERE 1=1"
+	query := "SELECT instance_id, workflow_name, status, started_at, updated_at FROM workflow_instances WHERE 1=1"
 	args := []any{}
 
 	// Handle both new and deprecated filter options
@@ -305,11 +334,11 @@ func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOpt
 		args = append(args, "%"+opts.InstanceIDFilter+"%")
 	}
 	if opts.StartedAfter != nil {
-		query += " AND datetime(created_at) > datetime(?)"
+		query += " AND datetime(started_at) > datetime(?)"
 		args = append(args, opts.StartedAfter.UTC().Format("2006-01-02 15:04:05"))
 	}
 	if opts.StartedBefore != nil {
-		query += " AND datetime(created_at) < datetime(?)"
+		query += " AND datetime(started_at) < datetime(?)"
 		args = append(args, opts.StartedBefore.UTC().Format("2006-01-02 15:04:05"))
 	}
 
@@ -333,8 +362,8 @@ func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOpt
 			cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
 			if err == nil {
 				cursorID := parts[1]
-				// For descending order: get rows where (created_at, instance_id) < (cursor_time, cursor_id)
-				query += " AND (datetime(created_at) < datetime(?) OR (datetime(created_at) = datetime(?) AND instance_id < ?))"
+				// For descending order: get rows where (started_at, instance_id) < (cursor_time, cursor_id)
+				query += " AND (datetime(started_at) < datetime(?) OR (datetime(started_at) = datetime(?) AND instance_id < ?))"
 				cursorTimeStr := cursorTime.UTC().Format("2006-01-02 15:04:05")
 				args = append(args, cursorTimeStr, cursorTimeStr, cursorID)
 			}
@@ -346,7 +375,7 @@ func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOpt
 		limit = 50 // Default page size
 	}
 	// Fetch one extra to determine if there are more pages
-	query += " ORDER BY created_at DESC, instance_id DESC LIMIT ?"
+	query += " ORDER BY started_at DESC, instance_id DESC LIMIT ?"
 	args = append(args, limit+1)
 
 	rows, err := conn.QueryContext(ctx, query, args...)
@@ -358,8 +387,19 @@ func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOpt
 	var instances []*WorkflowInstance
 	for rows.Next() {
 		var inst WorkflowInstance
-		if err := rows.Scan(&inst.InstanceID, &inst.WorkflowName, &inst.Status, &inst.CreatedAt, &inst.UpdatedAt); err != nil {
+		var startedAt, updatedAt sql.NullString
+		if err := rows.Scan(&inst.InstanceID, &inst.WorkflowName, &inst.Status, &startedAt, &updatedAt); err != nil {
 			return nil, err
+		}
+		if startedAt.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", startedAt.String); err == nil {
+				inst.StartedAt = t
+			}
+		}
+		if updatedAt.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", updatedAt.String); err == nil {
+				inst.UpdatedAt = t
+			}
 		}
 		instances = append(instances, &inst)
 	}
@@ -376,7 +416,7 @@ func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOpt
 	var nextPageToken string
 	if hasMore && len(instances) > 0 {
 		lastInst := instances[len(instances)-1]
-		nextPageToken = lastInst.CreatedAt.UTC().Format(time.RFC3339Nano) + "||" + lastInst.InstanceID
+		nextPageToken = lastInst.StartedAt.UTC().Format(time.RFC3339Nano) + "||" + lastInst.InstanceID
 	}
 
 	return &PaginationResult{
@@ -692,8 +732,19 @@ func (s *SQLiteStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Ti
 	var timers []*TimerSubscription
 	for rows.Next() {
 		var t TimerSubscription
-		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &t.ExpiresAt, &t.Step, &t.CreatedAt); err != nil {
+		var expiresAt, createdAt sql.NullString // SQLite stores datetime as TEXT
+		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &expiresAt, &t.Step, &createdAt); err != nil {
 			return nil, err
+		}
+		if expiresAt.Valid {
+			if parsed, err := time.Parse("2006-01-02 15:04:05", expiresAt.String); err == nil {
+				t.ExpiresAt = parsed
+			}
+		}
+		if createdAt.Valid {
+			if parsed, err := time.Parse("2006-01-02 15:04:05", createdAt.String); err == nil {
+				t.CreatedAt = parsed
+			}
 		}
 		timers = append(timers, &t)
 	}
@@ -716,7 +767,7 @@ func (s *SQLiteStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) 
 func (s *SQLiteStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, attempts, created_at
+		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
 		FROM workflow_outbox
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
@@ -732,7 +783,7 @@ func (s *SQLiteStorage) GetPendingOutboxEvents(ctx context.Context, limit int) (
 		var e OutboxEvent
 		var eventData sql.NullString
 
-		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.Attempts, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		if eventData.Valid {
@@ -770,7 +821,7 @@ func (s *SQLiteStorage) IncrementOutboxAttempts(ctx context.Context, eventID str
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE workflow_outbox
-		SET attempts = attempts + 1, updated_at = datetime('now')
+		SET retry_count = retry_count + 1, updated_at = datetime('now')
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -790,23 +841,30 @@ func (s *SQLiteStorage) CleanupOldOutboxEvents(ctx context.Context, olderThan ti
 // --- Compensation Manager ---
 
 // AddCompensation adds a compensation entry.
+// Order is determined by created_at DESC (LIFO).
+// Uses millisecond-precision timestamp for reliable ordering.
 func (s *SQLiteStorage) AddCompensation(ctx context.Context, entry *CompensationEntry) error {
 	conn := s.getConn(ctx)
+	// Use Go's time.Now() with millisecond precision for reliable LIFO ordering
+	// SQLite's datetime('now') only has second precision
+	createdAt := time.Now().Format("2006-01-02 15:04:05.000")
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_compensations (instance_id, activity_id, compensation_fn, compensation_arg, comp_order, status)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, entry.InstanceID, entry.ActivityID, entry.CompensationFn, string(entry.CompensationArg), entry.Order, entry.Status)
+		INSERT INTO workflow_compensations (instance_id, activity_id, activity_name, args, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, entry.InstanceID, entry.ActivityID, entry.ActivityName, string(entry.Args), createdAt)
 	return err
 }
 
-// GetCompensations retrieves compensations for a workflow in LIFO order.
+// GetCompensations retrieves compensations for a workflow in LIFO order (by created_at DESC).
+// Uses millisecond-precision timestamps set by AddCompensation for reliable ordering.
+// Status tracking is done via history events (CompensationExecuted, CompensationFailed).
 func (s *SQLiteStorage) GetCompensations(ctx context.Context, instanceID string) ([]*CompensationEntry, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, activity_id, compensation_fn, compensation_arg, comp_order, status, created_at
+		SELECT id, instance_id, activity_id, activity_name, args, created_at
 		FROM workflow_compensations
 		WHERE instance_id = ?
-		ORDER BY comp_order DESC
+		ORDER BY created_at DESC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -816,34 +874,16 @@ func (s *SQLiteStorage) GetCompensations(ctx context.Context, instanceID string)
 	var comps []*CompensationEntry
 	for rows.Next() {
 		var c CompensationEntry
-		var compArg sql.NullString
-		if err := rows.Scan(&c.ID, &c.InstanceID, &c.ActivityID, &c.CompensationFn, &compArg, &c.Order, &c.Status, &c.CreatedAt); err != nil {
+		var args sql.NullString
+		if err := rows.Scan(&c.ID, &c.InstanceID, &c.ActivityID, &c.ActivityName, &args, &c.CreatedAt); err != nil {
 			return nil, err
 		}
-		if compArg.Valid {
-			c.CompensationArg = []byte(compArg.String)
+		if args.Valid {
+			c.Args = []byte(args.String)
 		}
 		comps = append(comps, &c)
 	}
 	return comps, rows.Err()
-}
-
-// MarkCompensationExecuted marks a compensation as executed.
-func (s *SQLiteStorage) MarkCompensationExecuted(ctx context.Context, id int64) error {
-	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_compensations SET status = 'executed' WHERE id = ?
-	`, id)
-	return err
-}
-
-// MarkCompensationFailed marks a compensation as failed.
-func (s *SQLiteStorage) MarkCompensationFailed(ctx context.Context, id int64) error {
-	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_compensations SET status = 'failed' WHERE id = ?
-	`, id)
-	return err
 }
 
 // ========================================
@@ -851,23 +891,24 @@ func (s *SQLiteStorage) MarkCompensationFailed(ctx context.Context, id int64) er
 // ========================================
 
 // PublishToChannel publishes a message to a channel.
-func (s *SQLiteStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON, metadata []byte, targetInstanceID string) (int64, error) {
+// For direct messages, use dynamic channel names (e.g., "channel:instance_id").
+func (s *SQLiteStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON, metadata []byte) (int64, error) {
 	conn := s.getConn(ctx)
-	var dataJSONStr, metadataStr, targetStr sql.NullString
+	var dataStr, metadataStr sql.NullString
 	if dataJSON != nil {
-		dataJSONStr = sql.NullString{String: string(dataJSON), Valid: true}
+		dataStr = sql.NullString{String: string(dataJSON), Valid: true}
 	}
 	if metadata != nil {
 		metadataStr = sql.NullString{String: string(metadata), Valid: true}
 	}
-	if targetInstanceID != "" {
-		targetStr = sql.NullString{String: targetInstanceID, Valid: true}
-	}
+
+	// Generate UUID for message_id
+	msgID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().UnixNano()%1000000)
 
 	result, err := conn.ExecContext(ctx, `
-		INSERT INTO channel_messages (channel_name, data_json, metadata, target_instance_id)
-		VALUES (?, ?, ?, ?)
-	`, channelName, dataJSONStr, metadataStr, targetStr)
+		INSERT INTO channel_messages (channel, data, metadata, message_id, data_type)
+		VALUES (?, ?, ?, ?, 'json')
+	`, channelName, dataStr, metadataStr, msgID)
 	if err != nil {
 		return 0, err
 	}
@@ -881,9 +922,9 @@ func (s *SQLiteStorage) SubscribeToChannel(ctx context.Context, instanceID, chan
 	conn := s.getConn(ctx)
 
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO channel_subscriptions (instance_id, channel_name, mode)
+		INSERT INTO channel_subscriptions (instance_id, channel, mode)
 		VALUES (?, ?, ?)
-		ON CONFLICT (instance_id, channel_name) DO UPDATE SET mode = excluded.mode
+		ON CONFLICT (instance_id, channel) DO UPDATE SET mode = excluded.mode
 	`, instanceID, channelName, string(mode))
 	if err != nil {
 		return err
@@ -893,11 +934,11 @@ func (s *SQLiteStorage) SubscribeToChannel(ctx context.Context, instanceID, chan
 	// This ensures new subscribers only receive messages published after subscription
 	if mode == ChannelModeBroadcast {
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel_name, last_message_id)
+			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
 			SELECT ?, ?, COALESCE(MAX(id), 0)
 			FROM channel_messages
-			WHERE channel_name = ?
-			ON CONFLICT (instance_id, channel_name) DO NOTHING
+			WHERE channel = ?
+			ON CONFLICT (instance_id, channel) DO NOTHING
 		`, instanceID, channelName, channelName)
 		if err != nil {
 			return err
@@ -911,7 +952,7 @@ func (s *SQLiteStorage) SubscribeToChannel(ctx context.Context, instanceID, chan
 func (s *SQLiteStorage) UnsubscribeFromChannel(ctx context.Context, instanceID, channelName string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM channel_subscriptions WHERE instance_id = ? AND channel_name = ?
+		DELETE FROM channel_subscriptions WHERE instance_id = ? AND channel = ?
 	`, instanceID, channelName)
 	return err
 }
@@ -920,16 +961,15 @@ func (s *SQLiteStorage) UnsubscribeFromChannel(ctx context.Context, instanceID, 
 func (s *SQLiteStorage) GetChannelSubscription(ctx context.Context, instanceID, channelName string) (*ChannelSubscription, error) {
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
-		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
+		SELECT id, instance_id, channel, mode, timeout_at, COALESCE(activity_id, ''), subscribed_at
 		FROM channel_subscriptions
-		WHERE instance_id = ? AND channel_name = ?
+		WHERE instance_id = ? AND channel = ?
 	`, instanceID, channelName)
 
 	var sub ChannelSubscription
 	var modeStr string
-	var waiting int
-	var timeoutAt sql.NullTime
-	err := row.Scan(&sub.ID, &sub.InstanceID, &sub.ChannelName, &modeStr, &waiting, &timeoutAt, &sub.ActivityID, &sub.CreatedAt)
+	var timeoutAt, subscribedAt sql.NullString // SQLite stores datetime as TEXT
+	err := row.Scan(&sub.ID, &sub.InstanceID, &sub.Channel, &modeStr, &timeoutAt, &sub.ActivityID, &subscribedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -937,26 +977,33 @@ func (s *SQLiteStorage) GetChannelSubscription(ctx context.Context, instanceID, 
 		return nil, err
 	}
 	sub.Mode = ChannelMode(modeStr)
-	sub.Waiting = waiting != 0
 	if timeoutAt.Valid {
-		sub.TimeoutAt = &timeoutAt.Time
+		if t, err := time.Parse("2006-01-02 15:04:05", timeoutAt.String); err == nil {
+			sub.TimeoutAt = &t
+		}
+	}
+	if subscribedAt.Valid {
+		if t, err := time.Parse("2006-01-02 15:04:05", subscribedAt.String); err == nil {
+			sub.SubscribedAt = t
+		}
 	}
 	return &sub, nil
 }
 
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
+// Waiting state is indicated by activity_id being non-null.
 func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
 	conn := s.getConn(ctx)
 
-	// Update subscription to waiting state and store activity ID
+	// Update subscription to set activity_id (non-null = waiting state)
 	var timeoutStr sql.NullString
 	if timeoutAt != nil {
 		timeoutStr = sql.NullString{String: timeoutAt.UTC().Format("2006-01-02 15:04:05"), Valid: true}
 	}
 	_, err := conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
-		SET waiting = 1, timeout_at = ?, activity_id = ?
-		WHERE instance_id = ? AND channel_name = ?
+		SET timeout_at = ?, activity_id = ?
+		WHERE instance_id = ? AND channel = ?
 	`, timeoutStr, activityID, instanceID, channelName)
 	if err != nil {
 		return err
@@ -985,9 +1032,9 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 func (s *SQLiteStorage) GetPendingChannelMessages(ctx context.Context, channelName string, afterID int64, limit int) ([]*ChannelMessage, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, channel_name, data_json, data_binary, metadata, target_instance_id, created_at
+		SELECT id, channel, data, data_binary, metadata, published_at
 		FROM channel_messages
-		WHERE channel_name = ? AND id > ?
+		WHERE channel = ? AND id > ?
 		ORDER BY id ASC
 		LIMIT ?
 	`, channelName, afterID, limit)
@@ -999,21 +1046,23 @@ func (s *SQLiteStorage) GetPendingChannelMessages(ctx context.Context, channelNa
 	var messages []*ChannelMessage
 	for rows.Next() {
 		var msg ChannelMessage
-		var dataJSON, metadata, targetID sql.NullString
+		var data, metadata, publishedAt sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.ChannelName, &dataJSON, &dataBinary, &metadata, &targetID, &msg.CreatedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &publishedAt)
 		if err != nil {
 			return nil, err
 		}
-		if dataJSON.Valid {
-			msg.DataJSON = []byte(dataJSON.String)
+		if data.Valid {
+			msg.Data = []byte(data.String)
 		}
 		msg.DataBinary = dataBinary
 		if metadata.Valid {
 			msg.Metadata = []byte(metadata.String)
 		}
-		if targetID.Valid {
-			msg.TargetInstanceID = targetID.String
+		if publishedAt.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", publishedAt.String); err == nil {
+				msg.PublishedAt = t
+			}
 		}
 		messages = append(messages, &msg)
 	}
@@ -1030,7 +1079,7 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 	var mode string
 	err := conn.QueryRowContext(ctx, `
 		SELECT mode FROM channel_subscriptions
-		WHERE instance_id = ? AND channel_name = ?
+		WHERE instance_id = ? AND channel = ?
 	`, instanceID, channelName).Scan(&mode)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1046,17 +1095,17 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 		// Broadcast mode: Get messages after the cursor
 		var cursorID int64
 		err := conn.QueryRowContext(ctx, `
-			SELECT COALESCE(last_message_id, 0) FROM channel_delivery_cursors
-			WHERE instance_id = ? AND channel_name = ?
+			SELECT COALESCE(last_delivered_id, 0) FROM channel_delivery_cursors
+			WHERE instance_id = ? AND channel = ?
 		`, instanceID, channelName).Scan(&cursorID)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
 
 		query = `
-			SELECT id, channel_name, data_json, data_binary, metadata, target_instance_id, created_at
+			SELECT id, channel, data, data_binary, metadata, published_at
 			FROM channel_messages
-			WHERE channel_name = ? AND id > ?
+			WHERE channel = ? AND id > ?
 			ORDER BY id ASC
 			LIMIT 10
 		`
@@ -1064,10 +1113,10 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 	} else {
 		// Competing mode: Get unclaimed messages
 		query = `
-			SELECT m.id, m.channel_name, m.data_json, m.data_binary, m.metadata, m.target_instance_id, m.created_at
+			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
 			LEFT JOIN channel_message_claims c ON m.id = c.message_id
-			WHERE m.channel_name = ? AND c.message_id IS NULL
+			WHERE m.channel = ? AND c.message_id IS NULL
 			ORDER BY m.id ASC
 			LIMIT 10
 		`
@@ -1083,21 +1132,23 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 	var messages []*ChannelMessage
 	for rows.Next() {
 		var msg ChannelMessage
-		var dataJSON, metadata, targetID sql.NullString
+		var data, metadata, publishedAt sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.ChannelName, &dataJSON, &dataBinary, &metadata, &targetID, &msg.CreatedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &publishedAt)
 		if err != nil {
 			return nil, err
 		}
-		if dataJSON.Valid {
-			msg.DataJSON = []byte(dataJSON.String)
+		if data.Valid {
+			msg.Data = []byte(data.String)
 		}
 		msg.DataBinary = dataBinary
 		if metadata.Valid {
 			msg.Metadata = []byte(metadata.String)
 		}
-		if targetID.Valid {
-			msg.TargetInstanceID = targetID.String
+		if publishedAt.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", publishedAt.String); err == nil {
+				msg.PublishedAt = t
+			}
 		}
 		messages = append(messages, &msg)
 	}
@@ -1133,9 +1184,9 @@ func (s *SQLiteStorage) DeleteChannelMessage(ctx context.Context, messageID int6
 func (s *SQLiteStorage) UpdateDeliveryCursor(ctx context.Context, instanceID, channelName string, lastMessageID int64) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO channel_delivery_cursors (instance_id, channel_name, last_message_id)
+		INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
 		VALUES (?, ?, ?)
-		ON CONFLICT (instance_id, channel_name) DO UPDATE SET last_message_id = excluded.last_message_id, updated_at = datetime('now')
+		ON CONFLICT (instance_id, channel) DO UPDATE SET last_delivered_id = excluded.last_delivered_id, updated_at = datetime('now')
 	`, instanceID, channelName, lastMessageID)
 	return err
 }
@@ -1143,24 +1194,25 @@ func (s *SQLiteStorage) UpdateDeliveryCursor(ctx context.Context, instanceID, ch
 // GetDeliveryCursor gets the current delivery cursor for an instance and channel.
 func (s *SQLiteStorage) GetDeliveryCursor(ctx context.Context, instanceID, channelName string) (int64, error) {
 	conn := s.getConn(ctx)
-	var lastMessageID int64
+	var lastDeliveredID int64
 	err := conn.QueryRowContext(ctx, `
-		SELECT last_message_id FROM channel_delivery_cursors
-		WHERE instance_id = ? AND channel_name = ?
-	`, instanceID, channelName).Scan(&lastMessageID)
+		SELECT last_delivered_id FROM channel_delivery_cursors
+		WHERE instance_id = ? AND channel = ?
+	`, instanceID, channelName).Scan(&lastDeliveredID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
-	return lastMessageID, err
+	return lastDeliveredID, err
 }
 
 // GetChannelSubscribersWaiting finds subscribers waiting for messages on a channel.
+// Waiting state is determined by activity_id IS NOT NULL.
 func (s *SQLiteStorage) GetChannelSubscribersWaiting(ctx context.Context, channelName string) ([]*ChannelSubscription, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
+		SELECT id, instance_id, channel, mode, timeout_at, activity_id, subscribed_at
 		FROM channel_subscriptions
-		WHERE channel_name = ? AND waiting = 1
+		WHERE channel = ? AND activity_id IS NOT NULL AND activity_id != ''
 	`, channelName)
 	if err != nil {
 		return nil, err
@@ -1171,16 +1223,21 @@ func (s *SQLiteStorage) GetChannelSubscribersWaiting(ctx context.Context, channe
 	for rows.Next() {
 		var sub ChannelSubscription
 		var modeStr string
-		var waiting int
-		var timeoutAt sql.NullTime
-		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.ChannelName, &modeStr, &waiting, &timeoutAt, &sub.ActivityID, &sub.CreatedAt)
+		var timeoutAt, subscribedAt sql.NullString // SQLite stores datetime as TEXT
+		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.Channel, &modeStr, &timeoutAt, &sub.ActivityID, &subscribedAt)
 		if err != nil {
 			return nil, err
 		}
 		sub.Mode = ChannelMode(modeStr)
-		sub.Waiting = waiting != 0
 		if timeoutAt.Valid {
-			sub.TimeoutAt = &timeoutAt.Time
+			if t, err := time.Parse("2006-01-02 15:04:05", timeoutAt.String); err == nil {
+				sub.TimeoutAt = &t
+			}
+		}
+		if subscribedAt.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", subscribedAt.String); err == nil {
+				sub.SubscribedAt = t
+			}
 		}
 		subs = append(subs, &sub)
 	}
@@ -1188,12 +1245,13 @@ func (s *SQLiteStorage) GetChannelSubscribersWaiting(ctx context.Context, channe
 }
 
 // ClearChannelWaitingState clears the waiting state for an instance's channel subscription.
+// Waiting state is cleared by setting activity_id to NULL.
 func (s *SQLiteStorage) ClearChannelWaitingState(ctx context.Context, instanceID, channelName string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
-		SET waiting = 0, timeout_at = NULL
-		WHERE instance_id = ? AND channel_name = ?
+		SET activity_id = NULL, timeout_at = NULL
+		WHERE instance_id = ? AND channel = ?
 	`, instanceID, channelName)
 	return err
 }
@@ -1206,13 +1264,13 @@ func (s *SQLiteStorage) DeliverChannelMessage(ctx context.Context, instanceID st
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)
 		VALUES (?, ?, 'channel_message_received', ?, 'json')
-	`, instanceID, fmt.Sprintf("channel:%s:%d", message.ChannelName, message.ID), string(message.DataJSON))
+	`, instanceID, fmt.Sprintf("channel:%s:%d", message.Channel, message.ID), string(message.Data))
 	if err != nil {
 		return err
 	}
 
 	// Clear waiting state
-	return s.ClearChannelWaitingState(ctx, instanceID, message.ChannelName)
+	return s.ClearChannelWaitingState(ctx, instanceID, message.Channel)
 }
 
 // DeliverChannelMessageWithLock delivers a message using Lock-First pattern.
@@ -1251,7 +1309,7 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	var historyActivityID, subscriptionMode string
 	err = conn.QueryRowContext(ctx, `
 		SELECT COALESCE(activity_id, ''), mode FROM channel_subscriptions
-		WHERE instance_id = ? AND channel_name = ?
+		WHERE instance_id = ? AND channel = ?
 	`, instanceID, channelName).Scan(&historyActivityID, &subscriptionMode)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
@@ -1266,13 +1324,13 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	// Wrap the message in ReceivedMessage format so Receive can unmarshal it correctly
 	wrappedData := map[string]any{
 		"id":           message.ID,
-		"channel_name": channelName,
-		"created_at":   message.CreatedAt,
+		"channel":      channelName,
+		"published_at": message.PublishedAt,
 	}
-	// The message.DataJSON contains the actual data - unmarshal and re-wrap
+	// The message.Data contains the actual data - unmarshal and re-wrap
 	var msgData any
-	if len(message.DataJSON) > 0 {
-		_ = json.Unmarshal(message.DataJSON, &msgData)
+	if len(message.Data) > 0 {
+		_ = json.Unmarshal(message.Data, &msgData)
 	}
 	wrappedData["data"] = msgData
 	if len(message.Metadata) > 0 {
@@ -1295,10 +1353,10 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	// This prevents duplicate message delivery when workflow resumes
 	if subscriptionMode == string(ChannelModeBroadcast) {
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel_name, last_message_id)
+			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
 			VALUES (?, ?, ?)
-			ON CONFLICT (instance_id, channel_name)
-			DO UPDATE SET last_message_id = excluded.last_message_id, updated_at = datetime('now')
+			ON CONFLICT (instance_id, channel)
+			DO UPDATE SET last_delivered_id = excluded.last_delivered_id, updated_at = datetime('now')
 		`, instanceID, channelName, message.ID)
 		if err != nil {
 			_ = s.ReleaseLock(ctx, instanceID, workerID)
@@ -1339,21 +1397,22 @@ func (s *SQLiteStorage) CleanupOldChannelMessages(ctx context.Context, olderThan
 	conn := s.getConn(ctx)
 	threshold := time.Now().UTC().Add(-olderThan).Format("2006-01-02 15:04:05")
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM channel_messages WHERE datetime(created_at) < datetime(?)
+		DELETE FROM channel_messages WHERE datetime(published_at) < datetime(?)
 	`, threshold)
 	return err
 }
 
 // FindExpiredChannelSubscriptions finds channel subscriptions that have timed out.
+// Waiting state is determined by activity_id IS NOT NULL.
 func (s *SQLiteStorage) FindExpiredChannelSubscriptions(ctx context.Context, limit int) ([]*ChannelSubscription, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
+		SELECT id, instance_id, channel, mode, timeout_at, activity_id, COALESCE(cursor_message_id, 0), subscribed_at
 		FROM channel_subscriptions
-		WHERE waiting = 1 AND timeout_at IS NOT NULL AND datetime(timeout_at) < datetime('now')
+		WHERE activity_id IS NOT NULL AND activity_id != '' AND timeout_at IS NOT NULL AND datetime(timeout_at) < datetime('now')
 		ORDER BY timeout_at ASC
 		LIMIT ?
 	`, limit)
@@ -1366,16 +1425,21 @@ func (s *SQLiteStorage) FindExpiredChannelSubscriptions(ctx context.Context, lim
 	for rows.Next() {
 		var sub ChannelSubscription
 		var modeStr string
-		var waiting int
-		var timeoutAt sql.NullTime
-		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.ChannelName, &modeStr, &waiting, &timeoutAt, &sub.ActivityID, &sub.CreatedAt)
+		var timeoutAt, subscribedAt sql.NullString // SQLite stores datetime as TEXT
+		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.Channel, &modeStr, &timeoutAt, &sub.ActivityID, &sub.CursorMessageID, &subscribedAt)
 		if err != nil {
 			return nil, err
 		}
 		sub.Mode = ChannelMode(modeStr)
-		sub.Waiting = waiting != 0
 		if timeoutAt.Valid {
-			sub.TimeoutAt = &timeoutAt.Time
+			if t, err := time.Parse("2006-01-02 15:04:05", timeoutAt.String); err == nil {
+				sub.TimeoutAt = &t
+			}
+		}
+		if subscribedAt.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", subscribedAt.String); err == nil {
+				sub.SubscribedAt = t
+			}
 		}
 		subs = append(subs, &sub)
 	}

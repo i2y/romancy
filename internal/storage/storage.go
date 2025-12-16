@@ -227,14 +227,9 @@ type CompensationManager interface {
 	// AddCompensation registers a compensation action.
 	AddCompensation(ctx context.Context, entry *CompensationEntry) error
 
-	// GetCompensations retrieves compensation entries in LIFO order.
+	// GetCompensations retrieves compensation entries in LIFO order (by created_at DESC).
+	// Status tracking is done via history events (CompensationExecuted, CompensationFailed).
 	GetCompensations(ctx context.Context, instanceID string) ([]*CompensationEntry, error)
-
-	// MarkCompensationExecuted marks a compensation as executed.
-	MarkCompensationExecuted(ctx context.Context, id int64) error
-
-	// MarkCompensationFailed marks a compensation as failed.
-	MarkCompensationFailed(ctx context.Context, id int64) error
 }
 
 // ========================================
@@ -244,7 +239,8 @@ type CompensationManager interface {
 // ChannelManager handles channel-based messaging operations.
 type ChannelManager interface {
 	// PublishToChannel publishes a message to a channel.
-	PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte, targetInstanceID string) (int64, error)
+	// For direct messages, use dynamic channel names (e.g., "channel:instance_id").
+	PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte) (int64, error)
 
 	// SubscribeToChannel subscribes an instance to a channel.
 	SubscribeToChannel(ctx context.Context, instanceID, channelName string, mode ChannelMode) error

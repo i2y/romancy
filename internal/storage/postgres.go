@@ -163,13 +163,14 @@ func (s *PostgresStorage) RegisterPostCommitCallback(ctx context.Context, cb fun
 // CreateInstance creates a new workflow instance.
 func (s *PostgresStorage) CreateInstance(ctx context.Context, instance *WorkflowInstance) error {
 	conn := s.getConn(ctx)
+	framework := "go"
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
-			instance_id, workflow_name, status, input_data, source_code, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			instance_id, workflow_name, status, input_data, source_code, source_hash, owner_service, framework, started_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
-		string(instance.InputData), instance.SourceCode,
-		instance.CreatedAt.UTC(), instance.UpdatedAt.UTC())
+		string(instance.InputData), instance.SourceCode, instance.SourceHash, instance.OwnerService,
+		framework, instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
 	return err
 }
 
@@ -178,23 +179,23 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
 		SELECT instance_id, workflow_name, status, input_data, output_data,
-			   error_message, current_activity_id, source_code,
+			   current_activity_id, source_code, source_hash, owner_service, framework,
 			   locked_by, locked_at, lock_timeout_seconds, lock_expires_at,
-			   created_at, updated_at
+			   started_at, updated_at
 		FROM workflow_instances WHERE instance_id = $1
 	`, instanceID)
 
 	var inst WorkflowInstance
-	var inputData, outputData, errorMsg, activityID, sourceCode sql.NullString
+	var inputData, outputData, activityID, sourceCode, sourceHash, ownerService, framework sql.NullString
 	var lockedBy sql.NullString
 	var lockedAt, lockExpiresAt sql.NullTime
 	var lockTimeout sql.NullInt64
 
 	err := row.Scan(
 		&inst.InstanceID, &inst.WorkflowName, &inst.Status,
-		&inputData, &outputData, &errorMsg, &activityID, &sourceCode,
+		&inputData, &outputData, &activityID, &sourceCode, &sourceHash, &ownerService, &framework,
 		&lockedBy, &lockedAt, &lockTimeout, &lockExpiresAt,
-		&inst.CreatedAt, &inst.UpdatedAt,
+		&inst.StartedAt, &inst.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -209,14 +210,20 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	if outputData.Valid {
 		inst.OutputData = []byte(outputData.String)
 	}
-	if errorMsg.Valid {
-		inst.ErrorMessage = errorMsg.String
-	}
 	if activityID.Valid {
 		inst.CurrentActivityID = activityID.String
 	}
 	if sourceCode.Valid {
 		inst.SourceCode = sourceCode.String
+	}
+	if sourceHash.Valid {
+		inst.SourceHash = sourceHash.String
+	}
+	if ownerService.Valid {
+		inst.OwnerService = ownerService.String
+	}
+	if framework.Valid {
+		inst.Framework = framework.String
 	}
 	if lockedBy.Valid {
 		inst.LockedBy = lockedBy.String
@@ -238,11 +245,12 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 // UpdateInstanceStatus updates the status of a workflow instance.
 func (s *PostgresStorage) UpdateInstanceStatus(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string) error {
 	conn := s.getConn(ctx)
+	// Note: errorMsg parameter kept for interface compatibility but ignored
 	_, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
-		SET status = $1, error_message = $2, updated_at = NOW()
-		WHERE instance_id = $3
-	`, status, errorMsg, instanceID)
+		SET status = $1, updated_at = NOW()
+		WHERE instance_id = $2
+	`, status, instanceID)
 	return err
 }
 
@@ -274,9 +282,9 @@ func (s *PostgresStorage) CancelInstance(ctx context.Context, instanceID, reason
 	conn := s.getConn(ctx)
 	result, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
-		SET status = 'cancelled', error_message = $1, updated_at = NOW()
-		WHERE instance_id = $2 AND status IN ('pending', 'running', 'waiting_for_event', 'waiting_for_timer', 'waiting_for_message', 'recurred')
-	`, reason, instanceID)
+		SET status = 'cancelled', updated_at = NOW()
+		WHERE instance_id = $1 AND status IN ('pending', 'running', 'waiting_for_event', 'waiting_for_timer', 'waiting_for_message', 'recurred')
+	`, instanceID)
 	if err != nil {
 		return err
 	}
@@ -293,7 +301,7 @@ func (s *PostgresStorage) CancelInstance(ctx context.Context, instanceID, reason
 // ListInstances lists workflow instances with cursor-based pagination and filters.
 func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesOptions) (*PaginationResult, error) {
 	conn := s.getConn(ctx)
-	query := "SELECT instance_id, workflow_name, status, created_at, updated_at FROM workflow_instances WHERE 1=1"
+	query := "SELECT instance_id, workflow_name, status, started_at, updated_at FROM workflow_instances WHERE 1=1"
 	args := []any{}
 	argN := 1
 
@@ -324,12 +332,12 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 		argN++
 	}
 	if opts.StartedAfter != nil {
-		query += fmt.Sprintf(" AND created_at > $%d", argN)
+		query += fmt.Sprintf(" AND started_at > $%d", argN)
 		args = append(args, opts.StartedAfter.UTC())
 		argN++
 	}
 	if opts.StartedBefore != nil {
-		query += fmt.Sprintf(" AND created_at < $%d", argN)
+		query += fmt.Sprintf(" AND started_at < $%d", argN)
 		args = append(args, opts.StartedBefore.UTC())
 		argN++
 	}
@@ -355,8 +363,8 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 			cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
 			if err == nil {
 				cursorID := parts[1]
-				// For descending order: get rows where (created_at, instance_id) < (cursor_time, cursor_id)
-				query += fmt.Sprintf(" AND (created_at < $%d OR (created_at = $%d AND instance_id < $%d))", argN, argN+1, argN+2)
+				// For descending order: get rows where (started_at, instance_id) < (cursor_time, cursor_id)
+				query += fmt.Sprintf(" AND (started_at < $%d OR (started_at = $%d AND instance_id < $%d))", argN, argN+1, argN+2)
 				args = append(args, cursorTime.UTC(), cursorTime.UTC(), cursorID)
 				argN += 3
 			}
@@ -368,7 +376,7 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 		limit = 50 // Default page size
 	}
 	// Fetch one extra to determine if there are more pages
-	query += fmt.Sprintf(" ORDER BY created_at DESC, instance_id DESC LIMIT $%d", argN)
+	query += fmt.Sprintf(" ORDER BY started_at DESC, instance_id DESC LIMIT $%d", argN)
 	args = append(args, limit+1)
 
 	rows, err := conn.QueryContext(ctx, query, args...)
@@ -380,7 +388,7 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 	var instances []*WorkflowInstance
 	for rows.Next() {
 		var inst WorkflowInstance
-		if err := rows.Scan(&inst.InstanceID, &inst.WorkflowName, &inst.Status, &inst.CreatedAt, &inst.UpdatedAt); err != nil {
+		if err := rows.Scan(&inst.InstanceID, &inst.WorkflowName, &inst.Status, &inst.StartedAt, &inst.UpdatedAt); err != nil {
 			return nil, err
 		}
 		instances = append(instances, &inst)
@@ -398,7 +406,7 @@ func (s *PostgresStorage) ListInstances(ctx context.Context, opts ListInstancesO
 	var nextPageToken string
 	if hasMore && len(instances) > 0 {
 		lastInst := instances[len(instances)-1]
-		nextPageToken = lastInst.CreatedAt.UTC().Format(time.RFC3339Nano) + "||" + lastInst.InstanceID
+		nextPageToken = lastInst.StartedAt.UTC().Format(time.RFC3339Nano) + "||" + lastInst.InstanceID
 	}
 
 	return &PaginationResult{
@@ -768,7 +776,7 @@ func (s *PostgresStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent
 func (s *PostgresStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, attempts, created_at
+		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
 		FROM workflow_outbox
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
@@ -785,7 +793,7 @@ func (s *PostgresStorage) GetPendingOutboxEvents(ctx context.Context, limit int)
 		var e OutboxEvent
 		var eventData sql.NullString
 
-		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.Attempts, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		if eventData.Valid {
@@ -823,7 +831,7 @@ func (s *PostgresStorage) IncrementOutboxAttempts(ctx context.Context, eventID s
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE workflow_outbox
-		SET attempts = attempts + 1, updated_at = NOW()
+		SET retry_count = retry_count + 1, updated_at = NOW()
 		WHERE event_id = $1
 	`, eventID)
 	return err
@@ -846,9 +854,9 @@ func (s *PostgresStorage) CleanupOldOutboxEvents(ctx context.Context, olderThan 
 func (s *PostgresStorage) AddCompensation(ctx context.Context, entry *CompensationEntry) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_compensations (instance_id, activity_id, compensation_fn, compensation_arg, comp_order, status)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, entry.InstanceID, entry.ActivityID, entry.CompensationFn, string(entry.CompensationArg), entry.Order, entry.Status)
+		INSERT INTO workflow_compensations (instance_id, activity_id, activity_name, args)
+		VALUES ($1, $2, $3, $4)
+	`, entry.InstanceID, entry.ActivityID, entry.ActivityName, string(entry.Args))
 	return err
 }
 
@@ -856,10 +864,10 @@ func (s *PostgresStorage) AddCompensation(ctx context.Context, entry *Compensati
 func (s *PostgresStorage) GetCompensations(ctx context.Context, instanceID string) ([]*CompensationEntry, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, activity_id, compensation_fn, compensation_arg, comp_order, status, created_at
+		SELECT id, instance_id, activity_id, activity_name, args, created_at
 		FROM workflow_compensations
 		WHERE instance_id = $1
-		ORDER BY comp_order DESC
+		ORDER BY created_at DESC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -869,34 +877,16 @@ func (s *PostgresStorage) GetCompensations(ctx context.Context, instanceID strin
 	var comps []*CompensationEntry
 	for rows.Next() {
 		var c CompensationEntry
-		var compArg sql.NullString
-		if err := rows.Scan(&c.ID, &c.InstanceID, &c.ActivityID, &c.CompensationFn, &compArg, &c.Order, &c.Status, &c.CreatedAt); err != nil {
+		var args sql.NullString
+		if err := rows.Scan(&c.ID, &c.InstanceID, &c.ActivityID, &c.ActivityName, &args, &c.CreatedAt); err != nil {
 			return nil, err
 		}
-		if compArg.Valid {
-			c.CompensationArg = []byte(compArg.String)
+		if args.Valid {
+			c.Args = []byte(args.String)
 		}
 		comps = append(comps, &c)
 	}
 	return comps, rows.Err()
-}
-
-// MarkCompensationExecuted marks a compensation as executed.
-func (s *PostgresStorage) MarkCompensationExecuted(ctx context.Context, id int64) error {
-	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_compensations SET status = 'executed' WHERE id = $1
-	`, id)
-	return err
-}
-
-// MarkCompensationFailed marks a compensation as failed.
-func (s *PostgresStorage) MarkCompensationFailed(ctx context.Context, id int64) error {
-	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_compensations SET status = 'failed' WHERE id = $1
-	`, id)
-	return err
 }
 
 // ========================================
@@ -904,36 +894,30 @@ func (s *PostgresStorage) MarkCompensationFailed(ctx context.Context, id int64) 
 // ========================================
 
 // PublishToChannel publishes a message to a channel.
-func (s *PostgresStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON, metadata []byte, targetInstanceID string) (int64, error) {
+func (s *PostgresStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON, metadata []byte) (int64, error) {
 	conn := s.getConn(ctx)
-	var dataJSONStr, metadataStr, targetStr sql.NullString
+	var dataStr, metadataStr sql.NullString
 	if dataJSON != nil {
-		dataJSONStr = sql.NullString{String: string(dataJSON), Valid: true}
+		dataStr = sql.NullString{String: string(dataJSON), Valid: true}
 	}
 	if metadata != nil {
 		metadataStr = sql.NullString{String: string(metadata), Valid: true}
 	}
-	if targetInstanceID != "" {
-		targetStr = sql.NullString{String: targetInstanceID, Valid: true}
-	}
 
 	var id int64
 	err := conn.QueryRowContext(ctx, `
-		INSERT INTO channel_messages (channel_name, data_json, metadata, target_instance_id)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO channel_messages (channel, data, metadata, message_id, data_type)
+		VALUES ($1, $2, $3, gen_random_uuid()::text, 'json')
 		RETURNING id
-	`, channelName, dataJSONStr, metadataStr, targetStr).Scan(&id)
+	`, channelName, dataStr, metadataStr).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
 
 	// Send notification for channel message
 	msgPayload := map[string]any{
-		"channel_name": channelName,
-		"message_id":   id,
-	}
-	if targetInstanceID != "" {
-		msgPayload["target_instance_id"] = targetInstanceID
+		"channel":    channelName,
+		"message_id": id,
 	}
 	if payloadBytes, err := json.Marshal(msgPayload); err == nil {
 		s.sendNotify(ctx, notify.ChannelChannelMessage, string(payloadBytes))
@@ -950,9 +934,9 @@ func (s *PostgresStorage) SubscribeToChannel(ctx context.Context, instanceID, ch
 
 	// Insert subscription
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO channel_subscriptions (instance_id, channel_name, mode)
+		INSERT INTO channel_subscriptions (instance_id, channel, mode)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (instance_id, channel_name) DO UPDATE SET mode = EXCLUDED.mode
+		ON CONFLICT (instance_id, channel) DO UPDATE SET mode = EXCLUDED.mode
 	`, instanceID, channelName, string(mode))
 	if err != nil {
 		return err
@@ -962,11 +946,11 @@ func (s *PostgresStorage) SubscribeToChannel(ctx context.Context, instanceID, ch
 	// This ensures new subscribers only receive messages published after subscription
 	if mode == ChannelModeBroadcast {
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel_name, last_message_id)
+			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
 			SELECT $1, $2, COALESCE(MAX(id), 0)
 			FROM channel_messages
-			WHERE channel_name = $2
-			ON CONFLICT (instance_id, channel_name) DO NOTHING
+			WHERE channel = $2
+			ON CONFLICT (instance_id, channel) DO NOTHING
 		`, instanceID, channelName)
 		if err != nil {
 			return err
@@ -980,7 +964,7 @@ func (s *PostgresStorage) SubscribeToChannel(ctx context.Context, instanceID, ch
 func (s *PostgresStorage) UnsubscribeFromChannel(ctx context.Context, instanceID, channelName string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM channel_subscriptions WHERE instance_id = $1 AND channel_name = $2
+		DELETE FROM channel_subscriptions WHERE instance_id = $1 AND channel = $2
 	`, instanceID, channelName)
 	return err
 }
@@ -989,15 +973,15 @@ func (s *PostgresStorage) UnsubscribeFromChannel(ctx context.Context, instanceID
 func (s *PostgresStorage) GetChannelSubscription(ctx context.Context, instanceID, channelName string) (*ChannelSubscription, error) {
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
-		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
+		SELECT id, instance_id, channel, mode, timeout_at, COALESCE(activity_id, ''), subscribed_at
 		FROM channel_subscriptions
-		WHERE instance_id = $1 AND channel_name = $2
+		WHERE instance_id = $1 AND channel = $2
 	`, instanceID, channelName)
 
 	var sub ChannelSubscription
 	var modeStr string
 	var timeoutAt sql.NullTime
-	err := row.Scan(&sub.ID, &sub.InstanceID, &sub.ChannelName, &modeStr, &sub.Waiting, &timeoutAt, &sub.ActivityID, &sub.CreatedAt)
+	err := row.Scan(&sub.ID, &sub.InstanceID, &sub.Channel, &modeStr, &timeoutAt, &sub.ActivityID, &sub.SubscribedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1015,11 +999,11 @@ func (s *PostgresStorage) GetChannelSubscription(ctx context.Context, instanceID
 func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
 	conn := s.getConn(ctx)
 
-	// Update subscription to waiting state and store activity ID
+	// Update subscription to set timeout and activity ID
 	_, err := conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
-		SET waiting = TRUE, timeout_at = $1, activity_id = $2
-		WHERE instance_id = $3 AND channel_name = $4
+		SET timeout_at = $1, activity_id = $2
+		WHERE instance_id = $3 AND channel = $4
 	`, timeoutAt, activityID, instanceID, channelName)
 	if err != nil {
 		return err
@@ -1048,9 +1032,9 @@ func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Conte
 func (s *PostgresStorage) GetPendingChannelMessages(ctx context.Context, channelName string, afterID int64, limit int) ([]*ChannelMessage, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, channel_name, data_json, data_binary, metadata, target_instance_id, created_at
+		SELECT id, channel, data, data_binary, metadata, published_at
 		FROM channel_messages
-		WHERE channel_name = $1 AND id > $2
+		WHERE channel = $1 AND id > $2
 		ORDER BY id ASC
 		LIMIT $3
 	`, channelName, afterID, limit)
@@ -1062,21 +1046,18 @@ func (s *PostgresStorage) GetPendingChannelMessages(ctx context.Context, channel
 	var messages []*ChannelMessage
 	for rows.Next() {
 		var msg ChannelMessage
-		var dataJSON, metadata, targetID sql.NullString
+		var data, metadata sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.ChannelName, &dataJSON, &dataBinary, &metadata, &targetID, &msg.CreatedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &msg.PublishedAt)
 		if err != nil {
 			return nil, err
 		}
-		if dataJSON.Valid {
-			msg.DataJSON = []byte(dataJSON.String)
+		if data.Valid {
+			msg.Data = []byte(data.String)
 		}
 		msg.DataBinary = dataBinary
 		if metadata.Valid {
 			msg.Metadata = []byte(metadata.String)
-		}
-		if targetID.Valid {
-			msg.TargetInstanceID = targetID.String
 		}
 		messages = append(messages, &msg)
 	}
@@ -1093,7 +1074,7 @@ func (s *PostgresStorage) GetPendingChannelMessagesForInstance(ctx context.Conte
 	var mode string
 	err := conn.QueryRowContext(ctx, `
 		SELECT mode FROM channel_subscriptions
-		WHERE instance_id = $1 AND channel_name = $2
+		WHERE instance_id = $1 AND channel = $2
 	`, instanceID, channelName).Scan(&mode)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1109,17 +1090,17 @@ func (s *PostgresStorage) GetPendingChannelMessagesForInstance(ctx context.Conte
 		// Broadcast mode: Get messages after the cursor
 		var cursorID int64
 		err := conn.QueryRowContext(ctx, `
-			SELECT COALESCE(last_message_id, 0) FROM channel_delivery_cursors
-			WHERE instance_id = $1 AND channel_name = $2
+			SELECT COALESCE(last_delivered_id, 0) FROM channel_delivery_cursors
+			WHERE instance_id = $1 AND channel = $2
 		`, instanceID, channelName).Scan(&cursorID)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
 
 		query = `
-			SELECT id, channel_name, data_json, data_binary, metadata, target_instance_id, created_at
+			SELECT id, channel, data, data_binary, metadata, published_at
 			FROM channel_messages
-			WHERE channel_name = $1 AND id > $2
+			WHERE channel = $1 AND id > $2
 			ORDER BY id ASC
 			LIMIT 10
 		`
@@ -1127,10 +1108,10 @@ func (s *PostgresStorage) GetPendingChannelMessagesForInstance(ctx context.Conte
 	} else {
 		// Competing mode: Get unclaimed messages
 		query = `
-			SELECT m.id, m.channel_name, m.data_json, m.data_binary, m.metadata, m.target_instance_id, m.created_at
+			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
 			LEFT JOIN channel_message_claims c ON m.id = c.message_id
-			WHERE m.channel_name = $1 AND c.message_id IS NULL
+			WHERE m.channel = $1 AND c.message_id IS NULL
 			ORDER BY m.id ASC
 			LIMIT 10
 		`
@@ -1146,21 +1127,18 @@ func (s *PostgresStorage) GetPendingChannelMessagesForInstance(ctx context.Conte
 	var messages []*ChannelMessage
 	for rows.Next() {
 		var msg ChannelMessage
-		var dataJSON, metadata, targetID sql.NullString
+		var data, metadata sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.ChannelName, &dataJSON, &dataBinary, &metadata, &targetID, &msg.CreatedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &msg.PublishedAt)
 		if err != nil {
 			return nil, err
 		}
-		if dataJSON.Valid {
-			msg.DataJSON = []byte(dataJSON.String)
+		if data.Valid {
+			msg.Data = []byte(data.String)
 		}
 		msg.DataBinary = dataBinary
 		if metadata.Valid {
 			msg.Metadata = []byte(metadata.String)
-		}
-		if targetID.Valid {
-			msg.TargetInstanceID = targetID.String
 		}
 		messages = append(messages, &msg)
 	}
@@ -1196,9 +1174,9 @@ func (s *PostgresStorage) DeleteChannelMessage(ctx context.Context, messageID in
 func (s *PostgresStorage) UpdateDeliveryCursor(ctx context.Context, instanceID, channelName string, lastMessageID int64) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO channel_delivery_cursors (instance_id, channel_name, last_message_id)
+		INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (instance_id, channel_name) DO UPDATE SET last_message_id = EXCLUDED.last_message_id, updated_at = NOW()
+		ON CONFLICT (instance_id, channel) DO UPDATE SET last_delivered_id = EXCLUDED.last_delivered_id, updated_at = NOW()
 	`, instanceID, channelName, lastMessageID)
 	return err
 }
@@ -1206,24 +1184,24 @@ func (s *PostgresStorage) UpdateDeliveryCursor(ctx context.Context, instanceID, 
 // GetDeliveryCursor gets the current delivery cursor for an instance and channel.
 func (s *PostgresStorage) GetDeliveryCursor(ctx context.Context, instanceID, channelName string) (int64, error) {
 	conn := s.getConn(ctx)
-	var lastMessageID int64
+	var lastDeliveredID int64
 	err := conn.QueryRowContext(ctx, `
-		SELECT last_message_id FROM channel_delivery_cursors
-		WHERE instance_id = $1 AND channel_name = $2
-	`, instanceID, channelName).Scan(&lastMessageID)
+		SELECT last_delivered_id FROM channel_delivery_cursors
+		WHERE instance_id = $1 AND channel = $2
+	`, instanceID, channelName).Scan(&lastDeliveredID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
-	return lastMessageID, err
+	return lastDeliveredID, err
 }
 
 // GetChannelSubscribersWaiting finds subscribers waiting for messages on a channel.
 func (s *PostgresStorage) GetChannelSubscribersWaiting(ctx context.Context, channelName string) ([]*ChannelSubscription, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
+		SELECT id, instance_id, channel, mode, timeout_at, COALESCE(activity_id, ''), subscribed_at
 		FROM channel_subscriptions
-		WHERE channel_name = $1 AND waiting = TRUE
+		WHERE channel = $1 AND activity_id IS NOT NULL
 	`, channelName)
 	if err != nil {
 		return nil, err
@@ -1235,7 +1213,7 @@ func (s *PostgresStorage) GetChannelSubscribersWaiting(ctx context.Context, chan
 		var sub ChannelSubscription
 		var modeStr string
 		var timeoutAt sql.NullTime
-		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.ChannelName, &modeStr, &sub.Waiting, &timeoutAt, &sub.ActivityID, &sub.CreatedAt)
+		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.Channel, &modeStr, &timeoutAt, &sub.ActivityID, &sub.SubscribedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -1253,8 +1231,8 @@ func (s *PostgresStorage) ClearChannelWaitingState(ctx context.Context, instance
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
-		SET waiting = FALSE, timeout_at = NULL
-		WHERE instance_id = $1 AND channel_name = $2
+		SET activity_id = NULL, timeout_at = NULL
+		WHERE instance_id = $1 AND channel = $2
 	`, instanceID, channelName)
 	return err
 }
@@ -1267,13 +1245,13 @@ func (s *PostgresStorage) DeliverChannelMessage(ctx context.Context, instanceID 
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)
 		VALUES ($1, $2, 'channel_message_received', $3, 'json')
-	`, instanceID, fmt.Sprintf("channel:%s:%d", message.ChannelName, message.ID), string(message.DataJSON))
+	`, instanceID, fmt.Sprintf("channel:%s:%d", message.Channel, message.ID), string(message.Data))
 	if err != nil {
 		return err
 	}
 
 	// Clear waiting state
-	return s.ClearChannelWaitingState(ctx, instanceID, message.ChannelName)
+	return s.ClearChannelWaitingState(ctx, instanceID, message.Channel)
 }
 
 // DeliverChannelMessageWithLock delivers a message using Lock-First pattern.
@@ -1312,7 +1290,7 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	var historyActivityID, subscriptionMode string
 	err = conn.QueryRowContext(ctx, `
 		SELECT COALESCE(activity_id, ''), mode FROM channel_subscriptions
-		WHERE instance_id = $1 AND channel_name = $2
+		WHERE instance_id = $1 AND channel = $2
 	`, instanceID, channelName).Scan(&historyActivityID, &subscriptionMode)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
@@ -1327,13 +1305,13 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	// Wrap the message in ReceivedMessage format so Receive can unmarshal it correctly
 	wrappedData := map[string]any{
 		"id":           message.ID,
-		"channel_name": channelName,
-		"created_at":   message.CreatedAt,
+		"channel":      channelName,
+		"published_at": message.PublishedAt,
 	}
-	// The message.DataJSON contains the actual data - unmarshal and re-wrap
+	// The message.Data contains the actual data - unmarshal and re-wrap
 	var msgData any
-	if len(message.DataJSON) > 0 {
-		_ = json.Unmarshal(message.DataJSON, &msgData)
+	if len(message.Data) > 0 {
+		_ = json.Unmarshal(message.Data, &msgData)
 	}
 	wrappedData["data"] = msgData
 	if len(message.Metadata) > 0 {
@@ -1356,10 +1334,10 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	// This prevents duplicate message delivery when workflow resumes
 	if subscriptionMode == string(ChannelModeBroadcast) {
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel_name, last_message_id)
+			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
 			VALUES ($1, $2, $3)
-			ON CONFLICT (instance_id, channel_name)
-			DO UPDATE SET last_message_id = EXCLUDED.last_message_id, updated_at = NOW()
+			ON CONFLICT (instance_id, channel)
+			DO UPDATE SET last_delivered_id = EXCLUDED.last_delivered_id, updated_at = NOW()
 		`, instanceID, channelName, message.ID)
 		if err != nil {
 			_ = s.ReleaseLock(ctx, instanceID, workerID)
@@ -1409,7 +1387,7 @@ func (s *PostgresStorage) CleanupOldChannelMessages(ctx context.Context, olderTh
 	conn := s.getConn(ctx)
 	threshold := time.Now().UTC().Add(-olderThan)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM channel_messages WHERE created_at < $1
+		DELETE FROM channel_messages WHERE published_at < $1
 	`, threshold)
 	return err
 }
@@ -1421,9 +1399,9 @@ func (s *PostgresStorage) FindExpiredChannelSubscriptions(ctx context.Context, l
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, channel_name, mode, waiting, timeout_at, COALESCE(activity_id, ''), created_at
+		SELECT id, instance_id, channel, mode, timeout_at, COALESCE(activity_id, ''), subscribed_at
 		FROM channel_subscriptions
-		WHERE waiting = TRUE AND timeout_at IS NOT NULL AND timeout_at < NOW()
+		WHERE activity_id IS NOT NULL AND timeout_at IS NOT NULL AND timeout_at < NOW()
 		ORDER BY timeout_at ASC
 		LIMIT $1
 	`, limit)
@@ -1437,7 +1415,7 @@ func (s *PostgresStorage) FindExpiredChannelSubscriptions(ctx context.Context, l
 		var sub ChannelSubscription
 		var modeStr string
 		var timeoutAt sql.NullTime
-		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.ChannelName, &modeStr, &sub.Waiting, &timeoutAt, &sub.ActivityID, &sub.CreatedAt)
+		err := rows.Scan(&sub.ID, &sub.InstanceID, &sub.Channel, &modeStr, &timeoutAt, &sub.ActivityID, &sub.SubscribedAt)
 		if err != nil {
 			return nil, err
 		}

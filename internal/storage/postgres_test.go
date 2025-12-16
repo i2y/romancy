@@ -361,20 +361,20 @@ func TestPostgresStorage_CompensationOperations(t *testing.T) {
 
 	// Add compensations
 	comp1 := &CompensationEntry{
-		InstanceID:      "test-comp-1",
-		ActivityID:      "activity:1",
-		CompensationFn:  "rollback_activity1",
-		CompensationArg: []byte(`{"id": "1"}`),
-		Order:           1,
-		Status:          "pending",
+		InstanceID:   "test-comp-1",
+		ActivityID:   "activity:1",
+		ActivityName: "rollback_activity1",
+		Args:         []byte(`{"id": "1"}`),
+		Order:        1,
+		Status:       "pending",
 	}
 	comp2 := &CompensationEntry{
-		InstanceID:      "test-comp-1",
-		ActivityID:      "activity:2",
-		CompensationFn:  "rollback_activity2",
-		CompensationArg: []byte(`{"id": "2"}`),
-		Order:           2,
-		Status:          "pending",
+		InstanceID:   "test-comp-1",
+		ActivityID:   "activity:2",
+		ActivityName: "rollback_activity2",
+		Args:         []byte(`{"id": "2"}`),
+		Order:        2,
+		Status:       "pending",
 	}
 
 	store.AddCompensation(ctx, comp1)

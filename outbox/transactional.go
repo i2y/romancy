@@ -110,7 +110,7 @@ func SendEventTransactional[T any](
 		EventData:   dataBytes,
 		ContentType: options.ContentType,
 		Status:      "pending",
-		Attempts:    0,
+		RetryCount:  0,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}

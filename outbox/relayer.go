@@ -145,7 +145,7 @@ func (r *Relayer) processPendingEvents(ctx context.Context) {
 		}
 
 		// Check if max retries exceeded
-		if event.Attempts >= r.maxRetries {
+		if event.RetryCount >= r.maxRetries {
 			_ = r.storage.MarkOutboxEventFailed(ctx, event.EventID)
 			continue
 		}

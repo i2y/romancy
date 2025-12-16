@@ -46,6 +46,11 @@ func DefineActivity[I, O any](
 	for _, opt := range opts {
 		opt(a)
 	}
+	// Auto-register compensation executor if compensation is set
+	// This makes the compensation function available for execution during rollback
+	if a.compensationFn != nil {
+		RegisterActivity(a)
+	}
 	return a
 }
 
@@ -253,19 +258,11 @@ func (a *Activity[I, O]) registerCompensation(ctx *WorkflowContext, activityID s
 		return fmt.Errorf("failed to encode compensation argument: %w", err)
 	}
 
-	// Get current compensation count for ordering
-	entries, err := ctx.Storage().GetCompensations(ctx.Context(), ctx.InstanceID())
-	if err != nil {
-		return fmt.Errorf("failed to get existing compensations: %w", err)
-	}
-
 	entry := &storage.CompensationEntry{
-		InstanceID:      ctx.InstanceID(),
-		ActivityID:      activityID,
-		CompensationFn:  a.name, // Use activity name as the compensation function name
-		CompensationArg: inputData,
-		Order:           len(entries) + 1, // Higher order = execute first (LIFO)
-		Status:          "pending",
+		InstanceID:   ctx.InstanceID(),
+		ActivityID:   activityID,
+		ActivityName: a.name, // Use activity name as the compensation function name
+		Args:         inputData,
 	}
 
 	return ctx.Storage().AddCompensation(ctx.Context(), entry)

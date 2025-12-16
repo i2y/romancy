@@ -58,7 +58,7 @@ func TestCancelWorkflowWithCompensation(t *testing.T) {
 		WorkflowName: "test_workflow",
 		Status:       storage.StatusRunning,
 		InputData:    []byte(`{"item_id": "ITEM-001"}`),
-		CreatedAt:    time.Now(),
+		StartedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
 	}
 
@@ -68,12 +68,10 @@ func TestCancelWorkflowWithCompensation(t *testing.T) {
 
 	// Add a compensation entry
 	comp := &storage.CompensationEntry{
-		InstanceID:      "test-cancel-123",
-		ActivityID:      "test_reserve_inventory:1",
-		CompensationFn:  "test_reserve_inventory",
-		CompensationArg: []byte(`"ITEM-001"`),
-		Order:           1,
-		Status:          "pending",
+		InstanceID:   "test-cancel-123",
+		ActivityID:   "test_reserve_inventory:1",
+		ActivityName: "test_reserve_inventory",
+		Args:         []byte(`"ITEM-001"`),
 	}
 
 	if err := app.Storage().AddCompensation(ctx, comp); err != nil {
@@ -103,16 +101,22 @@ func TestCancelWorkflowWithCompensation(t *testing.T) {
 		t.Errorf("Expected status 'cancelled', got '%s'", result.Status)
 	}
 
-	// Verify compensation is marked as executed
-	compensations, err := app.Storage().GetCompensations(ctx, "test-cancel-123")
+	// Verify compensation was executed by checking history events
+	history, _, err := app.Storage().GetHistoryPaginated(ctx, "test-cancel-123", 0, 100)
 	if err != nil {
-		t.Fatalf("Failed to get compensations: %v", err)
+		t.Fatalf("Failed to get history: %v", err)
 	}
-	if len(compensations) != 1 {
-		t.Fatalf("Expected 1 compensation, got %d", len(compensations))
+
+	// Look for CompensationExecuted event in history
+	foundCompensationExecuted := false
+	for _, h := range history {
+		if h.EventType == storage.HistoryCompensationExecuted {
+			foundCompensationExecuted = true
+			break
+		}
 	}
-	if compensations[0].Status != "executed" {
-		t.Errorf("Expected compensation status 'executed', got '%s'", compensations[0].Status)
+	if !foundCompensationExecuted {
+		t.Error("Expected to find CompensationExecuted event in history")
 	}
 }
 
@@ -134,7 +138,7 @@ func TestCancelCompletedWorkflow(t *testing.T) {
 		WorkflowName: "test_workflow",
 		Status:       storage.StatusCompleted,
 		InputData:    []byte(`{}`),
-		CreatedAt:    time.Now(),
+		StartedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
 	}
 
@@ -167,7 +171,7 @@ func TestCancelIdempotent(t *testing.T) {
 		WorkflowName: "test_workflow",
 		Status:       storage.StatusCancelled,
 		InputData:    []byte(`{}`),
-		CreatedAt:    time.Now(),
+		StartedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
 	}
 
@@ -234,7 +238,7 @@ func TestCancelWithMultipleCompensations(t *testing.T) {
 		WorkflowName: "test_workflow",
 		Status:       storage.StatusRunning,
 		InputData:    []byte(`{}`),
-		CreatedAt:    time.Now(),
+		StartedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
 	}
 
@@ -242,19 +246,20 @@ func TestCancelWithMultipleCompensations(t *testing.T) {
 		t.Fatalf("Failed to create instance: %v", err)
 	}
 
-	// Add compensations in order (1, 2, 3)
-	for i, name := range []string{"multi_activity_1", "multi_activity_2", "multi_activity_3"} {
+	// Add compensations in order (1, 2, 3) with small delays to ensure created_at ordering
+	// AddCompensation uses millisecond-precision timestamps for reliable LIFO ordering
+	for _, name := range []string{"multi_activity_1", "multi_activity_2", "multi_activity_3"} {
 		comp := &storage.CompensationEntry{
-			InstanceID:      "multi-comp-123",
-			ActivityID:      name + ":1",
-			CompensationFn:  name,
-			CompensationArg: []byte(`"test"`),
-			Order:           i + 1, // Higher order = execute first (LIFO)
-			Status:          "pending",
+			InstanceID:   "multi-comp-123",
+			ActivityID:   name + ":1",
+			ActivityName: name,
+			Args:         []byte(`"test"`),
 		}
 		if err := app.Storage().AddCompensation(ctx, comp); err != nil {
 			t.Fatalf("Failed to add compensation: %v", err)
 		}
+		// Small delay to ensure different millisecond timestamps
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	// Reset order tracking

@@ -668,16 +668,16 @@ func TestEngine_executeCompensations(t *testing.T) {
 			}
 			require.NoError(t, store.CreateInstance(context.Background(), instance))
 
-			for i, compName := range tt.compensations {
+			for _, compName := range tt.compensations {
 				entry := &storage.CompensationEntry{
-					InstanceID:      instance.InstanceID,
-					ActivityID:      compName,
-					CompensationFn:  compName,
-					CompensationArg: []byte(`"arg"`),
-					Order:           i + 1,
-					Status:          "pending",
+					InstanceID:   instance.InstanceID,
+					ActivityID:   compName,
+					ActivityName: compName,
+					Args:         []byte(`"arg"`),
 				}
 				require.NoError(t, store.AddCompensation(context.Background(), entry))
+				// Small delay to ensure different millisecond timestamps for ordering
+				time.Sleep(2 * time.Millisecond)
 			}
 
 			var executedCount int
@@ -711,12 +711,10 @@ func TestEngine_executeCompensations_NoRunner(t *testing.T) {
 	require.NoError(t, store.CreateInstance(context.Background(), instance))
 
 	entry := &storage.CompensationEntry{
-		InstanceID:      instance.InstanceID,
-		ActivityID:      "comp1",
-		CompensationFn:  "comp1",
-		CompensationArg: []byte(`"arg"`),
-		Order:           1,
-		Status:          "pending",
+		InstanceID:   instance.InstanceID,
+		ActivityID:   "comp1",
+		ActivityName: "comp1",
+		Args:         []byte(`"arg"`),
 	}
 	require.NoError(t, store.AddCompensation(context.Background(), entry))
 

@@ -313,6 +313,15 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 			})
 		}
 
+		// Record workflow failure in history
+		eventData, _ := json.Marshal(map[string]any{"error": err.Error()})
+		_ = e.storage.AppendHistory(ctx, &storage.HistoryEvent{
+			InstanceID: instanceID,
+			EventType:  storage.HistoryWorkflowFailed,
+			EventData:  eventData,
+			DataType:   "json",
+		})
+
 		// Mark as failed
 		_ = e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusFailed, err.Error())
 
@@ -494,6 +503,7 @@ func (e *Engine) SetCompensationRunner(runner CompensationRunner) {
 }
 
 // executeCompensations runs all pending compensations for a workflow in LIFO order.
+// Status is tracked via history events (CompensationExecuted, CompensationFailed).
 func (e *Engine) executeCompensations(ctx context.Context, instanceID string) error {
 	entries, err := e.storage.GetCompensations(ctx, instanceID)
 	if err != nil {
@@ -509,16 +519,23 @@ func (e *Engine) executeCompensations(ctx context.Context, instanceID string) er
 		return nil
 	}
 
+	// Get executed compensation IDs from history
+	executedIDs, err := e.getExecutedCompensationIDs(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to get executed compensations: %w", err)
+	}
+
 	var firstErr error
 	for _, entry := range entries {
-		if entry.Status != "pending" {
+		// Skip already executed compensations
+		if _, executed := executedIDs[entry.ID]; executed {
 			continue
 		}
 
-		execErr := e.compensationRunner(ctx, entry.CompensationFn, entry.CompensationArg)
+		execErr := e.compensationRunner(ctx, entry.ActivityName, entry.Args)
 		if execErr != nil {
-			// Mark as failed
-			_ = e.storage.MarkCompensationFailed(ctx, entry.ID)
+			// Record failure in history
+			_ = e.recordCompensationResult(ctx, instanceID, entry, false, execErr.Error())
 			if firstErr == nil {
 				firstErr = fmt.Errorf("compensation %s failed: %w", entry.ActivityID, execErr)
 			}
@@ -526,9 +543,71 @@ func (e *Engine) executeCompensations(ctx context.Context, instanceID string) er
 			continue
 		}
 
-		// Mark as executed
-		_ = e.storage.MarkCompensationExecuted(ctx, entry.ID)
+		// Record success in history
+		_ = e.recordCompensationResult(ctx, instanceID, entry, true, "")
 	}
 
 	return firstErr
+}
+
+// getExecutedCompensationIDs returns a set of compensation IDs that have been executed.
+func (e *Engine) getExecutedCompensationIDs(ctx context.Context, instanceID string) (map[int64]bool, error) {
+	executed := make(map[int64]bool)
+
+	// Iterate through all history events to find compensation results
+	var afterID int64
+	const pageSize = 100
+	for {
+		events, hasMore, err := e.storage.GetHistoryPaginated(ctx, instanceID, afterID, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			if event.EventType == storage.HistoryCompensationExecuted ||
+				event.EventType == storage.HistoryCompensationFailed {
+				// Parse compensation_id from event data
+				var eventData map[string]any
+				if err := json.Unmarshal(event.EventData, &eventData); err == nil {
+					if id, ok := eventData["compensation_id"].(float64); ok {
+						executed[int64(id)] = true
+					}
+				}
+			}
+			afterID = event.ID
+		}
+		if !hasMore {
+			break
+		}
+	}
+	return executed, nil
+}
+
+// recordCompensationResult records a compensation execution result to history.
+func (e *Engine) recordCompensationResult(ctx context.Context, instanceID string, entry *storage.CompensationEntry, success bool, errorMsg string) error {
+	eventType := storage.HistoryCompensationExecuted
+	if !success {
+		eventType = storage.HistoryCompensationFailed
+	}
+
+	eventData := map[string]any{
+		"compensation_id": entry.ID,
+		"activity_id":     entry.ActivityID,
+		"activity_name":   entry.ActivityName,
+	}
+	if errorMsg != "" {
+		eventData["error"] = errorMsg
+	}
+
+	eventDataBytes, err := json.Marshal(eventData)
+	if err != nil {
+		return err
+	}
+
+	return e.storage.AppendHistory(ctx, &storage.HistoryEvent{
+		InstanceID: instanceID,
+		ActivityID: fmt.Sprintf("compensation:%d", entry.ID),
+		EventType:  eventType,
+		EventData:  eventDataBytes,
+		DataType:   "json",
+	})
 }

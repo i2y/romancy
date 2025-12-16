@@ -79,8 +79,8 @@ func TestMigrator_SQLite_Version(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected version 4, got %d", version)
+	if version != 6 {
+		t.Errorf("expected version 6, got %d", version)
 	}
 	if dirty {
 		t.Errorf("expected dirty=false, got dirty=true")
@@ -112,13 +112,13 @@ func TestMigrator_SQLite_Idempotent(t *testing.T) {
 		t.Fatalf("second Up failed: %v", err)
 	}
 
-	// Verify version is still 2
+	// Verify version is still the latest
 	version, _, err := migrator.Version()
 	if err != nil {
 		t.Fatalf("failed to get version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected version 4 after idempotent Up, got %d", version)
+	if version != 6 {
+		t.Errorf("expected version 6 after idempotent Up, got %d", version)
 	}
 }
 
@@ -162,6 +162,66 @@ func TestMigrator_SQLite_ExistingDatabase(t *testing.T) {
 			step INTEGER NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
+		CREATE TABLE workflow_compensations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			instance_id TEXT NOT NULL,
+			activity_id TEXT NOT NULL,
+			compensation_fn TEXT NOT NULL,
+			compensation_arg BLOB,
+			comp_order INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE channel_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			channel_name TEXT NOT NULL,
+			data_json TEXT,
+			data_binary BLOB,
+			metadata TEXT,
+			target_instance_id TEXT,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE channel_subscriptions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			instance_id TEXT NOT NULL,
+			channel_name TEXT NOT NULL,
+			mode TEXT NOT NULL DEFAULT 'broadcast',
+			waiting INTEGER NOT NULL DEFAULT 0,
+			timeout_at DATETIME,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE channel_delivery_cursors (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			instance_id TEXT NOT NULL,
+			channel_name TEXT NOT NULL,
+			last_message_id INTEGER NOT NULL DEFAULT 0,
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE channel_message_claims (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			message_id INTEGER NOT NULL,
+			instance_id TEXT NOT NULL,
+			claimed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE workflow_outbox (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT UNIQUE NOT NULL,
+			event_type TEXT NOT NULL,
+			event_source TEXT NOT NULL,
+			data_type TEXT NOT NULL,
+			event_data TEXT,
+			content_type TEXT,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE workflow_group_memberships (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			instance_id TEXT NOT NULL,
+			group_name TEXT NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		);
 	`)
 	if err != nil {
 		t.Fatalf("failed to create pre-existing tables: %v", err)
@@ -178,8 +238,8 @@ func TestMigrator_SQLite_ExistingDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected version 4 for existing database after migration, got %d", version)
+	if version != 6 {
+		t.Errorf("expected version 6 for existing database after migration, got %d", version)
 	}
 }
 

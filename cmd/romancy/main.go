@@ -198,7 +198,7 @@ func cmdGet(instanceID string) error {
 	fmt.Printf("Workflow:     %s\n", instance.WorkflowName)
 	fmt.Printf("Status:       %s\n", statusEmoji(instance.Status))
 	fmt.Printf("Activity ID:  %s\n", instance.CurrentActivityID)
-	fmt.Printf("Created:      %s\n", instance.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("Started:      %s\n", instance.StartedAt.Format(time.RFC3339))
 	fmt.Printf("Updated:      %s\n", instance.UpdatedAt.Format(time.RFC3339))
 
 	if instance.LockedBy != "" {
@@ -206,10 +206,6 @@ func cmdGet(instanceID string) error {
 		if instance.LockedAt != nil {
 			fmt.Printf("Locked At:    %s\n", instance.LockedAt.Format(time.RFC3339))
 		}
-	}
-
-	if instance.ErrorMessage != "" {
-		fmt.Printf("Error:        %s\n", instance.ErrorMessage)
 	}
 
 	// Display input

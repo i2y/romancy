@@ -196,14 +196,25 @@ func TestActivityTransactionRollbackOnError(t *testing.T) {
 		t.Fatal("Expected workflow to fail")
 	}
 
-	// Verify no history was recorded (transaction was rolled back)
+	// Verify no activity-related history was recorded (transaction was rolled back)
+	// WorkflowFailed event is recorded outside the transaction, so it's expected
 	history, _, err := store.GetHistoryPaginated(context.Background(), "test-instance-rollback-1", 0, 100)
 	if err != nil {
 		t.Fatalf("Failed to get history: %v", err)
 	}
 
-	if len(history) != 0 {
-		t.Errorf("Expected no history events after rollback, got %d", len(history))
+	// Count activity-related events (activity_started, activity_completed, activity_failed)
+	activityEvents := 0
+	for _, h := range history {
+		if h.EventType == storage.HistoryActivityStarted ||
+			h.EventType == storage.HistoryActivityCompleted ||
+			h.EventType == storage.HistoryActivityFailed {
+			activityEvents++
+		}
+	}
+
+	if activityEvents != 0 {
+		t.Errorf("Expected no activity history events after rollback, got %d", activityEvents)
 	}
 }
 

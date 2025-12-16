@@ -60,7 +60,7 @@ func (m *mockStorage) MarkOutboxEventFailed(ctx context.Context, eventID string)
 func (m *mockStorage) IncrementOutboxAttempts(ctx context.Context, eventID string) error {
 	for _, e := range m.events {
 		if e.EventID == eventID {
-			e.Attempts++
+			e.RetryCount++
 			break
 		}
 	}
@@ -157,11 +157,9 @@ func (m *mockStorage) AddCompensation(ctx context.Context, entry *storage.Compen
 func (m *mockStorage) GetCompensations(ctx context.Context, instanceID string) ([]*storage.CompensationEntry, error) {
 	return nil, nil
 }
-func (m *mockStorage) MarkCompensationExecuted(ctx context.Context, id int64) error { return nil }
-func (m *mockStorage) MarkCompensationFailed(ctx context.Context, id int64) error   { return nil }
 
 // ChannelManager stubs
-func (m *mockStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte, targetInstanceID string) (int64, error) {
+func (m *mockStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte) (int64, error) {
 	return 0, nil
 }
 func (m *mockStorage) SubscribeToChannel(ctx context.Context, instanceID, channelName string, mode storage.ChannelMode) error {
@@ -356,7 +354,7 @@ func TestRelayerMaxRetries(t *testing.T) {
 		EventType:   "test.event",
 		EventSource: "test",
 		Status:      "pending",
-		Attempts:    3, // Already at max
+		RetryCount:  3, // Already at max
 	}
 	s.events = append(s.events, event)
 

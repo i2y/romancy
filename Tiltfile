@@ -24,6 +24,8 @@ common_env = {
     "DATABASE_URL": "postgres://romancy:romancy@127.0.0.1:5433/romancy_test?sslmode=disable",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317",
     "ROMANCY_SERVE": "true",  # Keep one-shot examples running for Tilt
+    # Suppress verbose gRPC logging (gRPC v1.74+ uses log/slog by default)
+    "GRPC_GO_LOG_SEVERITY_LEVEL": "ERROR",
 }
 
 # Example definitions
