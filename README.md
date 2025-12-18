@@ -169,9 +169,32 @@ go get github.com/i2y/romancy
 
 ### Database Migrations
 
-Romancy uses [dbmate](https://github.com/amacneil/dbmate) for database schema management. The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between Romancy (Go) and [Edda](https://github.com/i2y/edda) (Python) to ensure cross-framework compatibility.
+Romancy **automatically applies database migrations** on startup. Migration files are embedded in the binary, so no external files are needed at runtime.
 
-**Running migrations with dbmate**:
+```go
+// Default: auto-migration enabled
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:pass@localhost/db"),
+)
+
+// Disable auto-migration (manage with dbmate CLI instead)
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:pass@localhost/db"),
+    romancy.WithAutoMigrate(false),
+)
+```
+
+**Features**:
+- **Automatic**: Migrations run during `app.Start()` before any workflows execute
+- **dbmate-compatible**: Uses the same `schema_migrations` table as dbmate CLI
+- **Multi-worker safe**: Safe for concurrent startup across multiple pods/processes
+- **Embedded**: Migration files are bundled into the binary via Go embed
+
+The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, shared between Romancy (Go) and [Edda](https://github.com/i2y/edda) (Python) for cross-framework compatibility.
+
+**Manual migration with dbmate** (optional):
+
+If you prefer to manage migrations externally:
 
 ```bash
 # Install dbmate
@@ -182,16 +205,11 @@ brew install dbmate  # macOS
 dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite up
 
 # Run migrations (PostgreSQL)
-dbmate --url "postgres://user:pass@localhost/db?sslmode=disable" --migrations-dir schema/db/migrations/postgres up
+dbmate --url "postgres://user:pass@localhost/db?sslmode=disable" --migrations-dir schema/db/migrations/postgresql up
 
 # Run migrations (MySQL)
 dbmate --url "mysql://user:pass@localhost/db" --migrations-dir schema/db/migrations/mysql up
-
-# Check current version
-dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite status
 ```
-
-**Note**: The `WithAutoMigrate()` option is deprecated. Migrations should be managed externally using dbmate before starting the application.
 
 ## Core Concepts
 

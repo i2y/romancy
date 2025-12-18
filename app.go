@@ -18,6 +18,7 @@ import (
 
 	"github.com/i2y/romancy/hooks"
 	"github.com/i2y/romancy/internal/coordination"
+	"github.com/i2y/romancy/internal/migrations"
 	"github.com/i2y/romancy/internal/notify"
 	"github.com/i2y/romancy/internal/replay"
 	"github.com/i2y/romancy/internal/storage"
@@ -239,6 +240,31 @@ func (a *App) initStorage() error {
 			return fmt.Errorf("failed to create SQLite storage: %w", err)
 		}
 		a.storage = sqliteStorage
+	}
+
+	// Run automatic migrations if enabled
+	if a.config.autoMigrate {
+		dbType, err := migrations.DetectDBType(url)
+		if err != nil {
+			slog.Warn("could not detect database type for migrations", "error", err)
+		} else {
+			// Use custom migrations FS if provided, otherwise use embedded migrations
+			migrationsFS := a.config.migrationsFS
+			if migrationsFS == nil {
+				migrationsFS = EmbeddedMigrationsFS()
+			}
+
+			applied, err := migrations.ApplyMigrations(a.ctx, a.storage.DB(), dbType, migrationsFS)
+			if err != nil {
+				return fmt.Errorf("failed to apply migrations: %w", err)
+			}
+			if len(applied) > 0 {
+				slog.Info("applied database migrations",
+					"count", len(applied),
+					"versions", applied,
+					"db_type", dbType)
+			}
+		}
 	}
 
 	// Create the replay engine

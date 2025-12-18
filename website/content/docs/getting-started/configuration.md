@@ -35,19 +35,44 @@ romancy.WithDatabase("mysql://user:password@localhost:3306/dbname")
 
 **Default**: `"file:romancy.db"`
 
-### WithAutoMigrate(enabled) (Deprecated)
+### WithAutoMigrate(enabled)
 
-This option is deprecated and now a no-op. Database migrations should be managed externally using [dbmate](https://github.com/amacneil/dbmate).
+Enables or disables automatic database migration on startup.
 
-The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between Romancy (Go) and Edda (Python) to ensure cross-framework compatibility.
+```go
+// Default: auto-migration enabled
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:password@localhost/db"),
+)
 
-```bash
-# Run migrations with dbmate
-dbmate --url "postgres://user:password@localhost/db" \
-       --migrations-dir schema/db/migrations/postgres up
+// Disable auto-migration
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:password@localhost/db"),
+    romancy.WithAutoMigrate(false),
+)
 ```
 
+**Default**: `true` (enabled)
+
+When enabled, Romancy automatically applies pending [dbmate](https://github.com/amacneil/dbmate)-compatible migrations during `app.Start()`. Migration files are embedded in the binary, so no external files are needed at runtime.
+
 See [Database Migrations](#database-migrations) section below for details.
+
+### WithMigrationsFS(fs)
+
+Sets a custom filesystem for database migrations.
+
+```go
+//go:embed custom_migrations
+var customMigrations embed.FS
+
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://..."),
+    romancy.WithMigrationsFS(customMigrations),
+)
+```
+
+**Default**: Embedded migrations from `schema/db/migrations/`
 
 ## Worker Configuration
 
@@ -299,50 +324,69 @@ func main() {
 
 ## Database Migrations
 
-Romancy uses [dbmate](https://github.com/amacneil/dbmate) for database schema management. The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository as a git submodule, which is shared between Romancy (Go) and Edda (Python) to ensure cross-framework compatibility.
+Romancy **automatically applies database migrations** on startup. Migration files are embedded in the binary using Go's `embed` package, so no external files are needed at runtime.
 
-### Installing dbmate
+### How It Works
 
-```bash
-# macOS
-brew install dbmate
+1. **Automatic**: When `app.Start()` is called, Romancy checks for pending migrations
+2. **dbmate-compatible**: Uses the same `schema_migrations` table and SQL format as [dbmate](https://github.com/amacneil/dbmate)
+3. **Multi-worker safe**: Multiple pods/processes can start simultaneously without conflicts (uses UNIQUE constraint handling)
+4. **Embedded**: Migration files are bundled into the binary
 
-# Go
-go install github.com/amacneil/dbmate@latest
+### Configuration
 
-# Linux (amd64)
-curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
-chmod +x /usr/local/bin/dbmate
+```go
+// Default: auto-migration enabled
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:password@localhost/db"),
+)
+
+// Disable auto-migration (manage manually with dbmate CLI)
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:password@localhost/db"),
+    romancy.WithAutoMigrate(false),
+)
 ```
 
-### Running Migrations
+### Cross-Framework Compatibility
+
+The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between:
+- **Romancy** (Go)
+- **Edda** (Python)
+
+This ensures that both frameworks can work with the same database.
+
+### Manual Migration with dbmate (Optional)
+
+If you prefer to manage migrations externally (e.g., in CI/CD pipelines), disable auto-migration and use the dbmate CLI:
 
 ```bash
-# SQLite
+# Install dbmate
+brew install dbmate  # macOS
+# or: go install github.com/amacneil/dbmate@latest
+
+# Run migrations
 dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite up
-
-# PostgreSQL
-dbmate --url "postgres://user:password@localhost/db?sslmode=disable" \
-       --migrations-dir schema/db/migrations/postgres up
-
-# MySQL
-dbmate --url "mysql://user:password@localhost/db" \
-       --migrations-dir schema/db/migrations/mysql up
+dbmate --url "postgres://user:password@localhost/db?sslmode=disable" --migrations-dir schema/db/migrations/postgresql up
+dbmate --url "mysql://user:password@localhost/db" --migrations-dir schema/db/migrations/mysql up
 ```
 
-### Migration Commands
+### Migration Commands (dbmate)
 
 | Command | Description |
 |---------|-------------|
 | `dbmate up` | Run all pending migrations |
 | `dbmate down` | Rollback the last migration |
 | `dbmate status` | Show migration status |
-| `dbmate rollback` | Alias for `down` |
 | `dbmate create NAME` | Create a new migration file |
 
-### Setting Up the Schema Submodule
+### Schema Submodule (For Romancy Contributors)
 
-If you're starting a new project, add the schema repository as a git submodule:
+{{< callout type="info" >}}
+**Regular users can skip this section.** Migration files are embedded in the romancy binary, so submodule setup is not required.
+{{< /callout >}}
+
+Only needed if you are contributing to romancy itself and need to modify the database schema:
 
 ```bash
 git submodule add https://github.com/durax-io/schema.git schema

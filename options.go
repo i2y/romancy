@@ -1,6 +1,7 @@
 package romancy
 
 import (
+	"io/fs"
 	"time"
 
 	"github.com/i2y/romancy/hooks"
@@ -62,6 +63,10 @@ type appConfig struct {
 
 	// Shutdown
 	shutdownTimeout time.Duration
+
+	// Migration settings
+	autoMigrate  bool  // Whether to run migrations on startup (default: true)
+	migrationsFS fs.FS // Optional custom migrations filesystem
 }
 
 // defaultConfig returns the default configuration.
@@ -95,6 +100,7 @@ func defaultConfig() *appConfig {
 		leaderLeaseDuration:        45 * time.Second,
 		shutdownTimeout:            30 * time.Second,
 		hooks:                      &hooks.NoOpHooks{},
+		autoMigrate:                true,
 	}
 }
 
@@ -108,13 +114,38 @@ func WithDatabase(url string) Option {
 	}
 }
 
-// WithAutoMigrate is deprecated. Use dbmate for migrations instead:
-// dbmate -d schema/db/migrations/sqlite up
-// This option is now a no-op for backwards compatibility.
-// Deprecated: Use dbmate for migrations.
+// WithAutoMigrate enables or disables automatic database migrations on startup.
+//
+// When enabled (default), romancy will automatically apply pending dbmate-compatible
+// migrations from the embedded schema/db/migrations/ directory during App.Start().
+//
+// This is compatible with the dbmate CLI tool and uses the same schema_migrations
+// table for tracking applied migrations.
+//
+// Set to false if you prefer to manage migrations manually using dbmate CLI:
+//
+//	dbmate -d schema/db/migrations/sqlite up
 func WithAutoMigrate(enabled bool) Option {
 	return func(c *appConfig) {
-		// No-op: migrations are now handled by dbmate
+		c.autoMigrate = enabled
+	}
+}
+
+// WithMigrationsFS sets a custom filesystem for database migrations.
+//
+// By default, romancy uses embedded migrations from schema/db/migrations/.
+// Use this option to provide custom migrations from a different source.
+//
+// The filesystem should contain subdirectories for each database type:
+//   - sqlite/
+//   - postgresql/
+//   - mysql/
+//
+// Each subdirectory should contain .sql files in dbmate format with
+// -- migrate:up and -- migrate:down sections.
+func WithMigrationsFS(migrationsFS fs.FS) Option {
+	return func(c *appConfig) {
+		c.migrationsFS = migrationsFS
 	}
 }
 

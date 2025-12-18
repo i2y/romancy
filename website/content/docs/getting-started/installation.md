@@ -203,40 +203,46 @@ app := romancy.NewApp(
 
 ## Database Migrations
 
-Romancy uses [dbmate](https://github.com/amacneil/dbmate) for database schema management. The schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between Romancy (Go) and Edda (Python).
+Romancy **automatically applies database migrations** on startup. No manual setup is required!
 
-### Setup
+### How It Works
 
-1. **Install dbmate**:
+Migration files are embedded in the Romancy binary and applied during `app.Start()`:
 
-```bash
-# macOS
-brew install dbmate
-
-# Go
-go install github.com/amacneil/dbmate@latest
+```go
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://user:password@localhost/db"),
+)
+if err := app.Start(ctx); err != nil {  // Migrations run here
+    log.Fatal(err)
+}
 ```
 
-2. **Add the schema submodule to your project**:
+**Features**:
+- **Zero configuration**: Works out of the box
+- **dbmate-compatible**: Uses the same `schema_migrations` table as dbmate CLI
+- **Multi-worker safe**: Safe for Kubernetes deployments with multiple replicas
+- **Embedded**: No external files needed at runtime
 
-```bash
-git submodule add https://github.com/durax-io/schema.git schema
-git submodule update --init --recursive
+### Manual Migration (Optional)
+
+If you prefer to manage migrations externally (e.g., in CI/CD), disable auto-migration:
+
+```go
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://..."),
+    romancy.WithAutoMigrate(false),  // Disable auto-migration
+)
 ```
 
-3. **Run migrations**:
+Then use [dbmate](https://github.com/amacneil/dbmate) CLI:
 
 ```bash
-# SQLite
+# Install dbmate
+brew install dbmate  # macOS
+
+# Run migrations
 dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite up
-
-# PostgreSQL
-dbmate --url "postgres://user:password@localhost/db?sslmode=disable" \
-       --migrations-dir schema/db/migrations/postgres up
-
-# MySQL
-dbmate --url "mysql://user:password@localhost/db" \
-       --migrations-dir schema/db/migrations/mysql up
 ```
 
 For more details, see the [Configuration Reference](/docs/getting-started/configuration#database-migrations).
