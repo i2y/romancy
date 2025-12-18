@@ -2,7 +2,6 @@ package romancy
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 )
@@ -19,16 +18,9 @@ type SimpleOutput struct {
 
 // TestWorkflowExecution tests basic workflow execution.
 func TestWorkflowExecution(t *testing.T) {
-	// Create a temporary database
-	tmpFile, err := os.CreateTemp("", "romancy-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_ = tmpFile.Close()
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	// Create app
-	app := NewApp(WithDatabase(tmpFile.Name()))
+	// Create app with pre-initialized test database
+	app, cleanup := createTestApp(t)
+	defer cleanup()
 
 	// Define a simple activity
 	greetActivity := DefineActivity[string, string](
@@ -90,16 +82,9 @@ func TestWorkflowExecution(t *testing.T) {
 
 // TestWorkflowWithMultipleActivities tests workflow with multiple activities.
 func TestWorkflowWithMultipleActivities(t *testing.T) {
-	// Create a temporary database
-	tmpFile, err := os.CreateTemp("", "romancy-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_ = tmpFile.Close()
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	// Create app
-	app := NewApp(WithDatabase(tmpFile.Name()))
+	// Create app with pre-initialized test database
+	app, cleanup := createTestApp(t)
+	defer cleanup()
 
 	// Define activities
 	addActivity := DefineActivity[int, int](
@@ -171,16 +156,9 @@ func TestWorkflowWithMultipleActivities(t *testing.T) {
 
 // TestWorkflowWithActivityFailure tests workflow with failing activity.
 func TestWorkflowWithActivityFailure(t *testing.T) {
-	// Create a temporary database
-	tmpFile, err := os.CreateTemp("", "romancy-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_ = tmpFile.Close()
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	// Create app
-	app := NewApp(WithDatabase(tmpFile.Name()))
+	// Create app with pre-initialized test database
+	app, cleanup := createTestApp(t)
+	defer cleanup()
 
 	// Define failing activity
 	failActivity := DefineActivity[string, string](

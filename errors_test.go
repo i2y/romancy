@@ -465,7 +465,7 @@ func TestIsSuspendSignal(t *testing.T) {
 		},
 		{
 			name: "timer suspend signal",
-			err:  NewTimerSuspend("inst-1", "timer-1", time.Now().Add(time.Hour), 1),
+			err:  NewTimerSuspend("inst-1", "timer-1", "timer-1", time.Now().Add(time.Hour)),
 			want: true,
 		},
 		{
@@ -480,7 +480,7 @@ func TestIsSuspendSignal(t *testing.T) {
 		},
 		{
 			name: "wrapped suspend signal",
-			err:  fmt.Errorf("wrapped: %w", NewTimerSuspend("inst-4", "timer-2", time.Now(), 2)),
+			err:  fmt.Errorf("wrapped: %w", NewTimerSuspend("inst-4", "timer-2", "timer-2", time.Now())),
 			want: true,
 		},
 	}
@@ -494,7 +494,7 @@ func TestIsSuspendSignal(t *testing.T) {
 }
 
 func TestAsSuspendSignal(t *testing.T) {
-	timerSignal := NewTimerSuspend("inst-1", "timer-1", time.Now().Add(time.Hour), 1)
+	timerSignal := NewTimerSuspend("inst-1", "timer-1", "timer-1", time.Now().Add(time.Hour))
 	channelSignal := NewChannelMessageSuspend("inst-2", "events", "act-1", nil)
 
 	tests := []struct {
@@ -551,35 +551,35 @@ func TestNewTimerSuspend(t *testing.T) {
 		name       string
 		instanceID string
 		timerID    string
+		activityID string
 		expiresAt  time.Time
-		step       int
 	}{
 		{
 			name:       "basic timer",
 			instanceID: "inst-1",
 			timerID:    "sleep-timer",
+			activityID: "sleep-timer",
 			expiresAt:  time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
-			step:       1,
 		},
 		{
 			name:       "delayed timer",
 			instanceID: "inst-2",
 			timerID:    "deadline-timer",
+			activityID: "deadline-timer",
 			expiresAt:  time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC),
-			step:       5,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			signal := NewTimerSuspend(tt.instanceID, tt.timerID, tt.expiresAt, tt.step)
+			signal := NewTimerSuspend(tt.instanceID, tt.timerID, tt.activityID, tt.expiresAt)
 
 			require.NotNil(t, signal)
 			assert.Equal(t, SuspendForTimer, signal.Type)
 			assert.Equal(t, tt.instanceID, signal.InstanceID)
 			assert.Equal(t, tt.timerID, signal.TimerID)
 			assert.Equal(t, tt.expiresAt, signal.ExpiresAt)
-			assert.Equal(t, tt.step, signal.Step)
+			assert.Equal(t, tt.activityID, signal.ActivityID)
 
 			assert.Contains(t, signal.Error(), "waiting for timer")
 			assert.Contains(t, signal.Error(), tt.timerID)
@@ -688,7 +688,7 @@ func TestSuspendSignal_Error(t *testing.T) {
 	}{
 		{
 			name:         "timer suspend",
-			signal:       NewTimerSuspend("inst-1", "timer-1", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), 1),
+			signal:       NewTimerSuspend("inst-1", "timer-1", "timer-1", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)),
 			wantContains: []string{"workflow suspended", "waiting for timer", "timer-1"},
 		},
 		{

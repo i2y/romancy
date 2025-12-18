@@ -52,6 +52,11 @@ func TestCancelWorkflowWithCompensation(t *testing.T) {
 	}
 	defer func() { _ = app.Shutdown(ctx) }()
 
+	// Initialize test schema
+	if err := storage.InitializeTestSchemaForStorage(ctx, app.Storage()); err != nil {
+		t.Fatalf("Failed to initialize test schema: %v", err)
+	}
+
 	// Create a workflow instance manually
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "test-cancel-123",
@@ -132,6 +137,11 @@ func TestCancelCompletedWorkflow(t *testing.T) {
 	}
 	defer func() { _ = app.Shutdown(ctx) }()
 
+	// Initialize test schema
+	if err := storage.InitializeTestSchemaForStorage(ctx, app.Storage()); err != nil {
+		t.Fatalf("Failed to initialize test schema: %v", err)
+	}
+
 	// Create a completed workflow instance
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "completed-123",
@@ -164,6 +174,11 @@ func TestCancelIdempotent(t *testing.T) {
 		t.Fatalf("Failed to start app: %v", err)
 	}
 	defer func() { _ = app.Shutdown(ctx) }()
+
+	// Initialize test schema
+	if err := storage.InitializeTestSchemaForStorage(ctx, app.Storage()); err != nil {
+		t.Fatalf("Failed to initialize test schema: %v", err)
+	}
 
 	// Create an already cancelled workflow instance
 	instance := &storage.WorkflowInstance{
@@ -231,6 +246,11 @@ func TestCancelWithMultipleCompensations(t *testing.T) {
 		t.Fatalf("Failed to start app: %v", err)
 	}
 	defer func() { _ = app.Shutdown(ctx) }()
+
+	// Initialize test schema
+	if err := storage.InitializeTestSchemaForStorage(ctx, app.Storage()); err != nil {
+		t.Fatalf("Failed to initialize test schema: %v", err)
+	}
 
 	// Create a workflow instance
 	instance := &storage.WorkflowInstance{

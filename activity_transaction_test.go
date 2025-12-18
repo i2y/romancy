@@ -43,7 +43,7 @@ func TestActivityExecutionInTransaction(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.Initialize(context.Background()); err != nil {
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
 		t.Fatalf("Failed to initialize storage: %v", err)
 	}
 
@@ -51,7 +51,7 @@ func TestActivityExecutionInTransaction(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "test-instance-tx-1",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	if err := store.CreateInstance(context.Background(), instance); err != nil {
 		t.Fatalf("Failed to create instance: %v", err)
@@ -99,7 +99,7 @@ func TestActivityExecutionWithoutTransaction(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.Initialize(context.Background()); err != nil {
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
 		t.Fatalf("Failed to initialize storage: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestActivityExecutionWithoutTransaction(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "test-instance-no-tx-1",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	if err := store.CreateInstance(context.Background(), instance); err != nil {
 		t.Fatalf("Failed to create instance: %v", err)
@@ -155,7 +155,7 @@ func TestActivityTransactionRollbackOnError(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.Initialize(context.Background()); err != nil {
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
 		t.Fatalf("Failed to initialize storage: %v", err)
 	}
 
@@ -163,7 +163,7 @@ func TestActivityTransactionRollbackOnError(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "test-instance-rollback-1",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	if err := store.CreateInstance(context.Background(), instance); err != nil {
 		t.Fatalf("Failed to create instance: %v", err)
@@ -226,7 +226,7 @@ func TestStorageConnReturnsTransaction(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.Initialize(context.Background()); err != nil {
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
 		t.Fatalf("Failed to initialize storage: %v", err)
 	}
 
@@ -234,7 +234,7 @@ func TestStorageConnReturnsTransaction(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "test-instance-conn-1",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	if err := store.CreateInstance(context.Background(), instance); err != nil {
 		t.Fatalf("Failed to create instance: %v", err)
@@ -293,7 +293,7 @@ func TestWorkflowContextSession(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.Initialize(context.Background()); err != nil {
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
 		t.Fatalf("Failed to initialize storage: %v", err)
 	}
 
@@ -301,7 +301,7 @@ func TestWorkflowContextSession(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "test-instance-session-1",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	if err := store.CreateInstance(context.Background(), instance); err != nil {
 		t.Fatalf("Failed to create instance: %v", err)
