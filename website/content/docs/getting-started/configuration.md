@@ -246,6 +246,37 @@ romancy.WithSingletonChannelCleanup(true)     // Only one worker cleans channels
 | `WithSingletonStaleLockCleanup(enabled)` | Stale lock cleanup as singleton | `true` |
 | `WithSingletonChannelCleanup(enabled)` | Channel cleanup as singleton | `true` |
 
+## Leader Election
+
+Configure leader election for coordinating singleton background tasks across multiple workers. Only the leader executes singleton tasks like stale lock cleanup and channel cleanup.
+
+### WithLeaderHeartbeatInterval(duration)
+
+Sets the interval at which the leader renews its lease.
+
+```go
+romancy.WithLeaderHeartbeatInterval(10 * time.Second)
+```
+
+**Default**: `15 seconds`
+
+### WithLeaderLeaseDuration(duration)
+
+Sets how long a leader holds its lease before it expires.
+
+```go
+romancy.WithLeaderLeaseDuration(30 * time.Second)
+```
+
+**Default**: `45 seconds`
+
+**Important**: Should be at least 3x the heartbeat interval to allow for missed heartbeats.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `WithLeaderHeartbeatInterval(d)` | Leader lease renewal interval | `15s` |
+| `WithLeaderLeaseDuration(d)` | Leader lease expiration time | `45s` |
+
 ## Observability
 
 ### WithHooks(hooks)
