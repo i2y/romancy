@@ -321,7 +321,7 @@ func TestRelayerWithCustomSender(t *testing.T) {
 	s.events = append(s.events, event)
 
 	// Process events
-	_ = r.RelayOnce(context.Background())
+	_, _ = r.RelayOnce(context.Background())
 
 	if atomic.LoadInt32(&sendCount) != 1 {
 		t.Errorf("expected sendCount=1, got %d", sendCount)
@@ -359,7 +359,7 @@ func TestRelayerMaxRetries(t *testing.T) {
 	s.events = append(s.events, event)
 
 	// Process events
-	_ = r.RelayOnce(context.Background())
+	_, _ = r.RelayOnce(context.Background())
 
 	// Check event was marked as failed (not retried)
 	if s.events[0].Status != "failed" {
@@ -431,5 +431,164 @@ func TestEventDataSerialization(t *testing.T) {
 	}
 	if decoded.Amount != 100 {
 		t.Errorf("expected Amount=100, got %d", decoded.Amount)
+	}
+}
+
+func TestRelayerCalculateBackoff(t *testing.T) {
+	s := &mockStorage{}
+	config := RelayerConfig{
+		PollInterval: 1 * time.Second,
+		MaxBackoff:   30 * time.Second,
+	}
+
+	r := NewRelayer(s, config)
+
+	tests := []struct {
+		name             string
+		consecutiveEmpty int
+		expected         time.Duration
+	}{
+		{"zero returns poll interval", 0, 1 * time.Second},
+		{"1 returns 2x poll interval", 1, 2 * time.Second},
+		{"2 returns 4x poll interval", 2, 4 * time.Second},
+		{"3 returns 8x poll interval", 3, 8 * time.Second},
+		{"4 returns 16x poll interval", 4, 16 * time.Second},
+		{"5 returns 32x (capped to maxBackoff)", 5, 30 * time.Second},
+		{"10 returns maxBackoff (exponent capped)", 10, 30 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := r.calculateBackoff(tt.consecutiveEmpty)
+			if result != tt.expected {
+				t.Errorf("calculateBackoff(%d) = %v, want %v",
+					tt.consecutiveEmpty, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRelayerAdaptiveBackoffWithEvents(t *testing.T) {
+	s := &mockStorage{}
+
+	var processCount int32
+	customSender := func(ctx context.Context, event *storage.OutboxEvent) error {
+		atomic.AddInt32(&processCount, 1)
+		return nil
+	}
+
+	config := RelayerConfig{
+		CustomSender: customSender,
+		PollInterval: 10 * time.Millisecond,
+		MaxBackoff:   100 * time.Millisecond,
+	}
+
+	r := NewRelayer(s, config)
+
+	// Add multiple pending events
+	for i := 0; i < 5; i++ {
+		event := &storage.OutboxEvent{
+			EventID:     "test-event-" + string(rune('0'+i)),
+			EventType:   "test.event",
+			EventSource: "test",
+			Status:      "pending",
+		}
+		s.events = append(s.events, event)
+	}
+
+	// Process events - should process all quickly without increasing backoff
+	count, err := r.RelayOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RelayOnce failed: %v", err)
+	}
+	if count != 5 {
+		t.Errorf("expected 5 events processed, got %d", count)
+	}
+	if atomic.LoadInt32(&processCount) != 5 {
+		t.Errorf("expected 5 sends, got %d", processCount)
+	}
+
+	// Now all events should be sent, next RelayOnce should return 0
+	count, err = r.RelayOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RelayOnce failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 events processed, got %d", count)
+	}
+}
+
+func TestRelayerWakeEvent(t *testing.T) {
+	s := &mockStorage{}
+
+	var sendCount int32
+	customSender := func(ctx context.Context, event *storage.OutboxEvent) error {
+		atomic.AddInt32(&sendCount, 1)
+		return nil
+	}
+
+	wakeChan := make(chan struct{}, 1)
+
+	config := RelayerConfig{
+		CustomSender: customSender,
+		PollInterval: 1 * time.Second, // Long poll interval
+		MaxBackoff:   30 * time.Second,
+		WakeEvent:    wakeChan,
+	}
+
+	r := NewRelayer(s, config)
+
+	// Start relayer
+	ctx := context.Background()
+	r.Start(ctx)
+
+	// Give relayer time to start and enter wait state
+	time.Sleep(50 * time.Millisecond)
+
+	// Add event and send wake signal
+	event := &storage.OutboxEvent{
+		EventID:     "test-event-wake",
+		EventType:   "test.event",
+		EventSource: "test",
+		Status:      "pending",
+	}
+	s.events = append(s.events, event)
+
+	// Send wake signal
+	wakeChan <- struct{}{}
+
+	// Wait for event to be processed
+	time.Sleep(100 * time.Millisecond)
+
+	r.Stop()
+
+	if atomic.LoadInt32(&sendCount) < 1 {
+		t.Error("expected at least one event to be sent after wake signal")
+	}
+}
+
+func TestRelayerMaxBackoffConfig(t *testing.T) {
+	s := &mockStorage{}
+
+	// Test with custom max backoff
+	config := RelayerConfig{
+		PollInterval: 100 * time.Millisecond,
+		MaxBackoff:   500 * time.Millisecond,
+	}
+
+	r := NewRelayer(s, config)
+
+	// With 100ms poll interval and 5 consecutive empty:
+	// backoff = 100ms * 2^5 = 3200ms, but capped at 500ms
+	result := r.calculateBackoff(5)
+	if result != 500*time.Millisecond {
+		t.Errorf("expected backoff capped at 500ms, got %v", result)
+	}
+
+	// With 10 consecutive empty (exponent capped at 5):
+	// backoff = 100ms * 2^5 = 3200ms, but capped at 500ms
+	result = r.calculateBackoff(10)
+	if result != 500*time.Millisecond {
+		t.Errorf("expected backoff capped at 500ms, got %v", result)
 	}
 }

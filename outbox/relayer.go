@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"math"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -24,6 +27,11 @@ type Relayer struct {
 	pollInterval time.Duration
 	batchSize    int
 	maxRetries   int
+	maxBackoff   time.Duration
+
+	// wakeEvent is an optional channel to wake the relayer on NOTIFY events.
+	// When a message is received, the relayer immediately checks for pending events.
+	wakeEvent <-chan struct{}
 
 	running bool
 	stopCh  chan struct{}
@@ -44,9 +52,16 @@ type RelayerConfig struct {
 	// MaxRetries is the maximum number of delivery attempts.
 	// Default: 5.
 	MaxRetries int
+	// MaxBackoff is the maximum backoff duration when no events are pending.
+	// Default: 30 seconds.
+	MaxBackoff time.Duration
 	// CustomSender is an optional custom event sender.
 	// If nil, the default CloudEvents HTTP sender is used.
 	CustomSender EventSender
+	// WakeEvent is an optional channel to wake the relayer on NOTIFY events.
+	// When provided, the relayer will immediately check for pending events
+	// when a message is received on this channel.
+	WakeEvent <-chan struct{}
 }
 
 // NewRelayer creates a new outbox relayer.
@@ -60,6 +75,9 @@ func NewRelayer(s storage.Storage, config RelayerConfig) *Relayer {
 	if config.MaxRetries == 0 {
 		config.MaxRetries = 5
 	}
+	if config.MaxBackoff == 0 {
+		config.MaxBackoff = 30 * time.Second
+	}
 
 	r := &Relayer{
 		storage:      s,
@@ -67,6 +85,8 @@ func NewRelayer(s storage.Storage, config RelayerConfig) *Relayer {
 		pollInterval: config.PollInterval,
 		batchSize:    config.BatchSize,
 		maxRetries:   config.MaxRetries,
+		maxBackoff:   config.MaxBackoff,
+		wakeEvent:    config.WakeEvent,
 		stopCh:       make(chan struct{}),
 	}
 
@@ -108,12 +128,11 @@ func (r *Relayer) Stop() {
 	r.wg.Wait()
 }
 
-// run is the main loop for the relayer.
+// run is the main loop for the relayer with adaptive backoff.
 func (r *Relayer) run(ctx context.Context) {
 	defer r.wg.Done()
 
-	ticker := time.NewTicker(r.pollInterval)
-	defer ticker.Stop()
+	consecutiveEmpty := 0
 
 	for {
 		select {
@@ -121,26 +140,79 @@ func (r *Relayer) run(ctx context.Context) {
 			return
 		case <-r.stopCh:
 			return
-		case <-ticker.C:
-			r.processPendingEvents(ctx)
+		default:
+		}
+
+		count, err := r.processPendingEvents(ctx)
+		if err != nil {
+			slog.Error("outbox relayer error", "error", err)
+			consecutiveEmpty = 0
+		} else if count == 0 {
+			consecutiveEmpty++
+		} else {
+			consecutiveEmpty = 0
+		}
+
+		// Calculate adaptive backoff
+		backoff := r.calculateBackoff(consecutiveEmpty)
+		jitter := time.Duration(rand.Float64() * float64(backoff) * 0.3)
+		waitTime := backoff + jitter
+
+		// Wait with optional NOTIFY wake
+		if r.wakeEvent != nil {
+			select {
+			case <-r.wakeEvent:
+				consecutiveEmpty = 0
+				slog.Debug("outbox relayer woken by NOTIFY")
+			case <-time.After(waitTime):
+			case <-r.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		} else {
+			select {
+			case <-time.After(waitTime):
+			case <-r.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
 
+// calculateBackoff computes exponential backoff with max cap.
+func (r *Relayer) calculateBackoff(consecutiveEmpty int) time.Duration {
+	if consecutiveEmpty == 0 {
+		return r.pollInterval
+	}
+	exp := min(consecutiveEmpty, 5) // Cap exponent to prevent overflow
+	backoff := time.Duration(float64(r.pollInterval) * math.Pow(2, float64(exp)))
+	if backoff > r.maxBackoff {
+		return r.maxBackoff
+	}
+	return backoff
+}
+
 // processPendingEvents processes a batch of pending events.
-func (r *Relayer) processPendingEvents(ctx context.Context) {
+// Returns the number of events processed and any error that occurred during fetch.
+func (r *Relayer) processPendingEvents(ctx context.Context) (int, error) {
 	events, err := r.storage.GetPendingOutboxEvents(ctx, r.batchSize)
 	if err != nil {
-		// Log error but continue
-		return
+		return 0, err
+	}
+
+	if len(events) == 0 {
+		return 0, nil
 	}
 
 	for _, event := range events {
 		select {
 		case <-ctx.Done():
-			return
+			return len(events), nil
 		case <-r.stopCh:
-			return
+			return len(events), nil
 		default:
 		}
 
@@ -162,6 +234,8 @@ func (r *Relayer) processPendingEvents(ctx context.Context) {
 		// Mark as sent
 		_ = r.storage.MarkOutboxEventSent(ctx, event.EventID)
 	}
+
+	return len(events), nil
 }
 
 // defaultSender sends events using CloudEvents HTTP client.
@@ -212,7 +286,7 @@ func (r *Relayer) CleanupOldEvents(ctx context.Context, olderThan time.Duration)
 }
 
 // RelayOnce processes pending events once (useful for testing).
-func (r *Relayer) RelayOnce(ctx context.Context) error {
-	r.processPendingEvents(ctx)
-	return nil
+// Returns the number of events processed and any error.
+func (r *Relayer) RelayOnce(ctx context.Context) (int, error) {
+	return r.processPendingEvents(ctx)
 }
