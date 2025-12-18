@@ -13,7 +13,6 @@ type Option func(*appConfig)
 type appConfig struct {
 	// Database
 	databaseURL string
-	autoMigrate bool
 
 	// Service identity
 	serviceName string
@@ -50,9 +49,13 @@ type appConfig struct {
 	maxTimersPerBatch    int
 	maxMessagesPerBatch  int
 
-	// Singleton task configuration
+	// Singleton task configuration (deprecated, use leader election)
 	singletonStaleLockCleanup bool
 	singletonChannelCleanup   bool
+
+	// Leader election configuration
+	leaderHeartbeatInterval time.Duration
+	leaderLeaseDuration     time.Duration
 
 	// Hooks
 	hooks hooks.WorkflowHooks
@@ -65,7 +68,6 @@ type appConfig struct {
 func defaultConfig() *appConfig {
 	return &appConfig{
 		databaseURL:                "file:romancy.db",
-		autoMigrate:                true,
 		serviceName:                "romancy-service",
 		outboxEnabled:              false,
 		outboxInterval:             1 * time.Second,
@@ -89,6 +91,8 @@ func defaultConfig() *appConfig {
 		maxMessagesPerBatch:        100,
 		singletonStaleLockCleanup:  true,
 		singletonChannelCleanup:    true,
+		leaderHeartbeatInterval:    15 * time.Second,
+		leaderLeaseDuration:        45 * time.Second,
 		shutdownTimeout:            30 * time.Second,
 		hooks:                      &hooks.NoOpHooks{},
 	}
@@ -104,12 +108,13 @@ func WithDatabase(url string) Option {
 	}
 }
 
-// WithAutoMigrate controls whether migrations run automatically on startup.
-// Default is true. Set to false if you want to manage migrations manually
-// using the CLI: `romancy migrate up --db <path>`
+// WithAutoMigrate is deprecated. Use dbmate for migrations instead:
+// dbmate -d schema/db/migrations/sqlite up
+// This option is now a no-op for backwards compatibility.
+// Deprecated: Use dbmate for migrations.
 func WithAutoMigrate(enabled bool) Option {
 	return func(c *appConfig) {
-		c.autoMigrate = enabled
+		// No-op: migrations are now handled by dbmate
 	}
 }
 
@@ -271,6 +276,7 @@ func WithMaxConcurrentMessages(n int) Option {
 // WithSingletonStaleLockCleanup sets whether stale lock cleanup runs as a singleton task.
 // When true, only one worker will run the cleanup at a time using system locks.
 // Default: true.
+// Deprecated: Leader election is now used for coordinating background tasks.
 func WithSingletonStaleLockCleanup(enabled bool) Option {
 	return func(c *appConfig) {
 		c.singletonStaleLockCleanup = enabled
@@ -280,9 +286,32 @@ func WithSingletonStaleLockCleanup(enabled bool) Option {
 // WithSingletonChannelCleanup sets whether channel cleanup runs as a singleton task.
 // When true, only one worker will run the cleanup at a time using system locks.
 // Default: true.
+// Deprecated: Leader election is now used for coordinating background tasks.
 func WithSingletonChannelCleanup(enabled bool) Option {
 	return func(c *appConfig) {
 		c.singletonChannelCleanup = enabled
+	}
+}
+
+// WithLeaderHeartbeatInterval sets the interval for leader election heartbeat.
+// The leader will renew its lease at this interval.
+// Default: 15 seconds.
+func WithLeaderHeartbeatInterval(d time.Duration) Option {
+	return func(c *appConfig) {
+		if d > 0 {
+			c.leaderHeartbeatInterval = d
+		}
+	}
+}
+
+// WithLeaderLeaseDuration sets the duration for which a leader holds its lease.
+// Should be at least 3x the heartbeat interval to allow for missed heartbeats.
+// Default: 45 seconds.
+func WithLeaderLeaseDuration(d time.Duration) Option {
+	return func(c *appConfig) {
+		if d > 0 {
+			c.leaderLeaseDuration = d
+		}
 	}
 }
 

@@ -14,7 +14,6 @@ func TestDefaultConfig(t *testing.T) {
 
 	// Database defaults
 	assert.Equal(t, "file:romancy.db", cfg.databaseURL)
-	assert.True(t, cfg.autoMigrate)
 
 	// Service identity defaults
 	assert.Equal(t, "romancy-service", cfg.serviceName)
@@ -94,27 +93,12 @@ func TestWithDatabase(t *testing.T) {
 }
 
 func TestWithAutoMigrate(t *testing.T) {
-	tests := []struct {
-		name    string
-		enabled bool
-	}{
-		{
-			name:    "enabled",
-			enabled: true,
-		},
-		{
-			name:    "disabled",
-			enabled: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := defaultConfig()
-			WithAutoMigrate(tt.enabled)(cfg)
-			assert.Equal(t, tt.enabled, cfg.autoMigrate)
-		})
-	}
+	// WithAutoMigrate is now deprecated and is a no-op
+	// This test just verifies that it doesn't panic
+	cfg := defaultConfig()
+	WithAutoMigrate(true)(cfg)
+	WithAutoMigrate(false)(cfg)
+	// No assertion needed - option is now a no-op for backwards compatibility
 }
 
 func TestWithServiceName(t *testing.T) {
@@ -850,7 +834,7 @@ func TestOptionChaining(t *testing.T) {
 			name: "full configuration",
 			options: []Option{
 				WithDatabase("mysql://localhost/db"),
-				WithAutoMigrate(false),
+				WithAutoMigrate(false), // deprecated, but kept for backwards compatibility
 				WithServiceName("test-service"),
 				WithWorkerID("worker-test"),
 				WithOutbox(true),
@@ -859,7 +843,7 @@ func TestOptionChaining(t *testing.T) {
 			},
 			check: func(t *testing.T, cfg *appConfig) {
 				assert.Equal(t, "mysql://localhost/db", cfg.databaseURL)
-				assert.False(t, cfg.autoMigrate)
+				// autoMigrate is now a no-op, so we don't test it
 				assert.Equal(t, "test-service", cfg.serviceName)
 				assert.Equal(t, "worker-test", cfg.workerID)
 				assert.True(t, cfg.outboxEnabled)

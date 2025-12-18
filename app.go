@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +64,17 @@ type App struct {
 	staleLockRunner      *coordination.SingletonTaskRunner
 	channelCleanupRunner *coordination.SingletonTaskRunner
 
+	// NOTIFY wake event channels for adaptive backoff
+	resumeWakeEvent chan struct{}
+	outboxWakeEvent chan struct{}
+
+	// Leader election state
+	isLeader           atomic.Bool
+	leaderCtx          context.Context
+	leaderCancel       context.CancelFunc
+	leaderTasksRunning bool
+	leaderMu           sync.Mutex
+
 	// State
 	initialized bool
 	running     bool
@@ -89,6 +102,8 @@ func NewApp(opts ...Option) *App {
 		resumptionSem:   semaphore.NewWeighted(int64(config.maxConcurrentResumptions)),
 		timerSem:        semaphore.NewWeighted(int64(config.maxConcurrentTimers)),
 		messageSem:      semaphore.NewWeighted(int64(config.maxConcurrentMessages)),
+		resumeWakeEvent: make(chan struct{}, 1),
+		outboxWakeEvent: make(chan struct{}, 1),
 	}
 }
 
@@ -226,13 +241,6 @@ func (a *App) initStorage() error {
 		a.storage = sqliteStorage
 	}
 
-	// Initialize storage (run migrations) if autoMigrate is enabled
-	if a.config.autoMigrate {
-		if err := a.storage.Initialize(a.ctx); err != nil {
-			return fmt.Errorf("failed to initialize storage: %w", err)
-		}
-	}
-
 	// Create the replay engine
 	a.engine = replay.NewEngine(a.storage, a.hooks, a.config.workerID)
 
@@ -287,6 +295,12 @@ func (a *App) handleWorkflowResumableNotify(ctx context.Context, channel notify.
 
 	slog.Debug("received workflow resumable notification", "instance_id", n.InstanceID)
 
+	// Signal wake channel for adaptive backoff reset
+	select {
+	case a.resumeWakeEvent <- struct{}{}:
+	default: // Non-blocking
+	}
+
 	// Trigger immediate workflow resumption
 	if err := a.resumptionSem.Acquire(ctx, 1); err != nil {
 		return
@@ -323,9 +337,13 @@ func (a *App) handleChannelMessageNotify(ctx context.Context, channel notify.Not
 
 // handleOutboxPendingNotify handles outbox pending notifications.
 func (a *App) handleOutboxPendingNotify(ctx context.Context, channel notify.NotifyChannel, payload string) {
-	// Outbox notifications are informational - the outbox relayer handles polling
-	// We could trigger immediate relay here if needed
 	slog.Debug("received outbox notification", "payload", payload)
+
+	// Signal wake channel for adaptive backoff reset
+	select {
+	case a.outboxWakeEvent <- struct{}{}:
+	default: // Non-blocking
+	}
 }
 
 // wakeWaitingChannelSubscribersForNotify triggers message delivery for waiting subscribers.
@@ -392,6 +410,27 @@ func addJitter(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * factor)
 }
 
+// calculateBackoff computes exponential backoff with max cap.
+// Used for adaptive polling when no work is available.
+func calculateBackoff(base time.Duration, consecutiveEmpty int, maxBackoff time.Duration) time.Duration {
+	if consecutiveEmpty == 0 {
+		return base
+	}
+	exp := min(consecutiveEmpty, 5) // Cap exponent to prevent overflow
+	backoff := time.Duration(float64(base) * math.Pow(2, float64(exp)))
+	if backoff > maxBackoff {
+		return maxBackoff
+	}
+	return backoff
+}
+
+// addJitterFraction adds random jitter as a fraction of the duration.
+// jitterFraction is the maximum fraction of d to add (e.g., 0.3 for ±30%).
+func addJitterFraction(d time.Duration, jitterFraction float64) time.Duration {
+	jitter := time.Duration(rand.Float64() * float64(d) * jitterFraction)
+	return d + jitter
+}
+
 // startBackgroundTasks starts all background goroutines.
 func (a *App) startBackgroundTasks() {
 	// Start PostgreSQL LISTEN/NOTIFY listener if configured
@@ -401,47 +440,150 @@ func (a *App) startBackgroundTasks() {
 		}
 	}
 
-	// Stale lock cleanup
+	// Leader election loop (all workers participate)
 	a.wg.Add(1)
-	go a.runStaleLockCleanup()
+	go a.runLeaderElection()
 
-	// Timer check
-	a.wg.Add(1)
-	go a.runTimerCheck()
-
-	// Event timeout check
-	a.wg.Add(1)
-	go a.runEventTimeoutCheck()
-
-	// Channel timeout check
-	a.wg.Add(1)
-	go a.runChannelTimeoutCheck()
-
-	// Recurred workflow check
-	a.wg.Add(1)
-	go a.runRecurCheck()
-
-	// Channel message cleanup
-	a.wg.Add(1)
-	go a.runChannelCleanup()
-
-	// Workflow resumption (for load balancing / fallback when LISTEN/NOTIFY unavailable)
+	// Workflow resumption (all workers - uses lock arbitration for distributed coordination)
 	a.wg.Add(1)
 	go a.runWorkflowResumption()
 
-	// Outbox relayer (if enabled)
+	// Outbox relayer (all workers - uses SKIP LOCKED for distributed coordination)
 	if a.config.outboxEnabled {
 		a.outboxRelayer = outbox.NewRelayer(a.storage, outbox.RelayerConfig{
 			TargetURL:    a.config.brokerURL,
 			PollInterval: a.config.outboxInterval,
 			BatchSize:    a.config.outboxBatchSize,
+			WakeEvent:    a.outboxWakeEvent,
 		})
 		a.outboxRelayer.Start(a.ctx)
 	}
+
+	// Note: Leader-only tasks (timer check, event timeout, channel timeout,
+	// recur check, stale lock cleanup, channel cleanup) are started dynamically
+	// when this worker becomes the leader via runLeaderElection().
+}
+
+// runLeaderElection periodically tries to become the leader.
+// Only the leader runs certain background tasks to reduce DB load.
+func (a *App) runLeaderElection() {
+	defer a.wg.Done()
+
+	// Try to acquire leadership immediately on startup
+	a.tryAcquireLeadership()
+
+	ticker := time.NewTicker(addJitter(a.config.leaderHeartbeatInterval))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			a.stopLeaderTasks()
+			return
+		case <-ticker.C:
+			a.tryAcquireLeadership()
+		}
+	}
+}
+
+// tryAcquireLeadership attempts to acquire or renew leadership.
+func (a *App) tryAcquireLeadership() {
+	if a.storage == nil {
+		return
+	}
+
+	wasLeader := a.isLeader.Load()
+
+	acquired, err := a.storage.TryAcquireSystemLock(
+		a.ctx,
+		"romancy_leader",
+		a.config.workerID,
+		int(a.config.leaderLeaseDuration.Seconds()),
+	)
+	if err != nil {
+		slog.Error("leader election error", "error", err)
+		return
+	}
+
+	if acquired && !wasLeader {
+		// Became leader - start leader-only tasks
+		slog.Info("became leader", "worker_id", a.config.workerID)
+		a.isLeader.Store(true)
+		a.startLeaderOnlyTasks()
+	} else if !acquired && wasLeader {
+		// Lost leadership - stop leader-only tasks
+		slog.Info("lost leadership", "worker_id", a.config.workerID)
+		a.isLeader.Store(false)
+		a.stopLeaderTasks()
+	}
+}
+
+// startLeaderOnlyTasks starts tasks that should only run on the leader.
+func (a *App) startLeaderOnlyTasks() {
+	a.leaderMu.Lock()
+	defer a.leaderMu.Unlock()
+
+	if a.leaderTasksRunning {
+		return
+	}
+
+	// Create a cancellable context for leader tasks
+	a.leaderCtx, a.leaderCancel = context.WithCancel(a.ctx)
+	a.leaderTasksRunning = true
+
+	// Timer check
+	a.wg.Add(1)
+	go a.runTimerCheckWithContext(a.leaderCtx)
+
+	// Event timeout check
+	a.wg.Add(1)
+	go a.runEventTimeoutCheckWithContext(a.leaderCtx)
+
+	// Channel timeout check
+	a.wg.Add(1)
+	go a.runChannelTimeoutCheckWithContext(a.leaderCtx)
+
+	// Recurred workflow check
+	a.wg.Add(1)
+	go a.runRecurCheckWithContext(a.leaderCtx)
+
+	// Stale lock cleanup
+	a.wg.Add(1)
+	go a.runStaleLockCleanupWithContext(a.leaderCtx)
+
+	// Channel message cleanup
+	a.wg.Add(1)
+	go a.runChannelCleanupWithContext(a.leaderCtx)
+
+	slog.Debug("started leader-only tasks")
+}
+
+// stopLeaderTasks stops all leader-only tasks.
+func (a *App) stopLeaderTasks() {
+	a.leaderMu.Lock()
+	defer a.leaderMu.Unlock()
+
+	if !a.leaderTasksRunning {
+		return
+	}
+
+	if a.leaderCancel != nil {
+		a.leaderCancel()
+		a.leaderCancel = nil
+	}
+	a.leaderTasksRunning = false
+
+	slog.Debug("stopped leader-only tasks")
 }
 
 // runStaleLockCleanup periodically cleans up stale locks.
+// Deprecated: Use runStaleLockCleanupWithContext instead.
 func (a *App) runStaleLockCleanup() {
+	a.runStaleLockCleanupWithContext(a.ctx)
+}
+
+// runStaleLockCleanupWithContext periodically cleans up stale locks with a cancellable context.
+func (a *App) runStaleLockCleanupWithContext(ctx context.Context) {
 	defer a.wg.Done()
 
 	ticker := time.NewTicker(addJitter(a.config.staleLockInterval))
@@ -449,20 +591,11 @@ func (a *App) runStaleLockCleanup() {
 
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var err error
-			if a.staleLockRunner != nil {
-				// Run as singleton task (only one worker runs at a time)
-				_, err = a.staleLockRunner.TryRun(a.ctx, func(ctx context.Context) error {
-					return a.cleanupStaleLocks()
-				})
-			} else {
-				// Run directly (all workers run)
-				err = a.cleanupStaleLocks()
-			}
-			if err != nil {
+			// Leader runs directly (no singleton runner needed when using leader election)
+			if err := a.cleanupStaleLocks(); err != nil {
 				slog.Error("error cleaning up stale locks", "error", err)
 			}
 		}
@@ -508,7 +641,13 @@ func (a *App) cleanupStaleLocks() error {
 }
 
 // runTimerCheck periodically checks for expired timers.
+// Deprecated: Use runTimerCheckWithContext instead.
 func (a *App) runTimerCheck() {
+	a.runTimerCheckWithContext(a.ctx)
+}
+
+// runTimerCheckWithContext periodically checks for expired timers with a cancellable context.
+func (a *App) runTimerCheckWithContext(ctx context.Context) {
 	defer a.wg.Done()
 
 	ticker := time.NewTicker(addJitter(a.config.timerCheckInterval))
@@ -516,7 +655,7 @@ func (a *App) runTimerCheck() {
 
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := a.checkExpiredTimers(); err != nil {
@@ -634,7 +773,13 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 }
 
 // runEventTimeoutCheck periodically checks for event timeouts.
+// Deprecated: Use runEventTimeoutCheckWithContext instead.
 func (a *App) runEventTimeoutCheck() {
+	a.runEventTimeoutCheckWithContext(a.ctx)
+}
+
+// runEventTimeoutCheckWithContext periodically checks for event timeouts with a cancellable context.
+func (a *App) runEventTimeoutCheckWithContext(ctx context.Context) {
 	defer a.wg.Done()
 
 	ticker := time.NewTicker(addJitter(a.config.eventTimeoutInterval))
@@ -642,7 +787,7 @@ func (a *App) runEventTimeoutCheck() {
 
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := a.checkEventTimeouts(); err != nil {
@@ -698,7 +843,7 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 	instance := &storage.WorkflowInstance{
 		InstanceID:   instanceID,
 		WorkflowName: workflowName,
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 		InputData:    inputData,
 		StartedAt:    now,
 		UpdatedAt:    now,
@@ -1358,7 +1503,13 @@ func (a *App) WorkerID() string {
 // ========================================
 
 // runChannelTimeoutCheck periodically checks for channel subscription timeouts.
+// Deprecated: Use runChannelTimeoutCheckWithContext instead.
 func (a *App) runChannelTimeoutCheck() {
+	a.runChannelTimeoutCheckWithContext(a.ctx)
+}
+
+// runChannelTimeoutCheckWithContext periodically checks for channel subscription timeouts with a cancellable context.
+func (a *App) runChannelTimeoutCheckWithContext(ctx context.Context) {
 	defer a.wg.Done()
 
 	ticker := time.NewTicker(addJitter(a.config.messageCheckInterval))
@@ -1366,7 +1517,7 @@ func (a *App) runChannelTimeoutCheck() {
 
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := a.checkChannelTimeouts(); err != nil {
@@ -1492,7 +1643,13 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 // ========================================
 
 // runRecurCheck periodically checks for recurred workflows that need to be restarted.
+// Deprecated: Use runRecurCheckWithContext instead.
 func (a *App) runRecurCheck() {
+	a.runRecurCheckWithContext(a.ctx)
+}
+
+// runRecurCheckWithContext periodically checks for recurred workflows with a cancellable context.
+func (a *App) runRecurCheckWithContext(ctx context.Context) {
 	defer a.wg.Done()
 
 	ticker := time.NewTicker(addJitter(a.config.recurCheckInterval))
@@ -1500,7 +1657,7 @@ func (a *App) runRecurCheck() {
 
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := a.checkRecurredWorkflows(); err != nil {
@@ -1587,34 +1744,62 @@ func (a *App) handleRecurredWorkflow(instance *storage.WorkflowInstance) error {
 // (e.g., after message delivery) and resumes them. This is essential for load
 // balancing in multi-worker environments - any worker can pick up and resume
 // the workflow, not just the one that delivered the message.
+//
+// Uses adaptive backoff to reduce DB load when no work is available.
 func (a *App) runWorkflowResumption() {
 	defer a.wg.Done()
 
-	ticker := time.NewTicker(addJitter(a.config.workflowResumptionInterval))
-	defer ticker.Stop()
+	consecutiveEmpty := 0
+	const maxBackoff = 60 * time.Second
 
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
-		case <-ticker.C:
-			if err := a.resumeResumableWorkflows(); err != nil {
-				slog.Error("error resuming workflows", "error", err)
-			}
+		default:
+		}
+
+		count, err := a.resumeResumableWorkflows()
+		if err != nil {
+			slog.Error("error resuming workflows", "error", err)
+			consecutiveEmpty = 0
+		} else if count == 0 {
+			consecutiveEmpty++
+		} else {
+			consecutiveEmpty = 0
+		}
+
+		// Calculate adaptive backoff
+		backoff := calculateBackoff(a.config.workflowResumptionInterval, consecutiveEmpty, maxBackoff)
+		waitTime := addJitterFraction(backoff, 0.3)
+
+		// Wait with optional NOTIFY wake
+		select {
+		case <-a.resumeWakeEvent:
+			consecutiveEmpty = 0
+			slog.Debug("workflow resumption woken by NOTIFY")
+		case <-time.After(waitTime):
+		case <-a.ctx.Done():
+			return
 		}
 	}
 }
 
 // resumeResumableWorkflows finds and resumes workflows that are ready.
-func (a *App) resumeResumableWorkflows() error {
+// Returns the number of workflows found and any error that occurred.
+func (a *App) resumeResumableWorkflows() (int, error) {
 	if a.storage == nil {
-		return nil
+		return 0, nil
 	}
 
 	// Find resumable workflows (status='running', no lock)
 	workflows, err := a.storage.FindResumableWorkflows(a.ctx, a.config.maxWorkflowsPerBatch)
 	if err != nil {
-		return fmt.Errorf("failed to find resumable workflows: %w", err)
+		return 0, fmt.Errorf("failed to find resumable workflows: %w", err)
+	}
+
+	if len(workflows) == 0 {
+		return 0, nil
 	}
 
 	var wg sync.WaitGroup
@@ -1641,7 +1826,7 @@ func (a *App) resumeResumableWorkflows() error {
 	}
 
 	wg.Wait()
-	return nil
+	return len(workflows), nil
 }
 
 // ========================================
@@ -1649,7 +1834,13 @@ func (a *App) resumeResumableWorkflows() error {
 // ========================================
 
 // runChannelCleanup periodically cleans up old channel messages.
+// Deprecated: Use runChannelCleanupWithContext instead.
 func (a *App) runChannelCleanup() {
+	a.runChannelCleanupWithContext(a.ctx)
+}
+
+// runChannelCleanupWithContext periodically cleans up old channel messages with a cancellable context.
+func (a *App) runChannelCleanupWithContext(ctx context.Context) {
 	defer a.wg.Done()
 
 	ticker := time.NewTicker(addJitter(a.config.channelCleanupInterval))
@@ -1657,20 +1848,11 @@ func (a *App) runChannelCleanup() {
 
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var err error
-			if a.channelCleanupRunner != nil {
-				// Run as singleton task (only one worker runs at a time)
-				_, err = a.channelCleanupRunner.TryRun(a.ctx, func(ctx context.Context) error {
-					return a.cleanupChannelMessages()
-				})
-			} else {
-				// Run directly (all workers run)
-				err = a.cleanupChannelMessages()
-			}
-			if err != nil {
+			// Leader runs directly (no singleton runner needed when using leader election)
+			if err := a.cleanupChannelMessages(); err != nil {
 				slog.Error("error cleaning up channel messages", "error", err)
 			}
 		}
