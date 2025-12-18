@@ -17,7 +17,7 @@ import (
 func setupTestStorage(t *testing.T) storage.Storage {
 	store, err := storage.NewSQLiteStorage(":memory:")
 	require.NoError(t, err)
-	require.NoError(t, store.Initialize(context.Background()))
+	require.NoError(t, storage.InitializeTestSchema(context.Background(), store))
 	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
@@ -500,7 +500,7 @@ func TestEngine_StartWorkflow(t *testing.T) {
 			instance := &storage.WorkflowInstance{
 				InstanceID:   "inst-" + tt.name,
 				WorkflowName: "test_workflow",
-				Status:       storage.StatusPending,
+				Status:       storage.StatusRunning,
 			}
 			require.NoError(t, store.CreateInstance(context.Background(), instance))
 
@@ -530,13 +530,13 @@ func TestEngine_StartWorkflow_TimerSuspend(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "inst-timer",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	require.NoError(t, store.CreateInstance(context.Background(), instance))
 
 	expiresAt := time.Now().Add(1 * time.Hour)
 	runner := func(execCtx *ExecutionContext) (any, error) {
-		return nil, NewTimerSuspend(execCtx.InstanceID(), "timer-1", expiresAt, 1)
+		return nil, NewTimerSuspend(execCtx.InstanceID(), "timer-1", "timer-1", expiresAt)
 	}
 
 	err := engine.StartWorkflow(context.Background(), instance.InstanceID, "test_workflow", nil, runner)
@@ -554,7 +554,7 @@ func TestEngine_StartWorkflow_RecurSuspend(t *testing.T) {
 	instance := &storage.WorkflowInstance{
 		InstanceID:   "inst-recur",
 		WorkflowName: "test_workflow",
-		Status:       storage.StatusPending,
+		Status:       storage.StatusRunning,
 	}
 	require.NoError(t, store.CreateInstance(context.Background(), instance))
 

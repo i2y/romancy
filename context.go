@@ -69,6 +69,9 @@ type WorkflowContext struct {
 
 	// Reference to the App for accessing app-level configuration
 	app *App
+
+	// Direct subscriptions: channel name → true (for ModeDirect syntactic sugar)
+	directSubscriptions map[string]bool
 }
 
 // NewWorkflowContext creates a new WorkflowContext.
@@ -113,15 +116,16 @@ func (c *WorkflowContext) Context() context.Context {
 // This is useful for passing transaction contexts to storage operations.
 func (c *WorkflowContext) WithContext(ctx context.Context) *WorkflowContext {
 	return &WorkflowContext{
-		ctx:            ctx,
-		cancel:         c.cancel,
-		instanceID:     c.instanceID,
-		workerID:       c.workerID,
-		workflowName:   c.workflowName,
-		isReplaying:    c.isReplaying,
-		historyCache:   c.historyCache,
-		activityCounts: c.activityCounts,
-		execCtx:        c.execCtx,
+		ctx:                 ctx,
+		cancel:              c.cancel,
+		instanceID:          c.instanceID,
+		workerID:            c.workerID,
+		workflowName:        c.workflowName,
+		isReplaying:         c.isReplaying,
+		historyCache:        c.historyCache,
+		activityCounts:      c.activityCounts,
+		execCtx:             c.execCtx,
+		directSubscriptions: c.directSubscriptions,
 	}
 }
 
@@ -304,4 +308,25 @@ func (c *WorkflowContext) SetApp(app *App) {
 // Returns nil if not set.
 func (c *WorkflowContext) App() *App {
 	return c.app
+}
+
+// recordDirectSubscription records that a channel was subscribed in ModeDirect.
+// This is used by Receive to automatically use the correct channel name.
+func (c *WorkflowContext) recordDirectSubscription(channelName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.directSubscriptions == nil {
+		c.directSubscriptions = make(map[string]bool)
+	}
+	c.directSubscriptions[channelName] = true
+}
+
+// isDirectSubscription returns true if the channel was subscribed in ModeDirect.
+func (c *WorkflowContext) isDirectSubscription(channelName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.directSubscriptions == nil {
+		return false
+	}
+	return c.directSubscriptions[channelName]
 }

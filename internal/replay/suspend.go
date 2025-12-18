@@ -56,12 +56,11 @@ type SuspendSignal struct {
 	// For SuspendForTimer
 	TimerID   string
 	ExpiresAt time.Time
-	Step      int // Activity step for replay (optional)
 
-	// For SuspendForChannelMessage (channel/event waiting)
+	// For SuspendForChannelMessage (channel/event waiting) or Timer
 	Channel    string         // Channel or event type name
 	Timeout    *time.Duration // Optional timeout
-	ActivityID string         // Activity ID for replay matching
+	ActivityID string         // Activity ID for replay matching (used for both channel and timer)
 
 	// For SuspendForRecur
 	NewInput any // New input for the next iteration
@@ -100,13 +99,13 @@ func AsSuspendSignal(err error) *SuspendSignal {
 }
 
 // NewTimerSuspend creates a SuspendSignal for timer waiting.
-func NewTimerSuspend(instanceID, timerID string, expiresAt time.Time, step int) *SuspendSignal {
+func NewTimerSuspend(instanceID, timerID, activityID string, expiresAt time.Time) *SuspendSignal {
 	return &SuspendSignal{
 		Type:       SuspendForTimer,
 		InstanceID: instanceID,
 		TimerID:    timerID,
 		ExpiresAt:  expiresAt,
-		Step:       step,
+		ActivityID: activityID,
 	}
 }
 

@@ -24,6 +24,19 @@ const (
 	// ModeCompeting delivers each message to exactly one subscriber.
 	// Multiple subscribers compete for messages (work queue pattern).
 	ModeCompeting ChannelMode = storage.ChannelModeCompeting
+
+	// ModeDirect receives messages sent via SendTo to this workflow instance.
+	// This is syntactic sugar that subscribes to "channel:instanceID" internally.
+	// Use with SendTo for point-to-point messaging.
+	//
+	// Example:
+	//   // Receiver workflow
+	//   romancy.Subscribe(ctx, "requests", romancy.ModeDirect)
+	//   msg, err := romancy.Receive[Request](ctx, "requests")
+	//
+	//   // Sender workflow
+	//   romancy.SendTo(ctx, targetInstanceID, "requests", request)
+	ModeDirect ChannelMode = storage.ChannelModeDirect
 )
 
 // ReceivedMessage represents a message received from a channel.
@@ -51,15 +64,31 @@ type ReceivedMessage[T any] struct {
 // The mode determines how messages are delivered:
 // - ModeBroadcast: All subscribers receive every message
 // - ModeCompeting: Each message goes to exactly one subscriber
+// - ModeDirect: Receives messages sent via SendTo to this instance
 //
 // Subscriptions persist across workflow restarts and are automatically
 // cleaned up when the workflow completes.
 func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error {
+	// Handle ModeDirect: convert to actual channel name and record for Receive
+	actualChannel := channelName
+	actualMode := mode
+	if mode == ModeDirect {
+		// ModeDirect subscribes to "channel:instanceID"
+		actualChannel = fmt.Sprintf("%s:%s", channelName, ctx.InstanceID())
+		actualMode = ModeBroadcast // Direct channels use broadcast internally
+		// Record so Receive knows to use the direct channel
+		ctx.recordDirectSubscription(channelName)
+	}
+
 	// Generate activity ID for deterministic replay
 	activityID := ctx.GenerateActivityID(fmt.Sprintf("subscribe_%s", channelName))
 
 	// Check if already subscribed (replay)
 	if _, ok := ctx.GetCachedResult(activityID); ok {
+		// Still need to record direct subscription on replay
+		if mode == ModeDirect {
+			ctx.recordDirectSubscription(channelName)
+		}
 		return nil
 	}
 
@@ -69,7 +98,7 @@ func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error
 		return fmt.Errorf("storage not available")
 	}
 
-	if err := s.SubscribeToChannel(ctx.Context(), ctx.InstanceID(), channelName, mode); err != nil {
+	if err := s.SubscribeToChannel(ctx.Context(), ctx.InstanceID(), actualChannel, actualMode); err != nil {
 		return fmt.Errorf("failed to subscribe to channel: %w", err)
 	}
 
@@ -126,15 +155,24 @@ func WithReceiveTimeout(d time.Duration) ReceiveOption {
 // a message is available or the optional timeout expires.
 //
 // During replay, if the message was already received, this returns immediately.
+//
+// For channels subscribed with ModeDirect, this automatically receives from
+// the direct channel (channel:instanceID) without needing to specify it.
 func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOption) (*ReceivedMessage[T], error) {
 	options := &receiveOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
 
+	// Check if this channel was subscribed with ModeDirect
+	actualChannel := channelName
+	if ctx.isDirectSubscription(channelName) {
+		actualChannel = fmt.Sprintf("%s:%s", channelName, ctx.InstanceID())
+	}
+
 	startTime := time.Now()
 
-	// Generate activity ID for this receive
+	// Generate activity ID for this receive (use original channelName for consistency)
 	activityID := ctx.GenerateActivityID(fmt.Sprintf("receive_%s", channelName))
 
 	// Check if result is cached (replay)
@@ -171,13 +209,13 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 		return nil, fmt.Errorf("storage not available")
 	}
 
-	sub, err := s.GetChannelSubscription(ctx.Context(), ctx.InstanceID(), channelName)
+	sub, err := s.GetChannelSubscription(ctx.Context(), ctx.InstanceID(), actualChannel)
 	if err != nil || sub == nil {
 		return nil, ErrChannelNotSubscribed
 	}
 
 	// Check for pending messages before suspending (Edda-style)
-	pendingMessages, err := s.GetPendingChannelMessagesForInstance(ctx.Context(), ctx.InstanceID(), channelName)
+	pendingMessages, err := s.GetPendingChannelMessagesForInstance(ctx.Context(), ctx.InstanceID(), actualChannel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check pending messages: %w", err)
 	}
@@ -200,7 +238,7 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 
 		// Update cursor for broadcast mode
 		if sub.Mode == storage.ChannelModeBroadcast {
-			if err := s.UpdateDeliveryCursor(ctx.Context(), ctx.InstanceID(), channelName, msg.ID); err != nil {
+			if err := s.UpdateDeliveryCursor(ctx.Context(), ctx.InstanceID(), actualChannel, msg.ID); err != nil {
 				return nil, fmt.Errorf("failed to update cursor: %w", err)
 			}
 		}
@@ -253,7 +291,8 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 
 	// Return SuspendSignal that the replay engine will handle
 	// Include the activityID so it can be used when recording history on message delivery
-	return nil, NewChannelMessageSuspend(ctx.InstanceID(), channelName, activityID, options.timeout)
+	// Use actualChannel so it wakes up on the correct channel (including direct channels)
+	return nil, NewChannelMessageSuspend(ctx.InstanceID(), actualChannel, activityID, options.timeout)
 }
 
 // Publish sends a message to all subscribers of a channel.

@@ -1,36 +1,41 @@
 // Package main demonstrates channel-based message passing between workflows.
 //
-// This example shows:
-// - Subscribe/Receive for receiving messages
-// - Publish for broadcasting messages
-// - SendTo for direct messaging to specific workflow instances
-// - ModeBroadcast vs ModeCompeting delivery modes
+// This example shows three delivery modes:
+// - Broadcast mode: All consumers receive all messages (fan-out)
+// - Competing mode: Each message is delivered to exactly one consumer (load balancing)
+// - Direct mode: SendTo delivers messages to a specific workflow instance
 //
 // Usage:
 //
 //	go run ./examples/channel/
 //
-// Then in separate terminals:
+// API Endpoints:
 //
-//  1. Start a consumer (broadcast mode):
+//  1. Start a broadcast consumer (all receive all messages):
 //     curl -X POST http://localhost:8084/start-consumer \
 //     -H "Content-Type: application/json" \
-//     -d '{"consumer_id": "consumer-1", "mode": "broadcast"}'
+//     -d '{"consumer_id": "alice", "mode": "broadcast"}'
 //
-//  2. Start another consumer:
+//  2. Start a competing consumer (each message goes to one):
 //     curl -X POST http://localhost:8084/start-consumer \
 //     -H "Content-Type: application/json" \
-//     -d '{"consumer_id": "consumer-2", "mode": "broadcast"}'
+//     -d '{"consumer_id": "worker-1", "mode": "competing"}'
 //
-//  3. Send a message to all consumers:
+//  3. Start a direct message receiver (for SendTo):
+//     curl -X POST http://localhost:8084/start-consumer \
+//     -H "Content-Type: application/json" \
+//     -d '{"consumer_id": "bob", "mode": "direct"}'
+//     # Note the instance_id in the response for SendTo
+//
+//  4. Publish a message (broadcast/competing consumers receive it):
 //     curl -X POST http://localhost:8084/publish \
 //     -H "Content-Type: application/json" \
-//     -d '{"channel": "notifications", "message": "Hello everyone!"}'
+//     -d '{"channel": "notifications", "message": "Hello everyone!", "from": "system"}'
 //
-//  4. Send a direct message to a specific consumer:
+//  5. Send a direct message to a specific instance:
 //     curl -X POST http://localhost:8084/send-to \
 //     -H "Content-Type: application/json" \
-//     -d '{"instance_id": "<workflow-instance-id>", "channel": "notifications", "message": "Private message"}'
+//     -d '{"instance_id": "<instance-id-from-step-3>", "channel": "notifications", "message": "Private message"}'
 package main
 
 import (
@@ -59,7 +64,7 @@ import (
 // ConsumerInput is the input for the consumer workflow.
 type ConsumerInput struct {
 	ConsumerID string `json:"consumer_id"`
-	Mode       string `json:"mode"` // "broadcast" or "competing"
+	Mode       string `json:"mode"` // "broadcast", "competing", or "direct"
 }
 
 // ConsumerResult is the output of the consumer workflow.
@@ -90,12 +95,29 @@ type ChatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// SendToInput is the input for the send-to workflow.
+type SendToInput struct {
+	TargetInstanceID string `json:"target_instance_id"`
+	Channel          string `json:"channel"`
+	Message          string `json:"message"`
+	From             string `json:"from"`
+}
+
+// SendToResult is the output of the send-to workflow.
+type SendToResult struct {
+	Status string `json:"status"`
+}
+
 // ----- Workflows -----
 
 // consumerWorkflow subscribes to a channel and receives messages.
+// Supports three modes:
+// - "broadcast": All consumers receive all messages (fan-out)
+// - "competing": Each message goes to exactly one consumer (load balancing)
+// - "direct": Receives SendTo messages sent to this specific instance
 var consumerWorkflow = romancy.DefineWorkflow("channel_consumer",
 	func(ctx *romancy.WorkflowContext, input ConsumerInput) (ConsumerResult, error) {
-		log.Printf("[Consumer %s] Starting consumer workflow", input.ConsumerID)
+		log.Printf("[Consumer %s] Starting consumer workflow (mode: %s)", input.ConsumerID, input.Mode)
 
 		result := ConsumerResult{
 			ConsumerID:       input.ConsumerID,
@@ -103,51 +125,79 @@ var consumerWorkflow = romancy.DefineWorkflow("channel_consumer",
 			Status:           "running",
 		}
 
-		// Determine channel mode
-		mode := romancy.ModeBroadcast
-		if input.Mode == "competing" {
-			mode = romancy.ModeCompeting
+		// Determine channel name and subscription mode based on input.Mode
+		var channelName string
+		var subscriptionMode romancy.ChannelMode
+
+		switch input.Mode {
+		case "competing":
+			// Competing mode: subscribe to shared channel, each message goes to one consumer
+			channelName = "notifications"
+			subscriptionMode = romancy.ModeCompeting
+			log.Printf("[Consumer %s] Subscribing to channel '%s' in COMPETING mode", input.ConsumerID, channelName)
+
+		case "direct":
+			// Direct mode: use ModeDirect to receive SendTo messages
+			// ModeDirect automatically subscribes to "notifications:instanceID"
+			channelName = "notifications"
+			subscriptionMode = romancy.ModeDirect
+			log.Printf("[Consumer %s] Subscribing to channel '%s' in DIRECT mode", input.ConsumerID, channelName)
+			log.Printf("[Consumer %s] Instance ID for SendTo: %s", input.ConsumerID, ctx.InstanceID())
+
+		default: // "broadcast" or empty
+			// Broadcast mode: all consumers receive all messages
+			channelName = "notifications"
+			subscriptionMode = romancy.ModeBroadcast
+			log.Printf("[Consumer %s] Subscribing to channel '%s' in BROADCAST mode", input.ConsumerID, channelName)
 		}
 
-		// Subscribe to the notifications channel
-		channelName := "notifications"
-		log.Printf("[Consumer %s] Subscribing to channel '%s' in %s mode", input.ConsumerID, channelName, input.Mode)
-		if err := romancy.Subscribe(ctx, channelName, mode); err != nil {
+		// Subscribe to the channel
+		if err := romancy.Subscribe(ctx, channelName, subscriptionMode); err != nil {
 			result.Status = "subscription_failed"
 			return result, fmt.Errorf("failed to subscribe: %w", err)
 		}
 
-		log.Printf("[Consumer %s] Subscribed! Draining all pending messages...", input.ConsumerID)
-		log.Printf("[Consumer %s] Instance ID: %s", input.ConsumerID, ctx.InstanceID())
+		log.Printf("[Consumer %s] Subscribed! Waiting for messages...", input.ConsumerID)
 
-		// Drain all pending messages with a short timeout (2 seconds)
-		// This will consume all existing messages until the channel is empty
-		for {
-			log.Printf("[Consumer %s] Waiting for message (count: %d)...", input.ConsumerID, len(result.MessagesReceived))
+		// Receive messages with timeout
+		// Uses short timeout to drain pending messages, then exits
+		emptyCount := 0
+		maxEmptyCount := 1 // Exit after 1 timeout (no pending messages)
 
-			// Wait for a message with 2-second timeout to detect empty channel
+		for emptyCount < maxEmptyCount {
+			log.Printf("[Consumer %s] Waiting for message (received: %d)...", input.ConsumerID, len(result.MessagesReceived))
+
 			msg, err := romancy.Receive[ChatMessage](ctx, channelName, romancy.WithReceiveTimeout(2*time.Second))
-			if err != nil {
-				// Check if this is a suspend signal (normal workflow pause)
-				if romancy.IsSuspendSignal(err) {
-					return result, err
+			if err == nil {
+				prefix := ""
+				if input.Mode == "direct" {
+					prefix = "[DIRECT] "
 				}
-				// Check for timeout error - channel is empty
-				var timeoutErr *romancy.ChannelMessageTimeoutError
-				if errors.As(err, &timeoutErr) {
-					log.Printf("[Consumer %s] Channel empty (timeout), finished draining", input.ConsumerID)
-					result.Status = "drained"
-					break
-				}
-				result.Status = "receive_failed"
-				return result, fmt.Errorf("failed to receive message: %w", err)
+				log.Printf("[Consumer %s] %sReceived message from %s: %s", input.ConsumerID, prefix, msg.Data.From, msg.Data.Content)
+				result.MessagesReceived = append(result.MessagesReceived, fmt.Sprintf("%s%s: %s", prefix, msg.Data.From, msg.Data.Content))
+				emptyCount = 0
+				continue
 			}
 
-			log.Printf("[Consumer %s] Received message from %s: %s", input.ConsumerID, msg.Data.From, msg.Data.Content)
-			result.MessagesReceived = append(result.MessagesReceived, fmt.Sprintf("%s: %s", msg.Data.From, msg.Data.Content))
+			// Check for suspend signal (workflow needs to pause)
+			if romancy.IsSuspendSignal(err) {
+				return result, err
+			}
+
+			// Check for timeout
+			var timeoutErr *romancy.ChannelMessageTimeoutError
+			if errors.As(err, &timeoutErr) {
+				emptyCount++
+				continue
+			}
+
+			// Other error
+			result.Status = "receive_failed"
+			return result, fmt.Errorf("failed to receive message: %w", err)
 		}
 
-		log.Printf("[Consumer %s] Finished draining %d messages", input.ConsumerID, len(result.MessagesReceived))
+		log.Printf("[Consumer %s] No more pending messages, finished with %d messages", input.ConsumerID, len(result.MessagesReceived))
+		result.Status = "drained"
 		return result, nil
 	},
 )
@@ -194,6 +244,26 @@ var producerWorkflow = romancy.DefineWorkflow("channel_producer",
 		result.Status = "completed"
 		log.Printf("[Producer %s] Finished sending %d messages", input.ProducerID, result.MessagesSent)
 		return result, nil
+	},
+)
+
+// sendToWorkflow sends a direct message to a specific workflow instance.
+var sendToWorkflow = romancy.DefineWorkflow("channel_send_to",
+	func(ctx *romancy.WorkflowContext, input SendToInput) (SendToResult, error) {
+		log.Printf("[SendTo] Sending direct message to %s on channel '%s'", input.TargetInstanceID, input.Channel)
+
+		msg := ChatMessage{
+			From:      input.From,
+			Content:   input.Message,
+			Timestamp: time.Now(),
+		}
+
+		if err := romancy.SendTo(ctx, input.TargetInstanceID, input.Channel, msg); err != nil {
+			return SendToResult{Status: "failed"}, fmt.Errorf("failed to send: %w", err)
+		}
+
+		log.Printf("[SendTo] Message sent successfully to %s", input.TargetInstanceID)
+		return SendToResult{Status: "sent"}, nil
 	},
 )
 
@@ -353,6 +423,59 @@ func PublishHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// SendToHandler sends a direct message to a specific workflow instance.
+func SendToHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		InstanceID string `json:"instance_id"`
+		Channel    string `json:"channel"`
+		Message    string `json:"message"`
+		From       string `json:"from"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.InstanceID == "" {
+		http.Error(w, "instance_id is required", http.StatusBadRequest)
+		return
+	}
+	if req.Channel == "" {
+		req.Channel = "notifications"
+	}
+	if req.From == "" {
+		req.From = "http-client"
+	}
+
+	input := SendToInput{
+		TargetInstanceID: req.InstanceID,
+		Channel:          req.Channel,
+		Message:          req.Message,
+		From:             req.From,
+	}
+
+	_, err := romancy.StartWorkflow(r.Context(), app, sendToWorkflow, input)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to send: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HTTP] Sent direct message to instance '%s' on channel '%s': %s", req.InstanceID, req.Channel, req.Message)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":      "sent",
+		"instance_id": req.InstanceID,
+		"channel":     req.Channel,
+		"message":     req.Message,
+	})
+}
+
 // ----- Main -----
 
 func main() {
@@ -390,6 +513,7 @@ func main() {
 	// Register workflows
 	romancy.RegisterWorkflow[ConsumerInput, ConsumerResult](app, consumerWorkflow)
 	romancy.RegisterWorkflow[ProducerInput, ProducerResult](app, producerWorkflow)
+	romancy.RegisterWorkflow[SendToInput, SendToResult](app, sendToWorkflow)
 
 	// Start the application
 	if err := app.Start(ctx); err != nil {
@@ -402,29 +526,31 @@ func main() {
 	log.Printf("Database: %s", dbURL)
 	log.Println("==============================================")
 	log.Println("")
-	log.Println("This example demonstrates channel-based message passing.")
+	log.Println("This example demonstrates three channel delivery modes:")
+	log.Println("- BROADCAST: All consumers receive all messages")
+	log.Println("- COMPETING: Each message goes to exactly one consumer")
+	log.Println("- DIRECT: SendTo delivers to a specific instance")
 	log.Println("")
-	log.Println("API Endpoints:")
+	log.Println("=== BROADCAST MODE ===")
+	log.Println("Start two broadcast consumers:")
+	fmt.Println(`curl -X POST http://localhost:8084/start-consumer -H "Content-Type: application/json" -d '{"consumer_id": "alice", "mode": "broadcast"}'`)
+	fmt.Println(`curl -X POST http://localhost:8084/start-consumer -H "Content-Type: application/json" -d '{"consumer_id": "bob", "mode": "broadcast"}'`)
+	log.Println("Publish a message (both alice and bob receive it):")
+	fmt.Println(`curl -X POST http://localhost:8084/publish -H "Content-Type: application/json" -d '{"channel": "notifications", "message": "Hello everyone!", "from": "system"}'`)
 	log.Println("")
-	log.Println("1. Start a consumer (subscribes to channel):")
-	fmt.Println(`curl -X POST http://localhost:8084/start-consumer \`)
-	fmt.Println(`     -H "Content-Type: application/json" \`)
-	fmt.Println(`     -d '{"consumer_id": "alice", "mode": "broadcast"}'`)
+	log.Println("=== COMPETING MODE ===")
+	log.Println("Start three competing consumers:")
+	fmt.Println(`curl -X POST http://localhost:8084/start-consumer -H "Content-Type: application/json" -d '{"consumer_id": "w1", "mode": "competing"}'`)
+	fmt.Println(`curl -X POST http://localhost:8084/start-consumer -H "Content-Type: application/json" -d '{"consumer_id": "w2", "mode": "competing"}'`)
+	fmt.Println(`curl -X POST http://localhost:8084/start-consumer -H "Content-Type: application/json" -d '{"consumer_id": "w3", "mode": "competing"}'`)
+	log.Println("Publish 3 messages (each worker receives exactly one):")
+	fmt.Println(`curl -X POST http://localhost:8084/start-producer -H "Content-Type: application/json" -d '{"producer_id": "bot", "messages": ["Task-1", "Task-2", "Task-3"], "channel": "notifications"}'`)
 	log.Println("")
-	log.Println("2. Start another consumer:")
-	fmt.Println(`curl -X POST http://localhost:8084/start-consumer \`)
-	fmt.Println(`     -H "Content-Type: application/json" \`)
-	fmt.Println(`     -d '{"consumer_id": "bob", "mode": "broadcast"}'`)
-	log.Println("")
-	log.Println("3. Publish a message (all consumers receive it):")
-	fmt.Println(`curl -X POST http://localhost:8084/publish \`)
-	fmt.Println(`     -H "Content-Type: application/json" \`)
-	fmt.Println(`     -d '{"channel": "notifications", "message": "Hello everyone!", "from": "system"}'`)
-	log.Println("")
-	log.Println("4. Start a producer (sends multiple messages):")
-	fmt.Println(`curl -X POST http://localhost:8084/start-producer \`)
-	fmt.Println(`     -H "Content-Type: application/json" \`)
-	fmt.Println(`     -d '{"producer_id": "bot", "messages": ["msg1", "msg2", "exit"], "channel": "notifications"}'`)
+	log.Println("=== DIRECT MODE (SendTo) ===")
+	log.Println("Start a direct message receiver (note the instance_id in response):")
+	fmt.Println(`curl -X POST http://localhost:8084/start-consumer -H "Content-Type: application/json" -d '{"consumer_id": "bob", "mode": "direct"}'`)
+	log.Println("Send a direct message to that instance:")
+	fmt.Println(`curl -X POST http://localhost:8084/send-to -H "Content-Type: application/json" -d '{"instance_id": "<INSTANCE_ID>", "channel": "notifications", "message": "Secret message for Bob", "from": "alice"}'`)
 	log.Println("")
 	log.Println("==============================================")
 
@@ -433,6 +559,7 @@ func main() {
 	mux.HandleFunc("/start-consumer", StartConsumerHandler)
 	mux.HandleFunc("/start-producer", StartProducerHandler)
 	mux.HandleFunc("/publish", PublishHandler)
+	mux.HandleFunc("/send-to", SendToHandler)
 	// Also mount the romancy handler for CloudEvents
 	mux.Handle("/", app.Handler())
 

@@ -180,7 +180,7 @@ func Sleep(ctx *WorkflowContext, duration time.Duration, opts ...SleepOption) er
 	ctx.RecordActivityID(timerID)
 
 	// Return SuspendSignal that the replay engine will handle
-	return NewTimerSuspend(ctx.InstanceID(), timerID, expiresAt, 0)
+	return NewTimerSuspend(ctx.InstanceID(), timerID, timerID, expiresAt)
 }
 
 // SleepOption configures sleep behavior.

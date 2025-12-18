@@ -3,7 +3,6 @@ package romancy
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 	"time"
 
@@ -27,19 +26,9 @@ type OrderResult struct {
 
 // TestWorkflowWithWaitEvent tests a workflow that waits for an event.
 func TestWorkflowWithWaitEvent(t *testing.T) {
-	// Create a temporary database
-	tmpFile, err := os.CreateTemp("", "romancy-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_ = tmpFile.Close()
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	// Create app with short workflow resumption interval for faster test
-	app := NewApp(
-		WithDatabase(tmpFile.Name()),
-		WithWorkflowResumptionInterval(100*time.Millisecond),
-	)
+	// Create app with pre-initialized test database
+	app, cleanup := createTestApp(t, WithWorkflowResumptionInterval(100*time.Millisecond))
+	defer cleanup()
 
 	// Define a workflow that waits for an event
 	orderWorkflow := DefineWorkflow[string, OrderResult](
@@ -133,20 +122,12 @@ func TestWorkflowWithWaitEvent(t *testing.T) {
 
 // TestWorkflowWithEventTimeout tests event timeout handling.
 func TestWorkflowWithEventTimeout(t *testing.T) {
-	// Create a temporary database
-	tmpFile, err := os.CreateTemp("", "romancy-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_ = tmpFile.Close()
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	// Create app with short timeout check interval and fast resumption
-	app := NewApp(
-		WithDatabase(tmpFile.Name()),
+	// Create app with pre-initialized test database
+	app, cleanup := createTestApp(t,
 		WithEventTimeoutInterval(100*time.Millisecond),
 		WithWorkflowResumptionInterval(100*time.Millisecond),
 	)
+	defer cleanup()
 
 	// Define a workflow that waits for an event with a short timeout
 	timeoutWorkflow := DefineWorkflow[string, string](
@@ -196,19 +177,9 @@ func TestWorkflowWithEventTimeout(t *testing.T) {
 
 // TestWorkflowWithSleep tests sleep functionality.
 func TestWorkflowWithSleep(t *testing.T) {
-	// Create a temporary database
-	tmpFile, err := os.CreateTemp("", "romancy-test-*.db")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_ = tmpFile.Close()
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	// Create app with short timer check interval
-	app := NewApp(
-		WithDatabase(tmpFile.Name()),
-		WithTimerCheckInterval(100*time.Millisecond),
-	)
+	// Create app with pre-initialized test database
+	app, cleanup := createTestApp(t, WithTimerCheckInterval(100*time.Millisecond))
+	defer cleanup()
 
 	// Define a workflow with a sleep
 	sleepWorkflow := DefineWorkflow[string, string](

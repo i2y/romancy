@@ -390,7 +390,7 @@ func (e *Engine) handleTimerSuspend(ctx context.Context, instanceID string, sig 
 		InstanceID: instanceID,
 		TimerID:    sig.TimerID,
 		ExpiresAt:  sig.ExpiresAt,
-		Step:       sig.Step,
+		ActivityID: sig.ActivityID,
 	}
 
 	if err := e.storage.RegisterTimerSubscription(ctx, timer); err != nil {
