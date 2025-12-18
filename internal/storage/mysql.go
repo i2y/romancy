@@ -350,7 +350,7 @@ func (s *MySQLStorage) CancelInstance(ctx context.Context, instanceID, reason st
 // ListInstances lists workflow instances with cursor-based pagination and filters.
 func (s *MySQLStorage) ListInstances(ctx context.Context, opts ListInstancesOptions) (*PaginationResult, error) {
 	conn := s.getConn(ctx)
-	query := "SELECT instance_id, workflow_name, status, started_at, updated_at FROM workflow_instances WHERE 1=1"
+	query := "SELECT instance_id, workflow_name, status, started_at, updated_at FROM workflow_instances WHERE framework = 'go'"
 	args := []any{}
 
 	// Handle both new and deprecated filter options
@@ -558,6 +558,7 @@ func (s *MySQLStorage) CleanupStaleLocks(ctx context.Context, timeoutSec int) ([
 		WHERE locked_by IS NOT NULL
 		AND lock_expires_at < NOW()
 		AND status IN ('running', 'waiting_for_event', 'waiting_for_timer')
+		AND framework = 'go'
 		LIMIT 100
 	`)
 	if err != nil {
@@ -574,11 +575,11 @@ func (s *MySQLStorage) CleanupStaleLocks(ctx context.Context, timeoutSec int) ([
 		stale = append(stale, info)
 	}
 
-	// Clear stale locks
+	// Clear stale locks (only for 'go' framework)
 	_, err = conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
-		WHERE locked_by IS NOT NULL AND lock_expires_at < NOW()
+		WHERE locked_by IS NOT NULL AND lock_expires_at < NOW() AND framework = 'go'
 	`)
 	if err != nil {
 		return nil, err
@@ -743,10 +744,11 @@ func (s *MySQLStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Tim
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, timer_id, expires_at, activity_id, created_at
-		FROM workflow_timer_subscriptions
-		WHERE expires_at <= NOW()
-		ORDER BY expires_at ASC
+		SELECT t.id, t.instance_id, t.timer_id, t.expires_at, t.activity_id, t.created_at
+		FROM workflow_timer_subscriptions t
+		JOIN workflow_instances w ON t.instance_id = w.instance_id
+		WHERE t.expires_at <= NOW() AND w.framework = 'go'
+		ORDER BY t.expires_at ASC
 		LIMIT ?
 	`, limit)
 	if err != nil {
@@ -1386,10 +1388,12 @@ func (s *MySQLStorage) FindExpiredChannelSubscriptions(ctx context.Context, limi
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, channel, mode, timeout_at, COALESCE(activity_id, ''), COALESCE(cursor_message_id, 0), subscribed_at
-		FROM channel_subscriptions
-		WHERE activity_id IS NOT NULL AND timeout_at IS NOT NULL AND timeout_at < NOW()
-		ORDER BY timeout_at ASC
+		SELECT cs.id, cs.instance_id, cs.channel, cs.mode, cs.timeout_at, COALESCE(cs.activity_id, ''), COALESCE(cs.cursor_message_id, 0), cs.subscribed_at
+		FROM channel_subscriptions cs
+		JOIN workflow_instances w ON cs.instance_id = w.instance_id
+		WHERE cs.activity_id IS NOT NULL AND cs.timeout_at IS NOT NULL AND cs.timeout_at < NOW()
+		AND w.framework = 'go'
+		ORDER BY cs.timeout_at ASC
 		LIMIT ?
 	`, limit)
 	if err != nil {

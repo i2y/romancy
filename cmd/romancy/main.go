@@ -42,7 +42,7 @@ func main() {
 	switch cmd {
 	case "get":
 		fs := flag.NewFlagSet("get", flag.ExitOnError)
-		fs.StringVar(&dbPath, "db", "romancy.db", "Path to database")
+		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		_ = fs.Parse(cmdArgs)
 		args := fs.Args()
 
@@ -58,7 +58,7 @@ func main() {
 
 	case "event":
 		fs := flag.NewFlagSet("event", flag.ExitOnError)
-		fs.StringVar(&dbPath, "db", "romancy.db", "Path to database")
+		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		fs.StringVar(&baseURL, "url", "http://localhost:8080", "Base URL of running Romancy server")
 		_ = fs.Parse(cmdArgs)
 		args := fs.Args()
@@ -75,7 +75,7 @@ func main() {
 
 	case "list":
 		fs := flag.NewFlagSet("list", flag.ExitOnError)
-		fs.StringVar(&dbPath, "db", "romancy.db", "Path to database")
+		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		statusFlag := fs.String("status", "", "Filter by status")
 		pageToken := fs.String("page-token", "", "Pagination token for next page")
 		_ = fs.Parse(cmdArgs)
@@ -87,7 +87,7 @@ func main() {
 
 	case "cancel":
 		fs := flag.NewFlagSet("cancel", flag.ExitOnError)
-		fs.StringVar(&dbPath, "db", "romancy.db", "Path to database")
+		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		fs.StringVar(&baseURL, "url", "http://localhost:8080", "Base URL of running Romancy server")
 		_ = fs.Parse(cmdArgs)
 		args := fs.Args()
@@ -130,13 +130,13 @@ func printUsage() {
 	fmt.Println("  cancel <instance_id>                  Cancel a workflow")
 	fmt.Println()
 	fmt.Println("Flags:")
-	fmt.Println("  --db <path>         Database path/URL (default: romancy.db)")
+	fmt.Println("  --db <url>          Database path or URL (default: romancy.db)")
 	fmt.Println("  --url <base_url>    Romancy server URL (default: http://localhost:8080)")
 	fmt.Println("  --status <status>   Filter by workflow status (for list command)")
 	fmt.Println("  --page-token <tok>  Pagination token for next page (for list command)")
 	fmt.Println()
 	fmt.Println("Status Values:")
-	fmt.Println("  pending, running, completed, failed, canceled,")
+	fmt.Println("  running, completed, failed, canceled,")
 	fmt.Println("  waiting_event, waiting_timer, waiting_message, recurred, compensating")
 	fmt.Println()
 	fmt.Println("Database Migrations:")
@@ -154,11 +154,17 @@ func printUsage() {
 }
 
 func openStorage() (storage.Storage, error) {
-	store, err := storage.NewSQLiteStorage(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+	url := dbPath
+	isPostgres := len(url) >= 8 && url[:8] == "postgres"
+
+	switch {
+	case isPostgres:
+		return storage.NewPostgresStorage(url)
+	case len(url) >= 5 && url[:5] == "mysql":
+		return storage.NewMySQLStorage(url)
+	default:
+		return storage.NewSQLiteStorage(url)
 	}
-	return store, nil
 }
 
 // cmdGet displays detailed information about a workflow instance.
