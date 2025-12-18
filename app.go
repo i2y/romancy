@@ -602,12 +602,6 @@ func (a *App) stopLeaderTasks() {
 	slog.Debug("stopped leader-only tasks")
 }
 
-// runStaleLockCleanup periodically cleans up stale locks.
-// Deprecated: Use runStaleLockCleanupWithContext instead.
-func (a *App) runStaleLockCleanup() {
-	a.runStaleLockCleanupWithContext(a.ctx)
-}
-
 // runStaleLockCleanupWithContext periodically cleans up stale locks with a cancellable context.
 func (a *App) runStaleLockCleanupWithContext(ctx context.Context) {
 	defer a.wg.Done()
@@ -664,12 +658,6 @@ func (a *App) cleanupStaleLocks() error {
 
 	wg.Wait()
 	return nil
-}
-
-// runTimerCheck periodically checks for expired timers.
-// Deprecated: Use runTimerCheckWithContext instead.
-func (a *App) runTimerCheck() {
-	a.runTimerCheckWithContext(a.ctx)
 }
 
 // runTimerCheckWithContext periodically checks for expired timers with a cancellable context.
@@ -796,12 +784,6 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 
 	// Resume workflow with lock already held
 	return a.resumeWorkflowWithLock(a.ctx, timer.InstanceID)
-}
-
-// runEventTimeoutCheck periodically checks for event timeouts.
-// Deprecated: Use runEventTimeoutCheckWithContext instead.
-func (a *App) runEventTimeoutCheck() {
-	a.runEventTimeoutCheckWithContext(a.ctx)
 }
 
 // runEventTimeoutCheckWithContext periodically checks for event timeouts with a cancellable context.
@@ -1528,12 +1510,6 @@ func (a *App) WorkerID() string {
 // Channel Message Handling
 // ========================================
 
-// runChannelTimeoutCheck periodically checks for channel subscription timeouts.
-// Deprecated: Use runChannelTimeoutCheckWithContext instead.
-func (a *App) runChannelTimeoutCheck() {
-	a.runChannelTimeoutCheckWithContext(a.ctx)
-}
-
 // runChannelTimeoutCheckWithContext periodically checks for channel subscription timeouts with a cancellable context.
 func (a *App) runChannelTimeoutCheckWithContext(ctx context.Context) {
 	defer a.wg.Done()
@@ -1668,12 +1644,6 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 // Recur Handling
 // ========================================
 
-// runRecurCheck periodically checks for recurred workflows that need to be restarted.
-// Deprecated: Use runRecurCheckWithContext instead.
-func (a *App) runRecurCheck() {
-	a.runRecurCheckWithContext(a.ctx)
-}
-
 // runRecurCheckWithContext periodically checks for recurred workflows with a cancellable context.
 func (a *App) runRecurCheckWithContext(ctx context.Context) {
 	defer a.wg.Done()
@@ -1786,12 +1756,13 @@ func (a *App) runWorkflowResumption() {
 		}
 
 		count, err := a.resumeResumableWorkflows()
-		if err != nil {
+		switch {
+		case err != nil:
 			slog.Error("error resuming workflows", "error", err)
 			consecutiveEmpty = 0
-		} else if count == 0 {
+		case count == 0:
 			consecutiveEmpty++
-		} else {
+		default:
 			consecutiveEmpty = 0
 		}
 
@@ -1858,12 +1829,6 @@ func (a *App) resumeResumableWorkflows() (int, error) {
 // ========================================
 // Channel Message Cleanup
 // ========================================
-
-// runChannelCleanup periodically cleans up old channel messages.
-// Deprecated: Use runChannelCleanupWithContext instead.
-func (a *App) runChannelCleanup() {
-	a.runChannelCleanupWithContext(a.ctx)
-}
 
 // runChannelCleanupWithContext periodically cleans up old channel messages with a cancellable context.
 func (a *App) runChannelCleanupWithContext(ctx context.Context) {

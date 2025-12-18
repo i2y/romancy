@@ -63,10 +63,10 @@ func TestExtractVersionFromFilename(t *testing.T) {
 
 func TestParseMigrationFile(t *testing.T) {
 	tests := []struct {
-		name      string
-		content   string
-		wantUp    string
-		wantDown  string
+		name     string
+		content  string
+		wantUp   string
+		wantDown string
 	}{
 		{
 			name: "standard format",

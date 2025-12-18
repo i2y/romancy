@@ -96,18 +96,6 @@ func parseSQLiteTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse time: %s", s)
 }
 
-// parseSQLiteTimeNullable parses an optional SQLite datetime TEXT value.
-func parseSQLiteTimeNullable(s sql.NullString) (*time.Time, error) {
-	if !s.Valid || s.String == "" {
-		return nil, nil
-	}
-	t, err := parseSQLiteTime(s.String)
-	if err != nil {
-		return nil, err
-	}
-	return &t, nil
-}
-
 // getConn returns the appropriate database handle based on context (internal use).
 func (s *SQLiteStorage) getConn(ctx context.Context) Executor {
 	if state, ok := ctx.Value(txKey{}).(*txState); ok {

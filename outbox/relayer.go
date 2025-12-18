@@ -144,12 +144,13 @@ func (r *Relayer) run(ctx context.Context) {
 		}
 
 		count, err := r.processPendingEvents(ctx)
-		if err != nil {
+		switch {
+		case err != nil:
 			slog.Error("outbox relayer error", "error", err)
 			consecutiveEmpty = 0
-		} else if count == 0 {
+		case count == 0:
 			consecutiveEmpty++
-		} else {
+		default:
 			consecutiveEmpty = 0
 		}
 

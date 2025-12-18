@@ -74,7 +74,7 @@ func GetAppliedMigrations(ctx context.Context, db *sql.DB) (map[string]bool, err
 		// Table might not exist yet
 		return applied, nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var version string
@@ -90,7 +90,7 @@ func GetAppliedMigrations(ctx context.Context, db *sql.DB) (map[string]bool, err
 // RecordMigration records a migration as applied.
 //
 // Returns true if recorded successfully, false if already recorded (race condition).
-func RecordMigration(ctx context.Context, db *sql.DB, dbType string, version string) (bool, error) {
+func RecordMigration(ctx context.Context, db *sql.DB, dbType, version string) (bool, error) {
 	// Use appropriate placeholder syntax
 	var query string
 	if dbType == "postgresql" {
@@ -130,7 +130,7 @@ func ExtractVersionFromFilename(filename string) string {
 // ParseMigrationFile parses dbmate migration file content.
 //
 // Returns (upSQL, downSQL) extracted from the file.
-func ParseMigrationFile(content string) (upSQL string, downSQL string) {
+func ParseMigrationFile(content string) (upSQL, downSQL string) {
 	// Extract "-- migrate:up" section
 	upRe := regexp.MustCompile(`(?s)-- migrate:up\s*(.*?)(?:-- migrate:down|$)`)
 	upMatch := upRe.FindStringSubmatch(content)
@@ -154,7 +154,7 @@ func ParseMigrationFile(content string) (upSQL string, downSQL string) {
 //   - Multiple statements separated by semicolons
 //   - Comment lines
 //   - "already exists" errors (idempotent)
-func ExecuteSQLStatements(ctx context.Context, db *sql.DB, sqlContent string, dbType string) error {
+func ExecuteSQLStatements(ctx context.Context, db *sql.DB, sqlContent, dbType string) error {
 	if sqlContent == "" {
 		return nil
 	}
@@ -202,10 +202,10 @@ func ExecuteSQLStatements(ctx context.Context, db *sql.DB, sqlContent string, db
 
 // splitSQLStatements splits SQL content by semicolons.
 // Handles basic cases but may not work for complex stored procedures.
-func splitSQLStatements(sql string) []string {
+func splitSQLStatements(sqlContent string) []string {
 	// Simple split by semicolon
 	// Note: This doesn't handle semicolons inside strings or complex cases
-	parts := strings.Split(sql, ";")
+	parts := strings.Split(sqlContent, ";")
 	var result []string
 	for _, part := range parts {
 		trimmed := strings.TrimSpace(part)
