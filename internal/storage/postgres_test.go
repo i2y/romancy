@@ -87,7 +87,7 @@ func TestPostgresStorage_CreateAndGetInstance(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-instance-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
+		Status:       StatusRunning,
 		InputData:    []byte(`{"key": "value"}`),
 		SourceCode:   "func test() {}",
 		CreatedAt:    now,
@@ -132,7 +132,7 @@ func TestPostgresStorage_UpdateInstanceStatus(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-status-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
+		Status:       StatusRunning,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -158,7 +158,7 @@ func TestPostgresStorage_LockOperations(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-lock-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
+		Status:       StatusRunning,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -426,7 +426,7 @@ func TestPostgresStorage_Transaction(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-tx-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
+		Status:       StatusRunning,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -459,7 +459,7 @@ func TestPostgresStorage_TransactionCommit(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-tx-commit-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
+		Status:       StatusRunning,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}

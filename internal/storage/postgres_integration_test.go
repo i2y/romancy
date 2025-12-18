@@ -43,10 +43,11 @@ func setupPostgresContainer(t *testing.T) (*PostgresStorage, func()) {
 		t.Fatalf("failed to create PostgreSQL storage: %v", err)
 	}
 
-	if err := store.Initialize(ctx); err != nil {
+	// Use embedded test schema instead of Initialize() (which is now no-op)
+	if err := InitializeTestSchemaPostgres(ctx, store); err != nil {
 		store.Close()
 		testcontainers.CleanupContainer(t, container)
-		t.Fatalf("failed to initialize storage: %v", err)
+		t.Fatalf("failed to initialize test schema: %v", err)
 	}
 
 	cleanup := func() {
@@ -62,16 +63,18 @@ func cleanupPostgresTables(t *testing.T, store *PostgresStorage) {
 	ctx := context.Background()
 
 	tables := []string{
-		"workflow_group_members",
-		"channel_messages",
+		"channel_message_claims",
+		"channel_delivery_cursors",
 		"channel_subscriptions",
-		"workflow_message_subscriptions",
+		"channel_messages",
+		"workflow_group_memberships",
+		"outbox_events",
 		"workflow_compensations",
-		"workflow_outbox",
 		"workflow_timer_subscriptions",
 		"workflow_history_archive",
 		"workflow_history",
 		"workflow_instances",
+		"system_locks",
 	}
 
 	for _, table := range tables {
@@ -85,10 +88,10 @@ func TestPostgresIntegration_Initialize(t *testing.T) {
 	store, cleanup := setupPostgresContainer(t)
 	defer cleanup()
 
-	// Initialize should be idempotent
+	// InitializeTestSchemaPostgres should be idempotent
 	ctx := context.Background()
-	if err := store.Initialize(ctx); err != nil {
-		t.Fatalf("Second Initialize failed: %v", err)
+	if err := InitializeTestSchemaPostgres(ctx, store); err != nil {
+		t.Fatalf("Second InitializeTestSchemaPostgres failed: %v", err)
 	}
 }
 
@@ -102,10 +105,9 @@ func TestPostgresIntegration_CreateAndGetInstance(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-instance-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
+		Status:       StatusRunning,
 		InputData:    []byte(`{"key": "value"}`),
-		SourceCode:   "func test() {}",
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 
@@ -146,8 +148,8 @@ func TestPostgresIntegration_UpdateInstanceStatus(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-status-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
-		CreatedAt:    now,
+		Status:       StatusRunning,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -172,8 +174,8 @@ func TestPostgresIntegration_LockOperations(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-lock-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
-		CreatedAt:    now,
+		Status:       StatusRunning,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -231,7 +233,7 @@ func TestPostgresIntegration_HistoryOperations(t *testing.T) {
 		InstanceID:   "test-history-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -276,7 +278,7 @@ func TestPostgresIntegration_TimerSubscription(t *testing.T) {
 		InstanceID:   "test-timer-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusWaitingForTimer,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -285,14 +287,14 @@ func TestPostgresIntegration_TimerSubscription(t *testing.T) {
 		InstanceID: "test-timer-1",
 		TimerID:    "timer-1",
 		ExpiresAt:  time.Now().Add(-1 * time.Hour), // Past time
-		Step:       1,
+		ActivityID: "activity:1",
 	}
 
 	if err := store.RegisterTimerSubscription(ctx, sub); err != nil {
 		t.Fatalf("RegisterTimerSubscription failed: %v", err)
 	}
 
-	timers, err := store.FindExpiredTimers(ctx)
+	timers, err := store.FindExpiredTimers(ctx, 100)
 	if err != nil {
 		t.Fatalf("FindExpiredTimers failed: %v", err)
 	}
@@ -356,7 +358,7 @@ func TestPostgresIntegration_CompensationOperations(t *testing.T) {
 		InstanceID:   "test-comp-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -366,16 +368,14 @@ func TestPostgresIntegration_CompensationOperations(t *testing.T) {
 		ActivityID:   "activity:1",
 		ActivityName: "rollback_activity1",
 		Args:         []byte(`{"id": "1"}`),
-		Order:        1,
-		Status:       "pending",
 	}
+	// Small delay to ensure ordering by created_at
+	time.Sleep(10 * time.Millisecond)
 	comp2 := &CompensationEntry{
 		InstanceID:   "test-comp-1",
 		ActivityID:   "activity:2",
 		ActivityName: "rollback_activity2",
 		Args:         []byte(`{"id": "2"}`),
-		Order:        2,
-		Status:       "pending",
 	}
 
 	store.AddCompensation(ctx, comp1)
@@ -390,16 +390,12 @@ func TestPostgresIntegration_CompensationOperations(t *testing.T) {
 		t.Fatalf("len(comps) = %d, want 2", len(comps))
 	}
 
-	// LIFO: comp2 should come first
-	if comps[0].Order != 2 {
-		t.Errorf("comps[0].Order = %d, want 2 (LIFO)", comps[0].Order)
+	// LIFO: comp2 should come first (most recently added)
+	if comps[0].ActivityID != "activity:2" {
+		t.Errorf("comps[0].ActivityID = %s, want activity:2 (LIFO)", comps[0].ActivityID)
 	}
-	if comps[1].Order != 1 {
-		t.Errorf("comps[1].Order = %d, want 1 (LIFO)", comps[1].Order)
-	}
-
-	if err := store.MarkCompensationExecuted(ctx, comps[0].ID); err != nil {
-		t.Fatalf("MarkCompensationExecuted failed: %v", err)
+	if comps[1].ActivityID != "activity:1" {
+		t.Errorf("comps[1].ActivityID = %s, want activity:1 (LIFO)", comps[1].ActivityID)
 	}
 }
 
@@ -423,8 +419,8 @@ func TestPostgresIntegration_Transaction(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-tx-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
-		CreatedAt:    now,
+		Status:       StatusRunning,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(txCtx, instance)
@@ -454,8 +450,8 @@ func TestPostgresIntegration_TransactionCommit(t *testing.T) {
 	instance := &WorkflowInstance{
 		InstanceID:   "test-tx-commit-1",
 		WorkflowName: "test_workflow",
-		Status:       StatusPending,
-		CreatedAt:    now,
+		Status:       StatusRunning,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(txCtx, instance)
@@ -532,7 +528,7 @@ func TestPostgresIntegration_ChannelOperations(t *testing.T) {
 		InstanceID:   "test-channel-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -591,7 +587,7 @@ func TestPostgresIntegration_GroupOperations(t *testing.T) {
 			InstanceID:   fmt.Sprintf("test-group-%d", i),
 			WorkflowName: "test_workflow",
 			Status:       StatusRunning,
-			CreatedAt:    now,
+			StartedAt:    now,
 			UpdatedAt:    now,
 		}
 		store.CreateInstance(ctx, instance)
@@ -644,8 +640,8 @@ func TestPostgresIntegration_ListInstances(t *testing.T) {
 		instance := &WorkflowInstance{
 			InstanceID:   fmt.Sprintf("list-test-%d", i),
 			WorkflowName: "test_workflow",
-			Status:       StatusPending,
-			CreatedAt:    now.Add(time.Duration(i) * time.Second),
+			Status:       StatusRunning,
+			StartedAt:    now.Add(time.Duration(i) * time.Second),
 			UpdatedAt:    now.Add(time.Duration(i) * time.Second),
 		}
 		store.CreateInstance(ctx, instance)

@@ -26,8 +26,8 @@ func TestSQLiteStorage(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Initialize the storage (create tables)
-	if err := storage.Initialize(ctx); err != nil {
+	// Initialize the storage (create tables) using test helper
+	if err := InitializeTestSchema(ctx, storage); err != nil {
 		t.Fatalf("failed to initialize storage: %v", err)
 	}
 
@@ -35,7 +35,7 @@ func TestSQLiteStorage(t *testing.T) {
 		instance := &WorkflowInstance{
 			InstanceID:   "test-instance-1",
 			WorkflowName: "test-workflow",
-			Status:       StatusPending,
+			Status:       StatusRunning,
 			InputData:    []byte(`{"name":"test"}`),
 			StartedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
@@ -62,8 +62,8 @@ func TestSQLiteStorage(t *testing.T) {
 			t.Errorf("expected workflow_name %s, got %s", instance.WorkflowName, got.WorkflowName)
 		}
 
-		if got.Status != StatusPending {
-			t.Errorf("expected status %s, got %s", StatusPending, got.Status)
+		if got.Status != StatusRunning {
+			t.Errorf("expected status %s, got %s", StatusRunning, got.Status)
 		}
 	})
 
@@ -157,7 +157,7 @@ func TestSQLiteStorage(t *testing.T) {
 			InstanceID: "test-instance-1",
 			TimerID:    "timer:1",
 			ExpiresAt:  expiresAt,
-			Step:       1,
+			ActivityID: "timer:1",
 		}
 		err := storage.RegisterTimerSubscription(ctx, timer)
 		if err != nil {
@@ -466,8 +466,8 @@ func TestSQLiteStorage_InputFilters(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Initialize the storage
-	if err := storage.Initialize(ctx); err != nil {
+	// Initialize the storage using test helper
+	if err := InitializeTestSchema(ctx, storage); err != nil {
 		t.Fatalf("failed to initialize storage: %v", err)
 	}
 
@@ -487,7 +487,7 @@ func TestSQLiteStorage_InputFilters(t *testing.T) {
 		instance := &WorkflowInstance{
 			InstanceID:   inst.id,
 			WorkflowName: "filter_test_workflow",
-			Status:       StatusPending,
+			Status:       StatusRunning,
 			InputData:    []byte(inst.input),
 			StartedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
@@ -561,13 +561,13 @@ func TestSQLiteStorage_InputFilters(t *testing.T) {
 	})
 
 	t.Run("combined with status filter", func(t *testing.T) {
-		// Update one instance to running
-		if err := storage.UpdateInstanceStatus(ctx, "filter-test-1", StatusRunning, ""); err != nil {
+		// Update one instance to completed (filter-test-1 is gold)
+		if err := storage.UpdateInstanceStatus(ctx, "filter-test-1", StatusCompleted, ""); err != nil {
 			t.Fatalf("failed to update status: %v", err)
 		}
 
 		result, err := storage.ListInstances(ctx, ListInstancesOptions{
-			StatusFilter: StatusPending,
+			StatusFilter: StatusRunning,
 			InputFilters: map[string]any{
 				"customer.tier": "gold",
 			},
@@ -575,9 +575,9 @@ func TestSQLiteStorage_InputFilters(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListInstances with combined filters failed: %v", err)
 		}
-		// filter-test-1 is gold but now running, filter-test-4 is gold and pending
+		// filter-test-1 is gold but now completed, filter-test-4 is gold and still running
 		if len(result.Instances) != 1 {
-			t.Errorf("expected 1 pending gold-tier instance, got %d", len(result.Instances))
+			t.Errorf("expected 1 running gold-tier instance, got %d", len(result.Instances))
 		}
 		if len(result.Instances) > 0 && result.Instances[0].InstanceID != "filter-test-4" {
 			t.Errorf("expected instance filter-test-4, got %s", result.Instances[0].InstanceID)
