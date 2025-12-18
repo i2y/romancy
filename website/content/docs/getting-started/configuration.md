@@ -35,16 +35,19 @@ romancy.WithDatabase("mysql://user:password@localhost:3306/dbname")
 
 **Default**: `"file:romancy.db"`
 
-### WithAutoMigrate(enabled)
+### WithAutoMigrate(enabled) (Deprecated)
 
-Controls whether database migrations run automatically on startup.
+This option is deprecated and now a no-op. Database migrations should be managed externally using [dbmate](https://github.com/amacneil/dbmate).
 
-```go
-romancy.WithAutoMigrate(true)   // Run migrations on startup (default)
-romancy.WithAutoMigrate(false)  // Manual migration via CLI: romancy migrate up
+The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between Romancy (Go) and Edda (Python) to ensure cross-framework compatibility.
+
+```bash
+# Run migrations with dbmate
+dbmate --url "postgres://user:password@localhost/db" \
+       --migrations-dir schema/db/migrations/postgres up
 ```
 
-**Default**: `true`
+See [Database Migrations](#database-migrations) section below for details.
 
 ## Worker Configuration
 
@@ -265,7 +268,6 @@ func main() {
     app := romancy.NewApp(
         // Database
         romancy.WithDatabase("postgres://user:password@localhost:5432/workflows"),
-        romancy.WithAutoMigrate(true),
 
         // Worker identity
         romancy.WithWorkerID("worker-1"),
@@ -293,4 +295,56 @@ func main() {
 
     // ...
 }
+```
+
+## Database Migrations
+
+Romancy uses [dbmate](https://github.com/amacneil/dbmate) for database schema management. The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository as a git submodule, which is shared between Romancy (Go) and Edda (Python) to ensure cross-framework compatibility.
+
+### Installing dbmate
+
+```bash
+# macOS
+brew install dbmate
+
+# Go
+go install github.com/amacneil/dbmate@latest
+
+# Linux (amd64)
+curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
+chmod +x /usr/local/bin/dbmate
+```
+
+### Running Migrations
+
+```bash
+# SQLite
+dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite up
+
+# PostgreSQL
+dbmate --url "postgres://user:password@localhost/db?sslmode=disable" \
+       --migrations-dir schema/db/migrations/postgres up
+
+# MySQL
+dbmate --url "mysql://user:password@localhost/db" \
+       --migrations-dir schema/db/migrations/mysql up
+```
+
+### Migration Commands
+
+| Command | Description |
+|---------|-------------|
+| `dbmate up` | Run all pending migrations |
+| `dbmate down` | Rollback the last migration |
+| `dbmate status` | Show migration status |
+| `dbmate rollback` | Alias for `down` |
+| `dbmate create NAME` | Create a new migration file |
+
+### Setting Up the Schema Submodule
+
+If you're starting a new project, add the schema repository as a git submodule:
+
+```bash
+git submodule add https://github.com/durax-io/schema.git schema
+git submodule update --init --recursive
 ```

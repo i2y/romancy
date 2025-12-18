@@ -169,41 +169,29 @@ go get github.com/i2y/romancy
 
 ### Database Migrations
 
-Romancy uses [golang-migrate](https://github.com/golang-migrate/migrate) for database schema management. Migrations run automatically on application startup by default.
+Romancy uses [dbmate](https://github.com/amacneil/dbmate) for database schema management. The database schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between Romancy (Go) and [Edda](https://github.com/i2y/edda) (Python) to ensure cross-framework compatibility.
 
-```go
-// Default: migrations run automatically on startup
-app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:pass@localhost/db"),
-)
-
-// Opt-out: manage migrations manually via CLI
-app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:pass@localhost/db"),
-    romancy.WithAutoMigrate(false),
-)
-```
-
-**CLI Migration Commands**:
+**Running migrations with dbmate**:
 
 ```bash
-# Run all pending migrations
-romancy migrate up --db workflow.db
+# Install dbmate
+brew install dbmate  # macOS
+# or: go install github.com/amacneil/dbmate@latest
 
-# Rollback all migrations
-romancy migrate down --db workflow.db
+# Run migrations (SQLite)
+dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite up
 
-# Show current migration version
-romancy migrate version --db workflow.db
+# Run migrations (PostgreSQL)
+dbmate --url "postgres://user:pass@localhost/db?sslmode=disable" --migrations-dir schema/db/migrations/postgres up
 
-# Run N migration steps (+up, -down)
-romancy migrate steps 1 --db workflow.db
+# Run migrations (MySQL)
+dbmate --url "mysql://user:pass@localhost/db" --migrations-dir schema/db/migrations/mysql up
 
-# PostgreSQL
-romancy migrate up --db postgres://user:pass@localhost/db --type postgres
+# Check current version
+dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite status
 ```
 
-**Upgrading from older versions**: Romancy automatically detects existing databases (tables exist but no migration tracking) and handles them gracefully - no manual intervention required.
+**Note**: The `WithAutoMigrate()` option is deprecated. Migrations should be managed externally using dbmate before starting the application.
 
 ## Core Concepts
 

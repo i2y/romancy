@@ -201,6 +201,46 @@ app := romancy.NewApp(
 - Row-level locking for concurrent access
 - Supports multi-worker deployments
 
+## Database Migrations
+
+Romancy uses [dbmate](https://github.com/amacneil/dbmate) for database schema management. The schema is managed in the [durax-io/schema](https://github.com/durax-io/schema) repository, which is shared between Romancy (Go) and Edda (Python).
+
+### Setup
+
+1. **Install dbmate**:
+
+```bash
+# macOS
+brew install dbmate
+
+# Go
+go install github.com/amacneil/dbmate@latest
+```
+
+2. **Add the schema submodule to your project**:
+
+```bash
+git submodule add https://github.com/durax-io/schema.git schema
+git submodule update --init --recursive
+```
+
+3. **Run migrations**:
+
+```bash
+# SQLite
+dbmate --url "sqlite:workflow.db" --migrations-dir schema/db/migrations/sqlite up
+
+# PostgreSQL
+dbmate --url "postgres://user:password@localhost/db?sslmode=disable" \
+       --migrations-dir schema/db/migrations/postgres up
+
+# MySQL
+dbmate --url "mysql://user:password@localhost/db" \
+       --migrations-dir schema/db/migrations/mysql up
+```
+
+For more details, see the [Configuration Reference](/docs/getting-started/configuration#database-migrations).
+
 ## Next Steps
 
 - **[Quick Start](/docs/getting-started/quick-start)**: Build your first workflow in 5 minutes

@@ -16,12 +16,13 @@ Channels allow workflows to:
 
 ## Delivery Modes
 
-Romancy supports two delivery modes:
+Romancy supports three delivery modes:
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
 | `ModeBroadcast` | All subscribers receive every message | Notifications, events |
 | `ModeCompeting` | Each message goes to exactly one subscriber | Work queues, load balancing |
+| `ModeDirect` | Receives messages sent via SendTo to this instance | Point-to-point, request-response |
 
 ## Basic Usage
 
@@ -127,13 +128,28 @@ err := romancy.Publish(ctx, "events", eventData,
 )
 ```
 
-### Send to Specific Instance
+### Send to Specific Instance (SendTo)
+
+`SendTo` sends a message directly to a specific workflow instance. Use `ModeDirect` on the receiver side for easy setup.
 
 ```go
+// === Receiver Workflow ===
+// Subscribe with ModeDirect to receive SendTo messages
+// This automatically subscribes to "notifications:instanceID"
+if err := romancy.Subscribe(ctx, "notifications", romancy.ModeDirect); err != nil {
+    return MyResult{}, err
+}
+
+// Receive works normally - ModeDirect handles the channel name internally
+msg, err := romancy.Receive[MyMessage](ctx, "notifications")
+
+// === Sender Workflow ===
 // Send directly to a specific workflow instance
 targetInstanceID := "wf-12345"
-err := romancy.SendTo(ctx, targetInstanceID, "private-channel", message)
+err := romancy.SendTo(ctx, targetInstanceID, "notifications", message)
 ```
+
+This design matches Erlang/Elixir's mailbox semantics where each process has its own mailbox identified by its PID.
 
 ## Unsubscribe
 
@@ -332,17 +348,25 @@ romancy.Subscribe(ctx, "work-queue", romancy.ModeCompeting)
 msg, _ := romancy.Receive[WorkItem](ctx, "work-queue")
 ```
 
-### Request-Response
+### Direct Messaging (SendTo)
 
-Direct communication between specific workflows:
+Point-to-point communication with specific workflow instances:
 
 ```go
-// Workflow A sends request
-romancy.SendTo(ctx, targetInstanceID, "requests", request)
+// === Receiver Workflow ===
+// Subscribe with ModeDirect to receive SendTo messages
+romancy.Subscribe(ctx, "messages", romancy.ModeDirect)
 
-// Workflow B receives and responds
-msg, _ := romancy.Receive[Request](ctx, "requests")
-romancy.SendTo(ctx, msg.SenderInstanceID, "responses", response)
+// Receive works with the original channel name
+msg, _ := romancy.Receive[Message](ctx, "messages")
+fmt.Printf("Received from %s: %s\n", msg.Data.From, msg.Data.Content)
+
+// === Sender Workflow ===
+// Send directly to a specific instance
+romancy.SendTo(ctx, targetInstanceID, "messages", Message{
+    From:    ctx.InstanceID(),
+    Content: "Hello!",
+})
 ```
 
 ## See Also
