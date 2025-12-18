@@ -5,7 +5,6 @@ go 1.24.3
 require (
 	github.com/cloudevents/sdk-go/v2 v2.16.2
 	github.com/go-sql-driver/mysql v1.7.1
-	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
 	github.com/i2y/bucephalus v0.1.0
 	github.com/jackc/pgx/v5 v5.7.6
@@ -50,7 +49,6 @@ require (
 	github.com/google/jsonschema-go v0.3.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
-	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect

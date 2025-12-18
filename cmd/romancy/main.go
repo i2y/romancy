@@ -6,7 +6,8 @@
 //	romancy event <instance_id> <event_type> <json_data> [--db <path>] [--url <base_url>]
 //	romancy list [--db <path>] [--status <status>] [--page-token <token>]
 //	romancy cancel <instance_id> [--db <path>] [--url <base_url>]
-//	romancy migrate <up|down|version|steps N> [--db <path>] [--type <sqlite|postgres|mysql>]
+//
+// Note: Database migrations are handled by dbmate. See schema/db/migrations/
 package main
 
 import (
@@ -18,11 +19,9 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/i2y/romancy/internal/migrations"
 	"github.com/i2y/romancy/internal/storage"
 )
 
@@ -104,20 +103,12 @@ func main() {
 		}
 
 	case "migrate":
-		fs := flag.NewFlagSet("migrate", flag.ExitOnError)
-		fs.StringVar(&dbPath, "db", "romancy.db", "Path to database")
-		dbType := fs.String("type", "sqlite", "Database type (sqlite, postgres, or mysql)")
-		_ = fs.Parse(cmdArgs)
-		args := fs.Args()
-
-		if len(args) < 1 {
-			fmt.Println("Usage: romancy migrate <up|down|version|steps N> [--db <path>] [--type <sqlite|postgres>]")
-			os.Exit(1)
-		}
-		if err := cmdMigrate(args[0], args[1:], *dbType); err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
+		fmt.Println("The 'migrate' command has been removed.")
+		fmt.Println("Please use dbmate for migrations:")
+		fmt.Println("  dbmate -d schema/db/migrations/sqlite up")
+		fmt.Println("  dbmate -d schema/db/migrations/postgresql up")
+		fmt.Println("  dbmate -d schema/db/migrations/mysql up")
+		os.Exit(1)
 
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
@@ -137,17 +128,9 @@ func printUsage() {
 	fmt.Println("  event <instance_id> <type> <json>     Send an event to a workflow")
 	fmt.Println("  list                                  List workflow instances")
 	fmt.Println("  cancel <instance_id>                  Cancel a workflow")
-	fmt.Println("  migrate <action>                      Run database migrations")
-	fmt.Println()
-	fmt.Println("Migrate Actions:")
-	fmt.Println("  up                                    Run all pending migrations")
-	fmt.Println("  down                                  Rollback all migrations")
-	fmt.Println("  version                               Show current migration version")
-	fmt.Println("  steps <N>                             Run N migration steps (+up, -down)")
 	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  --db <path>         Database path/URL (default: romancy.db)")
-	fmt.Println("  --type <type>       Database type: sqlite, postgres, or mysql (default: sqlite)")
 	fmt.Println("  --url <base_url>    Romancy server URL (default: http://localhost:8080)")
 	fmt.Println("  --status <status>   Filter by workflow status (for list command)")
 	fmt.Println("  --page-token <tok>  Pagination token for next page (for list command)")
@@ -156,15 +139,18 @@ func printUsage() {
 	fmt.Println("  pending, running, completed, failed, canceled,")
 	fmt.Println("  waiting_event, waiting_timer, waiting_message, recurred, compensating")
 	fmt.Println()
+	fmt.Println("Database Migrations:")
+	fmt.Println("  Use dbmate for database migrations:")
+	fmt.Println("  dbmate -d schema/db/migrations/sqlite up")
+	fmt.Println("  dbmate -d schema/db/migrations/postgresql up")
+	fmt.Println("  dbmate -d schema/db/migrations/mysql up")
+	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  romancy get wf-123abc")
 	fmt.Println("  romancy event wf-123abc payment.completed '{\"transaction_id\":\"TX-001\"}'")
 	fmt.Println("  romancy list --status running")
 	fmt.Println("  romancy list --page-token 'eyJ...'")
 	fmt.Println("  romancy cancel wf-123abc")
-	fmt.Println("  romancy migrate up --db workflow.db")
-	fmt.Println("  romancy migrate version --db postgres://user:pass@localhost/db --type postgres")
-	fmt.Println("  romancy migrate up --db mysql://user:pass@localhost/db --type mysql")
 }
 
 func openStorage() (storage.Storage, error) {
@@ -348,75 +334,6 @@ func cmdList(statusFilter, pageToken string) error {
 	return nil
 }
 
-// cmdMigrate handles database migrations.
-func cmdMigrate(action string, args []string, dbType string) error {
-	var store storage.Storage
-	var driverType migrations.DriverType
-	var err error
-
-	switch dbType {
-	case "sqlite":
-		store, err = storage.NewSQLiteStorage(dbPath)
-		driverType = migrations.DriverSQLite
-	case "postgres":
-		store, err = storage.NewPostgresStorage(dbPath)
-		driverType = migrations.DriverPostgres
-	case "mysql":
-		store, err = storage.NewMySQLStorage(dbPath)
-		driverType = migrations.DriverMySQL
-	default:
-		return fmt.Errorf("unsupported database type: %s (use: sqlite, postgres, mysql)", dbType)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-	defer func() { _ = store.Close() }()
-
-	migrator := migrations.NewMigrator(store.DB(), driverType)
-
-	switch action {
-	case "up":
-		fmt.Println("Running migrations...")
-		if err := migrator.Up(); err != nil {
-			return err
-		}
-		fmt.Println("Migrations completed successfully.")
-
-	case "down":
-		fmt.Println("Rolling back all migrations...")
-		if err := migrator.Down(); err != nil {
-			return err
-		}
-		fmt.Println("Rollback completed successfully.")
-
-	case "version":
-		version, dirty, err := migrator.Version()
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Current version: %d (dirty: %v)\n", version, dirty)
-
-	case "steps":
-		if len(args) < 1 {
-			return fmt.Errorf("steps requires a number argument")
-		}
-		n, err := strconv.Atoi(args[0])
-		if err != nil {
-			return fmt.Errorf("invalid steps number: %w", err)
-		}
-		fmt.Printf("Running %d migration steps...\n", n)
-		if err := migrator.Steps(n); err != nil {
-			return err
-		}
-		fmt.Println("Steps completed successfully.")
-
-	default:
-		return fmt.Errorf("unknown migrate action: %s (use: up, down, version, steps)", action)
-	}
-
-	return nil
-}
-
 // cmdCancel cancels a workflow by sending a cancel request to the server.
 func cmdCancel(instanceID string) error {
 	url := fmt.Sprintf("%s/cancel/%s", baseURL, instanceID)
@@ -447,8 +364,6 @@ func cmdCancel(instanceID string) error {
 
 func statusEmoji(status storage.WorkflowStatus) string {
 	switch status {
-	case storage.StatusPending:
-		return "⏳ pending"
 	case storage.StatusRunning:
 		return "🏃 running"
 	case storage.StatusWaitingForEvent:
@@ -475,8 +390,6 @@ func statusEmoji(status storage.WorkflowStatus) string {
 func parseStatus(s string) storage.WorkflowStatus {
 	s = strings.ToLower(s)
 	switch s {
-	case "pending":
-		return storage.StatusPending
 	case "running":
 		return storage.StatusRunning
 	case "waiting", "waiting_event", "waiting_for_event":
