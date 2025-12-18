@@ -307,6 +307,7 @@ func WithMaxConcurrentMessages(n int) Option {
 // WithSingletonStaleLockCleanup sets whether stale lock cleanup runs as a singleton task.
 // When true, only one worker will run the cleanup at a time using system locks.
 // Default: true.
+//
 // Deprecated: Leader election is now used for coordinating background tasks.
 func WithSingletonStaleLockCleanup(enabled bool) Option {
 	return func(c *appConfig) {
@@ -317,6 +318,7 @@ func WithSingletonStaleLockCleanup(enabled bool) Option {
 // WithSingletonChannelCleanup sets whether channel cleanup runs as a singleton task.
 // When true, only one worker will run the cleanup at a time using system locks.
 // Default: true.
+//
 // Deprecated: Leader election is now used for coordinating background tasks.
 func WithSingletonChannelCleanup(enabled bool) Option {
 	return func(c *appConfig) {
