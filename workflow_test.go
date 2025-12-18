@@ -146,7 +146,7 @@ func TestWorkflowWithMultipleActivities(t *testing.T) {
 	}
 
 	if result.Status != "completed" {
-		t.Errorf("expected status 'completed', got '%s'", result.Status)
+		t.Errorf("expected status 'completed', got '%s', error: %v", result.Status, result.Error)
 	}
 
 	if result.Output != 30 {

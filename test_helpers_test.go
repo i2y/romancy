@@ -40,7 +40,8 @@ func createTestApp(t *testing.T, opts ...Option) (*App, func()) {
 	_ = store.Close()
 
 	// Create app with the database path and any additional options
-	allOpts := append([]Option{WithDatabase(tmpPath)}, opts...)
+	// Disable auto-migrate since we already created the schema manually
+	allOpts := append([]Option{WithDatabase(tmpPath), WithAutoMigrate(false)}, opts...)
 	app := NewApp(allOpts...)
 
 	cleanup := func() {
