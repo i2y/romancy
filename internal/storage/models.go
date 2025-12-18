@@ -9,7 +9,6 @@ import (
 type WorkflowStatus string
 
 const (
-	StatusPending           WorkflowStatus = "pending"
 	StatusRunning           WorkflowStatus = "running"
 	StatusCompleted         WorkflowStatus = "completed"
 	StatusFailed            WorkflowStatus = "failed"
@@ -30,7 +29,6 @@ type WorkflowInstance struct {
 	InputData         []byte         `json:"input_data"`          // JSON-encoded input
 	OutputData        []byte         `json:"output_data"`         // JSON-encoded output (if completed)
 	CurrentActivityID string         `json:"current_activity_id"` // Last executed activity ID
-	SourceCode        string         `json:"source_code"`         // Source code snapshot (optional)
 	SourceHash        string         `json:"source_hash"`         // Source code hash (Edda compatibility)
 	OwnerService      string         `json:"owner_service"`       // Service that owns this workflow (Edda compatibility)
 	ContinuedFrom     string         `json:"continued_from"`      // Previous instance ID (for recur)
@@ -76,14 +74,13 @@ type TimerSubscription struct {
 	TimerID    string    `json:"timer_id"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	ActivityID string    `json:"activity_id"` // Activity ID for replay matching (Edda compatibility)
-	Step       int       `json:"step"`        // Activity step for replay
 	CreatedAt  time.Time `json:"created_at"`
 }
 
 // OutboxEvent represents an event in the transactional outbox.
+// Uses event_id (TEXT) as primary key for distributed DB compatibility (Spanner, CockroachDB).
 type OutboxEvent struct {
-	ID              int64      `json:"id"`
-	EventID         string     `json:"event_id"`          // CloudEvents ID
+	EventID         string     `json:"event_id"`          // CloudEvents ID (PRIMARY KEY)
 	EventType       string     `json:"event_type"`        // CloudEvents type
 	EventSource     string     `json:"event_source"`      // CloudEvents source
 	EventData       []byte     `json:"event_data"`        // JSON payload
@@ -144,6 +141,7 @@ type ChannelMode string
 const (
 	ChannelModeBroadcast ChannelMode = "broadcast" // All subscribers receive all messages
 	ChannelModeCompeting ChannelMode = "competing" // Each message goes to one subscriber
+	ChannelModeDirect    ChannelMode = "direct"    // Direct messages to specific instance (via SendTo)
 )
 
 // ChannelMessage represents a message in a channel.

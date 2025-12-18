@@ -12,7 +12,6 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/i2y/romancy/internal/migrations"
 	"github.com/i2y/romancy/internal/notify"
 )
 
@@ -43,10 +42,11 @@ func NewPostgresStorage(connStr string) (*PostgresStorage, error) {
 	}, nil
 }
 
-// Initialize creates the database schema using migrations.
+// Initialize is deprecated. Use dbmate for migrations:
+// dbmate -d schema/db/migrations/postgresql up
 func (s *PostgresStorage) Initialize(ctx context.Context) error {
-	migrator := migrations.NewMigrator(s.db, migrations.DriverPostgres)
-	return migrator.Up()
+	slog.Warn("Initialize() is deprecated. Use dbmate for migrations: dbmate -d schema/db/migrations/postgresql up")
+	return nil
 }
 
 // DB returns the underlying database connection.
@@ -164,12 +164,24 @@ func (s *PostgresStorage) RegisterPostCommitCallback(ctx context.Context, cb fun
 func (s *PostgresStorage) CreateInstance(ctx context.Context, instance *WorkflowInstance) error {
 	conn := s.getConn(ctx)
 	framework := "go"
+
+	// Ensure workflow definition exists (required by foreign key constraint)
+	// Uses ON CONFLICT DO NOTHING for idempotency
 	_, err := conn.ExecContext(ctx, `
+		INSERT INTO workflow_definitions (workflow_name, source_hash, source_code)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (workflow_name, source_hash) DO NOTHING
+	`, instance.WorkflowName, instance.SourceHash, "")
+	if err != nil {
+		return fmt.Errorf("failed to ensure workflow definition: %w", err)
+	}
+
+	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
-			instance_id, workflow_name, status, input_data, source_code, source_hash, owner_service, framework, started_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			instance_id, workflow_name, status, input_data, source_hash, owner_service, framework, started_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
-		string(instance.InputData), instance.SourceCode, instance.SourceHash, instance.OwnerService,
+		string(instance.InputData), instance.SourceHash, instance.OwnerService,
 		framework, instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
 	return err
 }
@@ -179,21 +191,21 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
 		SELECT instance_id, workflow_name, status, input_data, output_data,
-			   current_activity_id, source_code, source_hash, owner_service, framework,
+			   current_activity_id, source_hash, owner_service, framework,
 			   locked_by, locked_at, lock_timeout_seconds, lock_expires_at,
 			   started_at, updated_at
 		FROM workflow_instances WHERE instance_id = $1
 	`, instanceID)
 
 	var inst WorkflowInstance
-	var inputData, outputData, activityID, sourceCode, sourceHash, ownerService, framework sql.NullString
+	var inputData, outputData, activityID, sourceHash, ownerService, framework sql.NullString
 	var lockedBy sql.NullString
 	var lockedAt, lockExpiresAt sql.NullTime
 	var lockTimeout sql.NullInt64
 
 	err := row.Scan(
 		&inst.InstanceID, &inst.WorkflowName, &inst.Status,
-		&inputData, &outputData, &activityID, &sourceCode, &sourceHash, &ownerService, &framework,
+		&inputData, &outputData, &activityID, &sourceHash, &ownerService, &framework,
 		&lockedBy, &lockedAt, &lockTimeout, &lockExpiresAt,
 		&inst.StartedAt, &inst.UpdatedAt,
 	)
@@ -212,9 +224,6 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	}
 	if activityID.Valid {
 		inst.CurrentActivityID = activityID.String
-	}
-	if sourceCode.Valid {
-		inst.SourceCode = sourceCode.String
 	}
 	if sourceHash.Valid {
 		inst.SourceHash = sourceHash.String
@@ -621,10 +630,10 @@ func (s *PostgresStorage) GetHistoryCount(ctx context.Context, instanceID string
 func (s *PostgresStorage) RegisterTimerSubscription(ctx context.Context, sub *TimerSubscription) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, step)
+		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (instance_id, timer_id) DO NOTHING
-	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.Step)
+	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.ActivityID)
 	if err != nil {
 		return err
 	}
@@ -663,10 +672,10 @@ func (s *PostgresStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Co
 
 	// Register timer
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, step)
+		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (instance_id, timer_id) DO NOTHING
-	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.Step)
+	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.ActivityID)
 	if err != nil {
 		return err
 	}
@@ -727,7 +736,7 @@ func (s *PostgresStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, timer_id, expires_at, step, created_at
+		SELECT id, instance_id, timer_id, expires_at, activity_id, created_at
 		FROM workflow_timer_subscriptions
 		WHERE expires_at <= NOW()
 		ORDER BY expires_at ASC
@@ -741,8 +750,12 @@ func (s *PostgresStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*
 	var timers []*TimerSubscription
 	for rows.Next() {
 		var t TimerSubscription
-		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &t.ExpiresAt, &t.Step, &t.CreatedAt); err != nil {
+		var activityID sql.NullString
+		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &t.ExpiresAt, &activityID, &t.CreatedAt); err != nil {
 			return nil, err
+		}
+		if activityID.Valid {
+			t.ActivityID = activityID.String
 		}
 		timers = append(timers, &t)
 	}
@@ -755,7 +768,7 @@ func (s *PostgresStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*
 func (s *PostgresStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_outbox (event_id, event_type, event_source, event_data, data_type, content_type, status)
+		INSERT INTO outbox_events (event_id, event_type, event_source, event_data, data_type, content_type, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`, event.EventID, event.EventType, event.EventSource, string(event.EventData), event.DataType, event.ContentType, event.Status)
 	if err != nil {
@@ -776,8 +789,8 @@ func (s *PostgresStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent
 func (s *PostgresStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
-		FROM workflow_outbox
+		SELECT event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
+		FROM outbox_events
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
 		LIMIT $1
@@ -793,7 +806,7 @@ func (s *PostgresStorage) GetPendingOutboxEvents(ctx context.Context, limit int)
 		var e OutboxEvent
 		var eventData sql.NullString
 
-		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		if eventData.Valid {
@@ -804,12 +817,12 @@ func (s *PostgresStorage) GetPendingOutboxEvents(ctx context.Context, limit int)
 	return events, rows.Err()
 }
 
-// MarkOutboxEventSent marks an outbox event as sent.
+// MarkOutboxEventSent marks an outbox event as published.
 func (s *PostgresStorage) MarkOutboxEventSent(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET status = 'sent', updated_at = NOW()
+		UPDATE outbox_events
+		SET status = 'published', published_at = NOW()
 		WHERE event_id = $1
 	`, eventID)
 	return err
@@ -819,8 +832,8 @@ func (s *PostgresStorage) MarkOutboxEventSent(ctx context.Context, eventID strin
 func (s *PostgresStorage) MarkOutboxEventFailed(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET status = 'failed', updated_at = NOW()
+		UPDATE outbox_events
+		SET status = 'failed'
 		WHERE event_id = $1
 	`, eventID)
 	return err
@@ -830,20 +843,20 @@ func (s *PostgresStorage) MarkOutboxEventFailed(ctx context.Context, eventID str
 func (s *PostgresStorage) IncrementOutboxAttempts(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET retry_count = retry_count + 1, updated_at = NOW()
+		UPDATE outbox_events
+		SET retry_count = retry_count + 1
 		WHERE event_id = $1
 	`, eventID)
 	return err
 }
 
-// CleanupOldOutboxEvents removes old sent events.
+// CleanupOldOutboxEvents removes old published events.
 func (s *PostgresStorage) CleanupOldOutboxEvents(ctx context.Context, olderThan time.Duration) error {
 	conn := s.getConn(ctx)
 	threshold := time.Now().UTC().Add(-olderThan)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM workflow_outbox
-		WHERE status = 'sent' AND created_at < $1
+		DELETE FROM outbox_events
+		WHERE status = 'published' AND created_at < $1
 	`, threshold)
 	return err
 }
@@ -867,7 +880,7 @@ func (s *PostgresStorage) GetCompensations(ctx context.Context, instanceID strin
 		SELECT id, instance_id, activity_id, activity_name, args, created_at
 		FROM workflow_compensations
 		WHERE instance_id = $1
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -1110,7 +1123,7 @@ func (s *PostgresStorage) GetPendingChannelMessagesForInstance(ctx context.Conte
 		query = `
 			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
-			LEFT JOIN channel_message_claims c ON m.id = c.message_id
+			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
 			WHERE m.channel = $1 AND c.message_id IS NULL
 			ORDER BY m.id ASC
 			LIMIT 10
@@ -1495,13 +1508,13 @@ func (s *PostgresStorage) TryAcquireSystemLock(ctx context.Context, lockName, wo
 
 	// Try to insert or update if expired or same worker
 	result, err := conn.ExecContext(ctx, `
-		INSERT INTO system_locks (lock_name, locked_by, locked_at, expires_at)
+		INSERT INTO system_locks (lock_name, locked_by, locked_at, lock_expires_at)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (lock_name) DO UPDATE SET
 			locked_by = EXCLUDED.locked_by,
 			locked_at = EXCLUDED.locked_at,
-			expires_at = EXCLUDED.expires_at
-		WHERE system_locks.expires_at < NOW() OR system_locks.locked_by = EXCLUDED.locked_by
+			lock_expires_at = EXCLUDED.lock_expires_at
+		WHERE system_locks.lock_expires_at < NOW() OR system_locks.locked_by = EXCLUDED.locked_by
 	`, lockName, workerID, now, expiresAt)
 	if err != nil {
 		return false, err
@@ -1527,7 +1540,7 @@ func (s *PostgresStorage) ReleaseSystemLock(ctx context.Context, lockName, worke
 func (s *PostgresStorage) CleanupExpiredSystemLocks(ctx context.Context) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM system_locks WHERE expires_at < NOW()
+		DELETE FROM system_locks WHERE lock_expires_at < NOW()
 	`)
 	return err
 }
@@ -1597,28 +1610,28 @@ func (s *PostgresStorage) GetArchivedHistory(ctx context.Context, instanceID str
 }
 
 // CleanupInstanceSubscriptions removes all subscriptions for an instance.
+// Note: workflow_event_subscriptions was removed in schema unification;
+// events now use channel subscriptions.
 func (s *PostgresStorage) CleanupInstanceSubscriptions(ctx context.Context, instanceID string) error {
 	conn := s.getConn(ctx)
 
-	// Remove event subscriptions
-	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_event_subscriptions WHERE instance_id = $1`, instanceID)
-	if err != nil {
-		return err
-	}
-
 	// Remove timer subscriptions
-	_, err = conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = $1`, instanceID)
+	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = $1`, instanceID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete timer subscriptions: %w", err)
 	}
 
-	// Remove channel subscriptions
+	// Remove channel subscriptions (includes event subscriptions since WaitEvent uses channels)
 	_, err = conn.ExecContext(ctx, `DELETE FROM channel_subscriptions WHERE instance_id = $1`, instanceID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete channel subscriptions: %w", err)
 	}
 
 	// Remove group memberships
 	_, err = conn.ExecContext(ctx, `DELETE FROM workflow_group_memberships WHERE instance_id = $1`, instanceID)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to delete group memberships: %w", err)
+	}
+
+	return nil
 }

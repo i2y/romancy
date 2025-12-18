@@ -11,8 +11,6 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-
-	"github.com/i2y/romancy/internal/migrations"
 )
 
 // txKey is the context key for transactions.
@@ -32,7 +30,21 @@ type SQLiteStorage struct {
 
 // NewSQLiteStorage creates a new SQLite storage.
 func NewSQLiteStorage(dbPath string) (*SQLiteStorage, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	// For in-memory databases, use shared cache mode so all connections share the same database.
+	// This is required because database/sql uses connection pooling, and without shared cache,
+	// each connection to ":memory:" would get its own separate database.
+	connStr := dbPath
+	if dbPath == ":memory:" {
+		connStr = "file::memory:?cache=shared"
+	}
+	connStr += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+
+	// For shared memory, the connection string already has query params, so use & instead of ?
+	if dbPath == ":memory:" {
+		connStr = "file::memory:?cache=shared&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	}
+
+	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -43,10 +55,11 @@ func NewSQLiteStorage(dbPath string) (*SQLiteStorage, error) {
 	}, nil
 }
 
-// Initialize creates the database schema using migrations.
+// Initialize is deprecated. Use dbmate for migrations:
+// dbmate -d schema/db/migrations/sqlite up
 func (s *SQLiteStorage) Initialize(ctx context.Context) error {
-	migrator := migrations.NewMigrator(s.db, migrations.DriverSQLite)
-	return migrator.Up()
+	slog.Warn("Initialize() is deprecated. Use dbmate for migrations: dbmate -d schema/db/migrations/sqlite up")
+	return nil
 }
 
 // DB returns the underlying database connection.
@@ -57,6 +70,42 @@ func (s *SQLiteStorage) DB() *sql.DB {
 // Close closes the database connection.
 func (s *SQLiteStorage) Close() error {
 	return s.db.Close()
+}
+
+// parseSQLiteTime parses a SQLite datetime TEXT value into time.Time.
+// Handles both "2006-01-02 15:04:05" and "2006-01-02T15:04:05Z" formats.
+func parseSQLiteTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	// Try SQLite format first
+	t, err := time.Parse("2006-01-02 15:04:05", s)
+	if err == nil {
+		return t, nil
+	}
+	// Try RFC3339 format
+	t, err = time.Parse(time.RFC3339, s)
+	if err == nil {
+		return t, nil
+	}
+	// Try RFC3339 without timezone
+	t, err = time.Parse("2006-01-02T15:04:05", s)
+	if err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("cannot parse time: %s", s)
+}
+
+// parseSQLiteTimeNullable parses an optional SQLite datetime TEXT value.
+func parseSQLiteTimeNullable(s sql.NullString) (*time.Time, error) {
+	if !s.Valid || s.String == "" {
+		return nil, nil
+	}
+	t, err := parseSQLiteTime(s.String)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // getConn returns the appropriate database handle based on context (internal use).
@@ -151,12 +200,23 @@ func (s *SQLiteStorage) CreateInstance(ctx context.Context, instance *WorkflowIn
 	if framework == "" {
 		framework = "go" // Default framework
 	}
+
+	// Ensure workflow definition exists (required by foreign key constraint)
+	// Uses INSERT OR IGNORE for idempotency
 	_, err := conn.ExecContext(ctx, `
+		INSERT OR IGNORE INTO workflow_definitions (workflow_name, source_hash, source_code)
+		VALUES (?, ?, ?)
+	`, instance.WorkflowName, instance.SourceHash, "")
+	if err != nil {
+		return fmt.Errorf("failed to ensure workflow definition: %w", err)
+	}
+
+	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
-			instance_id, workflow_name, framework, status, input_data, source_code, source_hash, owner_service, started_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			instance_id, workflow_name, framework, status, input_data, source_hash, owner_service, started_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, instance.InstanceID, instance.WorkflowName, framework, instance.Status,
-		string(instance.InputData), instance.SourceCode, instance.SourceHash, instance.OwnerService,
+		string(instance.InputData), instance.SourceHash, instance.OwnerService,
 		instance.StartedAt.UTC().Format("2006-01-02 15:04:05"),
 		instance.UpdatedAt.UTC().Format("2006-01-02 15:04:05"))
 	return err
@@ -167,14 +227,14 @@ func (s *SQLiteStorage) GetInstance(ctx context.Context, instanceID string) (*Wo
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
 		SELECT instance_id, workflow_name, framework, status, input_data, output_data,
-			   current_activity_id, source_code, source_hash, owner_service,
+			   current_activity_id, source_hash, owner_service,
 			   locked_by, locked_at, lock_timeout_seconds, lock_expires_at,
 			   started_at, updated_at
 		FROM workflow_instances WHERE instance_id = ?
 	`, instanceID)
 
 	var inst WorkflowInstance
-	var inputData, outputData, framework, activityID, sourceCode, sourceHash, ownerService sql.NullString
+	var inputData, outputData, framework, activityID, sourceHash, ownerService sql.NullString
 	var lockedBy sql.NullString
 	var lockedAt, lockExpiresAt sql.NullString // SQLite stores datetime as TEXT
 	var startedAt, updatedAt sql.NullString    // SQLite stores datetime as TEXT
@@ -182,7 +242,7 @@ func (s *SQLiteStorage) GetInstance(ctx context.Context, instanceID string) (*Wo
 
 	err := row.Scan(
 		&inst.InstanceID, &inst.WorkflowName, &framework, &inst.Status,
-		&inputData, &outputData, &activityID, &sourceCode, &sourceHash, &ownerService,
+		&inputData, &outputData, &activityID, &sourceHash, &ownerService,
 		&lockedBy, &lockedAt, &lockTimeout, &lockExpiresAt,
 		&startedAt, &updatedAt,
 	)
@@ -204,9 +264,6 @@ func (s *SQLiteStorage) GetInstance(ctx context.Context, instanceID string) (*Wo
 	}
 	if activityID.Valid {
 		inst.CurrentActivityID = activityID.String
-	}
-	if sourceCode.Valid {
-		inst.SourceCode = sourceCode.String
 	}
 	if sourceHash.Valid {
 		inst.SourceHash = sourceHash.String
@@ -595,10 +652,12 @@ func (s *SQLiteStorage) GetHistoryPaginated(ctx context.Context, instanceID stri
 		var h HistoryEvent
 		var eventData sql.NullString
 		var eventDataBinary []byte
+		var createdAtStr string
 
-		if err := rows.Scan(&h.ID, &h.InstanceID, &h.ActivityID, &h.EventType, &eventData, &eventDataBinary, &h.DataType, &h.CreatedAt); err != nil {
+		if err := rows.Scan(&h.ID, &h.InstanceID, &h.ActivityID, &h.EventType, &eventData, &eventDataBinary, &h.DataType, &createdAtStr); err != nil {
 			return nil, false, err
 		}
+		h.CreatedAt, _ = parseSQLiteTime(createdAtStr)
 		if eventData.Valid {
 			h.EventData = []byte(eventData.String)
 		}
@@ -635,10 +694,10 @@ func (s *SQLiteStorage) RegisterTimerSubscription(ctx context.Context, sub *Time
 	conn := s.getConn(ctx)
 	expiresStr := sub.ExpiresAt.UTC().Format("2006-01-02 15:04:05")
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, step)
+		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT (instance_id, timer_id) DO NOTHING
-	`, sub.InstanceID, sub.TimerID, expiresStr, sub.Step)
+	`, sub.InstanceID, sub.TimerID, expiresStr, sub.ActivityID)
 	return err
 }
 
@@ -664,10 +723,10 @@ func (s *SQLiteStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Cont
 
 	// Register timer
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, step)
+		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT (instance_id, timer_id) DO NOTHING
-	`, sub.InstanceID, sub.TimerID, expiresStr, sub.Step)
+	`, sub.InstanceID, sub.TimerID, expiresStr, sub.ActivityID)
 	if err != nil {
 		return err
 	}
@@ -718,7 +777,7 @@ func (s *SQLiteStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Ti
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, timer_id, expires_at, step, created_at
+		SELECT id, instance_id, timer_id, expires_at, activity_id, created_at
 		FROM workflow_timer_subscriptions
 		WHERE datetime(expires_at) <= datetime('now')
 		ORDER BY expires_at ASC
@@ -733,8 +792,12 @@ func (s *SQLiteStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Ti
 	for rows.Next() {
 		var t TimerSubscription
 		var expiresAt, createdAt sql.NullString // SQLite stores datetime as TEXT
-		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &expiresAt, &t.Step, &createdAt); err != nil {
+		var activityID sql.NullString
+		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &expiresAt, &activityID, &createdAt); err != nil {
 			return nil, err
+		}
+		if activityID.Valid {
+			t.ActivityID = activityID.String
 		}
 		if expiresAt.Valid {
 			if parsed, err := time.Parse("2006-01-02 15:04:05", expiresAt.String); err == nil {
@@ -757,7 +820,7 @@ func (s *SQLiteStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Ti
 func (s *SQLiteStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_outbox (event_id, event_type, event_source, event_data, data_type, content_type, status)
+		INSERT INTO outbox_events (event_id, event_type, event_source, event_data, data_type, content_type, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, event.EventID, event.EventType, event.EventSource, string(event.EventData), event.DataType, event.ContentType, event.Status)
 	return err
@@ -767,8 +830,8 @@ func (s *SQLiteStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) 
 func (s *SQLiteStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
-		FROM workflow_outbox
+		SELECT event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
+		FROM outbox_events
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
 		LIMIT ?
@@ -782,10 +845,12 @@ func (s *SQLiteStorage) GetPendingOutboxEvents(ctx context.Context, limit int) (
 	for rows.Next() {
 		var e OutboxEvent
 		var eventData sql.NullString
+		var createdAtStr string
 
-		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &createdAtStr); err != nil {
 			return nil, err
 		}
+		e.CreatedAt, _ = parseSQLiteTime(createdAtStr)
 		if eventData.Valid {
 			e.EventData = []byte(eventData.String)
 		}
@@ -794,12 +859,12 @@ func (s *SQLiteStorage) GetPendingOutboxEvents(ctx context.Context, limit int) (
 	return events, rows.Err()
 }
 
-// MarkOutboxEventSent marks an outbox event as sent.
+// MarkOutboxEventSent marks an outbox event as published.
 func (s *SQLiteStorage) MarkOutboxEventSent(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET status = 'sent', updated_at = datetime('now')
+		UPDATE outbox_events
+		SET status = 'published', published_at = datetime('now')
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -809,8 +874,8 @@ func (s *SQLiteStorage) MarkOutboxEventSent(ctx context.Context, eventID string)
 func (s *SQLiteStorage) MarkOutboxEventFailed(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET status = 'failed', updated_at = datetime('now')
+		UPDATE outbox_events
+		SET status = 'failed'
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -820,20 +885,20 @@ func (s *SQLiteStorage) MarkOutboxEventFailed(ctx context.Context, eventID strin
 func (s *SQLiteStorage) IncrementOutboxAttempts(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET retry_count = retry_count + 1, updated_at = datetime('now')
+		UPDATE outbox_events
+		SET retry_count = retry_count + 1
 		WHERE event_id = ?
 	`, eventID)
 	return err
 }
 
-// CleanupOldOutboxEvents removes old sent events.
+// CleanupOldOutboxEvents removes old published events.
 func (s *SQLiteStorage) CleanupOldOutboxEvents(ctx context.Context, olderThan time.Duration) error {
 	conn := s.getConn(ctx)
 	threshold := time.Now().UTC().Add(-olderThan).Format("2006-01-02 15:04:05")
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM workflow_outbox
-		WHERE status = 'sent' AND datetime(created_at) < datetime(?)
+		DELETE FROM outbox_events
+		WHERE status = 'published' AND datetime(created_at) < datetime(?)
 	`, threshold)
 	return err
 }
@@ -864,7 +929,7 @@ func (s *SQLiteStorage) GetCompensations(ctx context.Context, instanceID string)
 		SELECT id, instance_id, activity_id, activity_name, args, created_at
 		FROM workflow_compensations
 		WHERE instance_id = ?
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -875,9 +940,11 @@ func (s *SQLiteStorage) GetCompensations(ctx context.Context, instanceID string)
 	for rows.Next() {
 		var c CompensationEntry
 		var args sql.NullString
-		if err := rows.Scan(&c.ID, &c.InstanceID, &c.ActivityID, &c.ActivityName, &args, &c.CreatedAt); err != nil {
+		var createdAtStr string
+		if err := rows.Scan(&c.ID, &c.InstanceID, &c.ActivityID, &c.ActivityName, &args, &createdAtStr); err != nil {
 			return nil, err
 		}
+		c.CreatedAt, _ = parseSQLiteTime(createdAtStr)
 		if args.Valid {
 			c.Args = []byte(args.String)
 		}
@@ -1115,7 +1182,7 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 		query = `
 			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
-			LEFT JOIN channel_message_claims c ON m.id = c.message_id
+			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
 			WHERE m.channel = ? AND c.message_id IS NULL
 			ORDER BY m.id ASC
 			LIMIT 10
@@ -1515,13 +1582,13 @@ func (s *SQLiteStorage) TryAcquireSystemLock(ctx context.Context, lockName, work
 
 	// Try to insert or update if expired or same worker
 	result, err := conn.ExecContext(ctx, `
-		INSERT INTO system_locks (lock_name, locked_by, locked_at, expires_at)
+		INSERT INTO system_locks (lock_name, locked_by, locked_at, lock_expires_at)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT (lock_name) DO UPDATE SET
 			locked_by = excluded.locked_by,
 			locked_at = excluded.locked_at,
-			expires_at = excluded.expires_at
-		WHERE datetime(system_locks.expires_at) < datetime('now') OR system_locks.locked_by = excluded.locked_by
+			lock_expires_at = excluded.lock_expires_at
+		WHERE datetime(system_locks.lock_expires_at) < datetime('now') OR system_locks.locked_by = excluded.locked_by
 	`, lockName, workerID, nowStr, expiresStr)
 	if err != nil {
 		return false, err
@@ -1547,7 +1614,7 @@ func (s *SQLiteStorage) ReleaseSystemLock(ctx context.Context, lockName, workerI
 func (s *SQLiteStorage) CleanupExpiredSystemLocks(ctx context.Context) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM system_locks WHERE datetime(expires_at) < datetime('now')
+		DELETE FROM system_locks WHERE datetime(lock_expires_at) < datetime('now')
 	`)
 	return err
 }
@@ -1597,8 +1664,8 @@ func (s *SQLiteStorage) GetArchivedHistory(ctx context.Context, instanceID strin
 		var e ArchivedHistoryEvent
 		var eventData sql.NullString
 		var originalID sql.NullInt64
-		var originalCreatedAt sql.NullTime
-		err := rows.Scan(&e.ID, &originalID, &e.InstanceID, &e.ActivityID, &e.EventType, &eventData, &e.EventDataBinary, &e.DataType, &originalCreatedAt, &e.ArchivedAt)
+		var originalCreatedAtStr, archivedAtStr sql.NullString
+		err := rows.Scan(&e.ID, &originalID, &e.InstanceID, &e.ActivityID, &e.EventType, &eventData, &e.EventDataBinary, &e.DataType, &originalCreatedAtStr, &archivedAtStr)
 		if err != nil {
 			return nil, err
 		}
@@ -1608,8 +1675,11 @@ func (s *SQLiteStorage) GetArchivedHistory(ctx context.Context, instanceID strin
 		if eventData.Valid {
 			e.EventData = []byte(eventData.String)
 		}
-		if originalCreatedAt.Valid {
-			e.OriginalCreatedAt = originalCreatedAt.Time
+		if originalCreatedAtStr.Valid {
+			e.OriginalCreatedAt, _ = parseSQLiteTime(originalCreatedAtStr.String)
+		}
+		if archivedAtStr.Valid {
+			e.ArchivedAt, _ = parseSQLiteTime(archivedAtStr.String)
 		}
 		events = append(events, &e)
 	}
@@ -1617,28 +1687,28 @@ func (s *SQLiteStorage) GetArchivedHistory(ctx context.Context, instanceID strin
 }
 
 // CleanupInstanceSubscriptions removes all subscriptions for an instance.
+// Note: workflow_event_subscriptions was removed in schema unification;
+// events now use channel subscriptions.
 func (s *SQLiteStorage) CleanupInstanceSubscriptions(ctx context.Context, instanceID string) error {
 	conn := s.getConn(ctx)
 
-	// Remove event subscriptions
-	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_event_subscriptions WHERE instance_id = ?`, instanceID)
-	if err != nil {
-		return err
-	}
-
 	// Remove timer subscriptions
-	_, err = conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = ?`, instanceID)
+	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = ?`, instanceID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete timer subscriptions: %w", err)
 	}
 
-	// Remove channel subscriptions
+	// Remove channel subscriptions (includes event subscriptions since WaitEvent uses channels)
 	_, err = conn.ExecContext(ctx, `DELETE FROM channel_subscriptions WHERE instance_id = ?`, instanceID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete channel subscriptions: %w", err)
 	}
 
 	// Remove group memberships
 	_, err = conn.ExecContext(ctx, `DELETE FROM workflow_group_memberships WHERE instance_id = ?`, instanceID)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to delete group memberships: %w", err)
+	}
+
+	return nil
 }

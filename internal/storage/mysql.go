@@ -12,8 +12,6 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-
-	"github.com/i2y/romancy/internal/migrations"
 )
 
 // MySQLStorage implements the Storage interface using MySQL 8.0+.
@@ -111,10 +109,11 @@ func convertToMySQLDSN(connStr string) (string, error) {
 	return dsn, nil
 }
 
-// Initialize creates the database schema using migrations.
+// Initialize is deprecated. Use dbmate for migrations:
+// dbmate -d schema/db/migrations/mysql up
 func (s *MySQLStorage) Initialize(ctx context.Context) error {
-	migrator := migrations.NewMigrator(s.db, migrations.DriverMySQL)
-	return migrator.Up()
+	slog.Warn("Initialize() is deprecated. Use dbmate for migrations: dbmate -d schema/db/migrations/mysql up")
+	return nil
 }
 
 // DB returns the underlying database connection.
@@ -207,12 +206,23 @@ func (s *MySQLStorage) RegisterPostCommitCallback(ctx context.Context, cb func()
 // CreateInstance creates a new workflow instance.
 func (s *MySQLStorage) CreateInstance(ctx context.Context, instance *WorkflowInstance) error {
 	conn := s.getConn(ctx)
+
+	// Ensure workflow definition exists (required by foreign key constraint)
+	// Uses INSERT IGNORE for idempotency
 	_, err := conn.ExecContext(ctx, `
+		INSERT IGNORE INTO workflow_definitions (workflow_name, source_hash, source_code)
+		VALUES (?, ?, ?)
+	`, instance.WorkflowName, instance.SourceHash, "")
+	if err != nil {
+		return fmt.Errorf("failed to ensure workflow definition: %w", err)
+	}
+
+	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
-			instance_id, workflow_name, status, input_data, source_code, source_hash, owner_service, framework, started_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			instance_id, workflow_name, status, input_data, source_hash, owner_service, framework, started_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
-		string(instance.InputData), instance.SourceCode, instance.SourceHash, instance.OwnerService, "go",
+		string(instance.InputData), instance.SourceHash, instance.OwnerService, "go",
 		instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
 	return err
 }
@@ -222,21 +232,21 @@ func (s *MySQLStorage) GetInstance(ctx context.Context, instanceID string) (*Wor
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
 		SELECT instance_id, workflow_name, status, input_data, output_data,
-			   current_activity_id, source_code, source_hash, owner_service, framework,
+			   current_activity_id, source_hash, owner_service, framework,
 			   locked_by, locked_at, lock_timeout_seconds, lock_expires_at,
 			   started_at, updated_at
 		FROM workflow_instances WHERE instance_id = ?
 	`, instanceID)
 
 	var inst WorkflowInstance
-	var inputData, outputData, activityID, sourceCode, sourceHash, ownerService, framework sql.NullString
+	var inputData, outputData, activityID, sourceHash, ownerService, framework sql.NullString
 	var lockedBy sql.NullString
 	var lockedAt, lockExpiresAt sql.NullTime
 	var lockTimeout sql.NullInt64
 
 	err := row.Scan(
 		&inst.InstanceID, &inst.WorkflowName, &inst.Status,
-		&inputData, &outputData, &activityID, &sourceCode, &sourceHash, &ownerService, &framework,
+		&inputData, &outputData, &activityID, &sourceHash, &ownerService, &framework,
 		&lockedBy, &lockedAt, &lockTimeout, &lockExpiresAt,
 		&inst.StartedAt, &inst.UpdatedAt,
 	)
@@ -255,9 +265,6 @@ func (s *MySQLStorage) GetInstance(ctx context.Context, instanceID string) (*Wor
 	}
 	if activityID.Valid {
 		inst.CurrentActivityID = activityID.String
-	}
-	if sourceCode.Valid {
-		inst.SourceCode = sourceCode.String
 	}
 	if sourceHash.Valid {
 		inst.SourceHash = sourceHash.String
@@ -656,9 +663,9 @@ func (s *MySQLStorage) RegisterTimerSubscription(ctx context.Context, sub *Timer
 	conn := s.getConn(ctx)
 	// MySQL uses INSERT IGNORE instead of ON CONFLICT DO NOTHING
 	_, err := conn.ExecContext(ctx, `
-		INSERT IGNORE INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, step)
+		INSERT IGNORE INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
 		VALUES (?, ?, ?, ?)
-	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.Step)
+	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.ActivityID)
 	return err
 }
 
@@ -683,9 +690,9 @@ func (s *MySQLStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Conte
 
 	// Register timer
 	_, err := conn.ExecContext(ctx, `
-		INSERT IGNORE INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, step)
+		INSERT IGNORE INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
 		VALUES (?, ?, ?, ?)
-	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.Step)
+	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.ActivityID)
 	if err != nil {
 		return err
 	}
@@ -736,7 +743,7 @@ func (s *MySQLStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Tim
 	}
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, instance_id, timer_id, expires_at, step, created_at
+		SELECT id, instance_id, timer_id, expires_at, activity_id, created_at
 		FROM workflow_timer_subscriptions
 		WHERE expires_at <= NOW()
 		ORDER BY expires_at ASC
@@ -750,8 +757,12 @@ func (s *MySQLStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Tim
 	var timers []*TimerSubscription
 	for rows.Next() {
 		var t TimerSubscription
-		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &t.ExpiresAt, &t.Step, &t.CreatedAt); err != nil {
+		var activityID sql.NullString
+		if err := rows.Scan(&t.ID, &t.InstanceID, &t.TimerID, &t.ExpiresAt, &activityID, &t.CreatedAt); err != nil {
 			return nil, err
+		}
+		if activityID.Valid {
+			t.ActivityID = activityID.String
 		}
 		timers = append(timers, &t)
 	}
@@ -764,7 +775,7 @@ func (s *MySQLStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*Tim
 func (s *MySQLStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_outbox (event_id, event_type, event_source, event_data, data_type, content_type, status)
+		INSERT INTO outbox_events (event_id, event_type, event_source, event_data, data_type, content_type, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, event.EventID, event.EventType, event.EventSource, string(event.EventData), event.DataType, event.ContentType, event.Status)
 	return err
@@ -775,8 +786,8 @@ func (s *MySQLStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) e
 func (s *MySQLStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
-		FROM workflow_outbox
+		SELECT event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
+		FROM outbox_events
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
 		LIMIT ?
@@ -792,7 +803,7 @@ func (s *MySQLStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([
 		var e OutboxEvent
 		var eventData sql.NullString
 
-		if err := rows.Scan(&e.ID, &e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		if eventData.Valid {
@@ -803,12 +814,12 @@ func (s *MySQLStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([
 	return events, rows.Err()
 }
 
-// MarkOutboxEventSent marks an outbox event as sent.
+// MarkOutboxEventSent marks an outbox event as published.
 func (s *MySQLStorage) MarkOutboxEventSent(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET status = 'sent', updated_at = NOW()
+		UPDATE outbox_events
+		SET status = 'published', published_at = NOW()
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -818,8 +829,8 @@ func (s *MySQLStorage) MarkOutboxEventSent(ctx context.Context, eventID string) 
 func (s *MySQLStorage) MarkOutboxEventFailed(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET status = 'failed', updated_at = NOW()
+		UPDATE outbox_events
+		SET status = 'failed'
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -829,20 +840,20 @@ func (s *MySQLStorage) MarkOutboxEventFailed(ctx context.Context, eventID string
 func (s *MySQLStorage) IncrementOutboxAttempts(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		UPDATE workflow_outbox
-		SET retry_count = retry_count + 1, updated_at = NOW()
+		UPDATE outbox_events
+		SET retry_count = retry_count + 1
 		WHERE event_id = ?
 	`, eventID)
 	return err
 }
 
-// CleanupOldOutboxEvents removes old sent events.
+// CleanupOldOutboxEvents removes old published events.
 func (s *MySQLStorage) CleanupOldOutboxEvents(ctx context.Context, olderThan time.Duration) error {
 	conn := s.getConn(ctx)
 	threshold := time.Now().UTC().Add(-olderThan)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM workflow_outbox
-		WHERE status = 'sent' AND created_at < ?
+		DELETE FROM outbox_events
+		WHERE status = 'published' AND created_at < ?
 	`, threshold)
 	return err
 }
@@ -866,7 +877,7 @@ func (s *MySQLStorage) GetCompensations(ctx context.Context, instanceID string) 
 		SELECT id, instance_id, activity_id, activity_name, args, created_at
 		FROM workflow_compensations
 		WHERE instance_id = ?
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -904,9 +915,10 @@ func (s *MySQLStorage) PublishToChannel(ctx context.Context, channelName string,
 	}
 
 	// MySQL doesn't support RETURNING, use LastInsertId instead
+	// Must include message_id (required NOT NULL field) and data_type
 	result, err := conn.ExecContext(ctx, `
-		INSERT INTO channel_messages (channel, data, metadata)
-		VALUES (?, ?, ?)
+		INSERT INTO channel_messages (channel, data, metadata, message_id, data_type)
+		VALUES (?, ?, ?, UUID(), 'json')
 	`, channelName, dataStr, metadataStr)
 	if err != nil {
 		return 0, err
@@ -1098,7 +1110,7 @@ func (s *MySQLStorage) GetPendingChannelMessagesForInstance(ctx context.Context,
 		query = `
 			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
-			LEFT JOIN channel_message_claims c ON m.id = c.message_id
+			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
 			WHERE m.channel = ? AND c.message_id IS NULL
 			ORDER BY m.id ASC
 			LIMIT 10
@@ -1472,12 +1484,12 @@ func (s *MySQLStorage) TryAcquireSystemLock(ctx context.Context, lockName, worke
 	// The INSERT will succeed if the lock doesn't exist
 	// The UPDATE will only happen if the lock is expired or owned by the same worker
 	result, err := conn.ExecContext(ctx, `
-		INSERT INTO system_locks (lock_name, locked_by, locked_at, expires_at)
+		INSERT INTO system_locks (lock_name, locked_by, locked_at, lock_expires_at)
 		VALUES (?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
-			locked_by = IF(expires_at < NOW() OR locked_by = VALUES(locked_by), VALUES(locked_by), locked_by),
-			locked_at = IF(expires_at < NOW() OR locked_by = VALUES(locked_by), VALUES(locked_at), locked_at),
-			expires_at = IF(system_locks.expires_at < NOW() OR locked_by = VALUES(locked_by), VALUES(expires_at), expires_at)
+			locked_by = IF(lock_expires_at < NOW() OR locked_by = VALUES(locked_by), VALUES(locked_by), locked_by),
+			locked_at = IF(lock_expires_at < NOW() OR locked_by = VALUES(locked_by), VALUES(locked_at), locked_at),
+			lock_expires_at = IF(system_locks.lock_expires_at < NOW() OR locked_by = VALUES(locked_by), VALUES(lock_expires_at), lock_expires_at)
 	`, lockName, workerID, now, expiresAt)
 	if err != nil {
 		return false, err
@@ -1510,7 +1522,7 @@ func (s *MySQLStorage) ReleaseSystemLock(ctx context.Context, lockName, workerID
 func (s *MySQLStorage) CleanupExpiredSystemLocks(ctx context.Context) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
-		DELETE FROM system_locks WHERE expires_at < NOW()
+		DELETE FROM system_locks WHERE lock_expires_at < NOW()
 	`)
 	return err
 }
@@ -1580,28 +1592,28 @@ func (s *MySQLStorage) GetArchivedHistory(ctx context.Context, instanceID string
 }
 
 // CleanupInstanceSubscriptions removes all subscriptions for an instance.
+// Note: workflow_event_subscriptions was removed in schema unification;
+// events now use channel subscriptions.
 func (s *MySQLStorage) CleanupInstanceSubscriptions(ctx context.Context, instanceID string) error {
 	conn := s.getConn(ctx)
 
-	// Remove event subscriptions
-	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_event_subscriptions WHERE instance_id = ?`, instanceID)
-	if err != nil {
-		return err
-	}
-
 	// Remove timer subscriptions
-	_, err = conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = ?`, instanceID)
+	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = ?`, instanceID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete timer subscriptions: %w", err)
 	}
 
-	// Remove channel subscriptions
+	// Remove channel subscriptions (includes event subscriptions since WaitEvent uses channels)
 	_, err = conn.ExecContext(ctx, `DELETE FROM channel_subscriptions WHERE instance_id = ?`, instanceID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete channel subscriptions: %w", err)
 	}
 
 	// Remove group memberships
 	_, err = conn.ExecContext(ctx, `DELETE FROM workflow_group_memberships WHERE instance_id = ?`, instanceID)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to delete group memberships: %w", err)
+	}
+
+	return nil
 }
