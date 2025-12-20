@@ -178,9 +178,75 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 	// Check if result is cached (replay)
 	// First try raw JSON to avoid re-serialization
 	if rawJSON, ok := ctx.GetCachedResultRaw(activityID); ok && len(rawJSON) > 0 {
+		// Try Go format first (ReceivedMessage with channel_name, created_at)
 		var msg ReceivedMessage[T]
-		if err := json.Unmarshal(rawJSON, &msg); err == nil {
+		if err := json.Unmarshal(rawJSON, &msg); err == nil && msg.ChannelName != "" {
 			return &msg, nil
+		}
+
+		// Try Python/cross-language format (channel, published_at)
+		var pythonFormat struct {
+			ID          any             `json:"id"`
+			Channel     string          `json:"channel"`
+			ChannelName string          `json:"channel_name"`
+			Data        json.RawMessage `json:"data"`
+			Metadata    map[string]any  `json:"metadata"`
+			PublishedAt string          `json:"published_at"`
+			CreatedAt   *time.Time      `json:"created_at"`
+		}
+		if err := json.Unmarshal(rawJSON, &pythonFormat); err == nil {
+			// Resolve channel name (prefer channel_name, fallback to channel)
+			resolvedChannel := pythonFormat.ChannelName
+			if resolvedChannel == "" {
+				resolvedChannel = pythonFormat.Channel
+			}
+
+			// Unmarshal data to type T
+			var data T
+			if len(pythonFormat.Data) > 0 {
+				if err := json.Unmarshal(pythonFormat.Data, &data); err != nil {
+					return nil, fmt.Errorf("failed to deserialize cached message data: %w", err)
+				}
+			}
+
+			// Resolve time (prefer created_at, fallback to published_at)
+			var createdAt time.Time
+			if pythonFormat.CreatedAt != nil {
+				createdAt = *pythonFormat.CreatedAt
+			} else if pythonFormat.PublishedAt != "" {
+				// Try multiple ISO 8601 formats
+				for _, layout := range []string{
+					time.RFC3339,
+					time.RFC3339Nano,
+					"2006-01-02T15:04:05.999999",
+					"2006-01-02T15:04:05",
+				} {
+					if t, err := time.Parse(layout, pythonFormat.PublishedAt); err == nil {
+						createdAt = t
+						break
+					}
+				}
+			}
+
+			// Resolve ID (handle both int64 and string UUID)
+			var id int64
+			switch v := pythonFormat.ID.(type) {
+			case float64:
+				id = int64(v)
+			case int64:
+				id = v
+			case string:
+				// UUID string - use 0 as fallback (ID is mostly for logging)
+				id = 0
+			}
+
+			return &ReceivedMessage[T]{
+				ID:          id,
+				ChannelName: resolvedChannel,
+				Data:        data,
+				Metadata:    pythonFormat.Metadata,
+				CreatedAt:   createdAt,
+			}, nil
 		}
 	}
 	// Also check GetCachedResult which handles cached errors

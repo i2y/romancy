@@ -1321,8 +1321,8 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	// Wrap the message in ReceivedMessage format so Receive can unmarshal it correctly
 	wrappedData := map[string]any{
 		"id":           message.ID,
-		"channel":      channelName,
-		"published_at": message.PublishedAt,
+		"channel_name": channelName,
+		"created_at":   message.PublishedAt,
 	}
 	// The message.Data contains the actual data - unmarshal and re-wrap
 	var msgData any
