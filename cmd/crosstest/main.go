@@ -7,6 +7,8 @@
 //
 //	# Publisher mode (send a test message)
 //	go run ./cmd/crosstest --db=/tmp/cross_test.db --channel=test --mode=publisher --message='{"hello": "world"}'
+//
+//nolint:gocritic // exitAfterDefer is acceptable for CLI tools using log.Fatalf
 package main
 
 import (
