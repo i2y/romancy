@@ -1264,6 +1264,7 @@ func (s *SQLiteStorage) GetDeliveryCursor(ctx context.Context, instanceID, chann
 
 // GetChannelSubscribersWaiting finds subscribers waiting for messages on a channel.
 // Waiting state is determined by activity_id IS NOT NULL.
+// Returns all waiting subscribers regardless of framework - delivery is handled by Lock-First pattern.
 func (s *SQLiteStorage) GetChannelSubscribersWaiting(ctx context.Context, channelName string) ([]*ChannelSubscription, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
@@ -1399,7 +1400,7 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 
 	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)
-		VALUES (?, ?, 'activity_completed', ?, 'json')
+		VALUES (?, ?, 'ChannelMessageReceived', ?, 'json')
 	`, instanceID, historyActivityID, string(wrappedJSON))
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)

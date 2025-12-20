@@ -1199,6 +1199,7 @@ func (s *MySQLStorage) GetDeliveryCursor(ctx context.Context, instanceID, channe
 }
 
 // GetChannelSubscribersWaiting finds subscribers waiting for messages on a channel.
+// Returns all waiting subscribers regardless of framework - delivery is handled by Lock-First pattern.
 func (s *MySQLStorage) GetChannelSubscribersWaiting(ctx context.Context, channelName string) ([]*ChannelSubscription, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
@@ -1322,7 +1323,7 @@ func (s *MySQLStorage) DeliverChannelMessageWithLock(
 
 	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)
-		VALUES (?, ?, 'activity_completed', ?, 'json')
+		VALUES (?, ?, 'ChannelMessageReceived', ?, 'json')
 	`, instanceID, activityID, string(wrappedJSON))
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)

@@ -40,7 +40,7 @@ func (m *mockStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]
 func (m *mockStorage) MarkOutboxEventSent(ctx context.Context, eventID string) error {
 	for _, e := range m.events {
 		if e.EventID == eventID {
-			e.Status = "sent"
+			e.Status = "published"
 			break
 		}
 	}
@@ -327,9 +327,9 @@ func TestRelayerWithCustomSender(t *testing.T) {
 		t.Errorf("expected sendCount=1, got %d", sendCount)
 	}
 
-	// Check event was marked as sent
-	if s.events[0].Status != "sent" {
-		t.Errorf("expected status=sent, got %s", s.events[0].Status)
+	// Check event was marked as published
+	if s.events[0].Status != "published" {
+		t.Errorf("expected status=published, got %s", s.events[0].Status)
 	}
 }
 

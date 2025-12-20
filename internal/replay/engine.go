@@ -236,7 +236,8 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 		historyCount++
 
 		switch event.EventType {
-		case storage.HistoryActivityCompleted:
+		case storage.HistoryActivityCompleted, storage.HistoryChannelMessageReceived:
+			// Both activity results and channel messages are cached for replay
 			var result any
 			if event.DataType == "json" && len(event.EventData) > 0 {
 				if err := json.Unmarshal(event.EventData, &result); err == nil {
@@ -247,7 +248,8 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 					}
 				}
 			}
-		case storage.HistoryActivityFailed:
+		case storage.HistoryActivityFailed, storage.HistoryMessageTimeout:
+			// Both activity failures and message timeouts are cached as errors
 			errMsg := ""
 			if len(event.EventData) > 0 {
 				_ = json.Unmarshal(event.EventData, &errMsg)

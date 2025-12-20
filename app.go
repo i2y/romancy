@@ -1612,7 +1612,7 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 	historyEvent := &storage.HistoryEvent{
 		InstanceID: sub.InstanceID,
 		ActivityID: activityID,
-		EventType:  storage.HistoryActivityFailed,
+		EventType:  storage.HistoryMessageTimeout,
 		EventData:  errJSON,
 		DataType:   "json",
 	}

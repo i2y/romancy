@@ -203,11 +203,10 @@ func TestActivityTransactionRollbackOnError(t *testing.T) {
 		t.Fatalf("Failed to get history: %v", err)
 	}
 
-	// Count activity-related events (activity_started, activity_completed, activity_failed)
+	// Count activity-related events (ActivityCompleted, ActivityFailed)
 	activityEvents := 0
 	for _, h := range history {
-		if h.EventType == storage.HistoryActivityStarted ||
-			h.EventType == storage.HistoryActivityCompleted ||
+		if h.EventType == storage.HistoryActivityCompleted ||
 			h.EventType == storage.HistoryActivityFailed {
 			activityEvents++
 		}

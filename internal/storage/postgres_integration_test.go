@@ -241,7 +241,7 @@ func TestPostgresIntegration_HistoryOperations(t *testing.T) {
 	event := &HistoryEvent{
 		InstanceID: "test-history-1",
 		ActivityID: "activity:1",
-		EventType:  "activity_completed",
+		EventType:  HistoryActivityCompleted,
 		EventData:  []byte(`{"result": "ok"}`),
 		DataType:   "json",
 	}

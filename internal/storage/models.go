@@ -41,18 +41,33 @@ type WorkflowInstance struct {
 }
 
 // HistoryEventType represents the type of history event.
+// Values are unified with Edda (Python) for cross-language compatibility.
 type HistoryEventType string
 
 const (
-	HistoryActivityStarted      HistoryEventType = "activity_started"
-	HistoryActivityCompleted    HistoryEventType = "activity_completed"
-	HistoryActivityFailed       HistoryEventType = "activity_failed"
-	HistoryEventReceived        HistoryEventType = "event_received"
-	HistoryTimerFired           HistoryEventType = "timer_fired"
-	HistoryCompensationAdded    HistoryEventType = "compensation_added"
-	HistoryCompensationExecuted HistoryEventType = "compensation_executed"
-	HistoryCompensationFailed   HistoryEventType = "compensation_failed"
-	HistoryWorkflowFailed       HistoryEventType = "workflow_failed"
+	// Activity events
+	HistoryActivityCompleted HistoryEventType = "ActivityCompleted"
+	HistoryActivityFailed    HistoryEventType = "ActivityFailed"
+
+	// External event received (via WaitEvent)
+	HistoryEventReceived HistoryEventType = "EventReceived"
+
+	// Timer expired (via Sleep/SleepUntil)
+	HistoryTimerExpired HistoryEventType = "TimerExpired"
+
+	// Channel message received (via Receive)
+	HistoryChannelMessageReceived HistoryEventType = "ChannelMessageReceived"
+
+	// Message receive timeout
+	HistoryMessageTimeout HistoryEventType = "MessageTimeout"
+
+	// Compensation events
+	HistoryCompensationExecuted HistoryEventType = "CompensationExecuted"
+	HistoryCompensationFailed   HistoryEventType = "CompensationFailed"
+
+	// Workflow lifecycle events
+	HistoryWorkflowFailed    HistoryEventType = "WorkflowFailed"
+	HistoryWorkflowCancelled HistoryEventType = "WorkflowCancelled"
 )
 
 // HistoryEvent represents a single event in a workflow's execution history.
@@ -87,7 +102,7 @@ type OutboxEvent struct {
 	EventDataBinary []byte     `json:"event_data_binary"` // Binary payload (Edda compatibility)
 	DataType        string     `json:"data_type"`         // "json" or "binary"
 	ContentType     string     `json:"content_type"`      // e.g., "application/json"
-	Status          string     `json:"status"`            // "pending", "sent", "failed"
+	Status          string     `json:"status"`            // "pending", "processing", "published", "failed"
 	RetryCount      int        `json:"retry_count"`       // Number of retry attempts (unified with Edda)
 	LastError       string     `json:"last_error"`        // Last error message (Edda compatibility)
 	PublishedAt     *time.Time `json:"published_at"`      // When the event was published (Edda compatibility)
