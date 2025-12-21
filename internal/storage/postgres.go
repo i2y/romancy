@@ -1010,6 +1010,24 @@ func (s *PostgresStorage) GetChannelSubscription(ctx context.Context, instanceID
 	return &sub, nil
 }
 
+// GetChannelMode retrieves the mode for a channel (from any existing subscription).
+// Returns empty string if no subscriptions exist.
+func (s *PostgresStorage) GetChannelMode(ctx context.Context, channelName string) (ChannelMode, error) {
+	conn := s.getConn(ctx)
+	row := conn.QueryRowContext(ctx, `
+		SELECT mode FROM channel_subscriptions WHERE channel = $1 LIMIT 1
+	`, channelName)
+
+	var modeStr string
+	if err := row.Scan(&modeStr); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return ChannelMode(modeStr), nil
+}
+
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
 func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
 	conn := s.getConn(ctx)

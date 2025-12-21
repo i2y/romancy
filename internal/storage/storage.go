@@ -251,6 +251,10 @@ type ChannelManager interface {
 	// GetChannelSubscription retrieves a subscription for an instance and channel.
 	GetChannelSubscription(ctx context.Context, instanceID, channelName string) (*ChannelSubscription, error)
 
+	// GetChannelMode retrieves the mode for a channel (from any existing subscription).
+	// Returns empty string if no subscriptions exist.
+	GetChannelMode(ctx context.Context, channelName string) (ChannelMode, error)
+
 	// RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait
 	// and releases the workflow lock.
 	RegisterChannelReceiveAndReleaseLock(

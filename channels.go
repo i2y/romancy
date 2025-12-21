@@ -68,6 +68,9 @@ type ReceivedMessage[T any] struct {
 //
 // Subscriptions persist across workflow restarts and are automatically
 // cleaned up when the workflow completes.
+//
+// Once a channel has subscribers, its mode is locked. Attempting to subscribe
+// with a different mode will return a ChannelModeConflictError.
 func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error {
 	// Handle ModeDirect: convert to actual channel name and record for Receive
 	actualChannel := channelName
@@ -96,6 +99,19 @@ func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error
 	s := ctx.Storage()
 	if s == nil {
 		return fmt.Errorf("storage not available")
+	}
+
+	// Check for mode conflict
+	existingMode, err := s.GetChannelMode(ctx.Context(), actualChannel)
+	if err != nil {
+		return fmt.Errorf("failed to check channel mode: %w", err)
+	}
+	if existingMode != "" && existingMode != actualMode {
+		return &ChannelModeConflictError{
+			Channel:       channelName,
+			ExistingMode:  string(existingMode),
+			RequestedMode: string(mode),
+		}
 	}
 
 	if err := s.SubscribeToChannel(ctx.Context(), ctx.InstanceID(), actualChannel, actualMode); err != nil {

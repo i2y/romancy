@@ -171,6 +171,9 @@ func (m *mockStorage) UnsubscribeFromChannel(ctx context.Context, instanceID, ch
 func (m *mockStorage) GetChannelSubscription(ctx context.Context, instanceID, channelName string) (*storage.ChannelSubscription, error) {
 	return nil, nil
 }
+func (m *mockStorage) GetChannelMode(ctx context.Context, channelName string) (storage.ChannelMode, error) {
+	return "", nil
+}
 func (m *mockStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
 	return nil
 }

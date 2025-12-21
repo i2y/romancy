@@ -171,6 +171,18 @@ func (e *ChannelMessageTimeoutError) Error() string {
 // ErrChannelNotSubscribed indicates an operation on a channel without subscription.
 var ErrChannelNotSubscribed = errors.New("not subscribed to channel")
 
+// ChannelModeConflictError indicates subscribing with a different mode than the channel's established mode.
+type ChannelModeConflictError struct {
+	Channel       string
+	ExistingMode  string
+	RequestedMode string
+}
+
+func (e *ChannelModeConflictError) Error() string {
+	return fmt.Sprintf("channel %q is already configured as %q mode; cannot subscribe with %q mode",
+		e.Channel, e.ExistingMode, e.RequestedMode)
+}
+
 // ErrGroupNotJoined indicates an operation on a group without membership.
 var ErrGroupNotJoined = errors.New("not a member of group")
 
