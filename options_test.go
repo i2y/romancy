@@ -41,10 +41,6 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 10, cfg.maxConcurrentTimers)
 	assert.Equal(t, 10, cfg.maxConcurrentMessages)
 
-	// Singleton defaults
-	assert.True(t, cfg.singletonStaleLockCleanup)
-	assert.True(t, cfg.singletonChannelCleanup)
-
 	// Hooks default
 	assert.IsType(t, &hooks.NoOpHooks{}, cfg.hooks)
 
@@ -651,54 +647,6 @@ func TestWithMaxConcurrentMessages(t *testing.T) {
 	}
 }
 
-func TestWithSingletonStaleLockCleanup(t *testing.T) {
-	tests := []struct {
-		name    string
-		enabled bool
-	}{
-		{
-			name:    "enabled",
-			enabled: true,
-		},
-		{
-			name:    "disabled",
-			enabled: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := defaultConfig()
-			WithSingletonStaleLockCleanup(tt.enabled)(cfg)
-			assert.Equal(t, tt.enabled, cfg.singletonStaleLockCleanup)
-		})
-	}
-}
-
-func TestWithSingletonChannelCleanup(t *testing.T) {
-	tests := []struct {
-		name    string
-		enabled bool
-	}{
-		{
-			name:    "enabled",
-			enabled: true,
-		},
-		{
-			name:    "disabled",
-			enabled: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := defaultConfig()
-			WithSingletonChannelCleanup(tt.enabled)(cfg)
-			assert.Equal(t, tt.enabled, cfg.singletonChannelCleanup)
-		})
-	}
-}
-
 func TestWithShutdownTimeout(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -817,17 +765,6 @@ func TestOptionChaining(t *testing.T) {
 				assert.Equal(t, 20, cfg.maxConcurrentResumptions)
 				assert.Equal(t, 15, cfg.maxConcurrentTimers)
 				assert.Equal(t, 25, cfg.maxConcurrentMessages)
-			},
-		},
-		{
-			name: "singleton configuration",
-			options: []Option{
-				WithSingletonStaleLockCleanup(false),
-				WithSingletonChannelCleanup(false),
-			},
-			check: func(t *testing.T, cfg *appConfig) {
-				assert.False(t, cfg.singletonStaleLockCleanup)
-				assert.False(t, cfg.singletonChannelCleanup)
 			},
 		},
 		{

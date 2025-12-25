@@ -17,7 +17,6 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/i2y/romancy/hooks"
-	"github.com/i2y/romancy/internal/coordination"
 	"github.com/i2y/romancy/internal/migrations"
 	"github.com/i2y/romancy/internal/notify"
 	"github.com/i2y/romancy/internal/replay"
@@ -60,10 +59,6 @@ type App struct {
 	resumptionSem *semaphore.Weighted
 	timerSem      *semaphore.Weighted
 	messageSem    *semaphore.Weighted
-
-	// Singleton task runners (for distributed coordination)
-	staleLockRunner      *coordination.SingletonTaskRunner
-	channelCleanupRunner *coordination.SingletonTaskRunner
 
 	// NOTIFY wake event channels for adaptive backoff
 	resumeWakeEvent chan struct{}
@@ -123,22 +118,6 @@ func (a *App) Start(ctx context.Context) error {
 	// Initialize storage
 	if err := a.initStorage(); err != nil {
 		return fmt.Errorf("failed to initialize storage: %w", err)
-	}
-
-	// Initialize singleton task runners if enabled
-	if a.config.singletonStaleLockCleanup {
-		a.staleLockRunner = coordination.NewSingletonTaskRunner(
-			a.storage,
-			a.config.workerID,
-			coordination.DefaultSingletonConfig("stale_lock_cleanup"),
-		)
-	}
-	if a.config.singletonChannelCleanup {
-		a.channelCleanupRunner = coordination.NewSingletonTaskRunner(
-			a.storage,
-			a.config.workerID,
-			coordination.DefaultSingletonConfig("channel_cleanup"),
-		)
 	}
 
 	// Start background tasks

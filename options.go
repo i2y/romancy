@@ -50,10 +50,6 @@ type appConfig struct {
 	maxTimersPerBatch    int
 	maxMessagesPerBatch  int
 
-	// Singleton task configuration (deprecated, use leader election)
-	singletonStaleLockCleanup bool
-	singletonChannelCleanup   bool
-
 	// Leader election configuration
 	leaderHeartbeatInterval time.Duration
 	leaderLeaseDuration     time.Duration
@@ -94,8 +90,6 @@ func defaultConfig() *appConfig {
 		maxWorkflowsPerBatch:       100,
 		maxTimersPerBatch:          100,
 		maxMessagesPerBatch:        100,
-		singletonStaleLockCleanup:  true,
-		singletonChannelCleanup:    true,
 		leaderHeartbeatInterval:    15 * time.Second,
 		leaderLeaseDuration:        45 * time.Second,
 		shutdownTimeout:            30 * time.Second,
@@ -301,28 +295,6 @@ func WithMaxConcurrentMessages(n int) Option {
 		if n > 0 {
 			c.maxConcurrentMessages = n
 		}
-	}
-}
-
-// WithSingletonStaleLockCleanup sets whether stale lock cleanup runs as a singleton task.
-// When true, only one worker will run the cleanup at a time using system locks.
-// Default: true.
-//
-// Deprecated: Leader election is now used for coordinating background tasks.
-func WithSingletonStaleLockCleanup(enabled bool) Option {
-	return func(c *appConfig) {
-		c.singletonStaleLockCleanup = enabled
-	}
-}
-
-// WithSingletonChannelCleanup sets whether channel cleanup runs as a singleton task.
-// When true, only one worker will run the cleanup at a time using system locks.
-// Default: true.
-//
-// Deprecated: Leader election is now used for coordinating background tasks.
-func WithSingletonChannelCleanup(enabled bool) Option {
-	return func(c *appConfig) {
-		c.singletonChannelCleanup = enabled
 	}
 }
 
