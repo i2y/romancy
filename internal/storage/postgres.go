@@ -437,6 +437,7 @@ func (s *PostgresStorage) FindResumableWorkflows(ctx context.Context, limit int)
 		FROM workflow_instances
 		WHERE status = $1
 		AND (locked_by IS NULL OR locked_by = '')
+		AND framework = 'go'
 		ORDER BY updated_at ASC
 		LIMIT $2
 	`

@@ -483,6 +483,7 @@ func (s *SQLiteStorage) FindResumableWorkflows(ctx context.Context, limit int) (
 		FROM workflow_instances
 		WHERE status = ?
 		AND (locked_by IS NULL OR locked_by = '')
+		AND framework = 'go'
 		ORDER BY updated_at ASC
 		LIMIT ?
 	`
