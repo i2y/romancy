@@ -181,15 +181,16 @@ func TestWorkflowWithSleep(t *testing.T) {
 	app, cleanup := createTestApp(t, WithTimerCheckInterval(100*time.Millisecond))
 	defer cleanup()
 
-	// Define a workflow with a sleep
+	// Sleep duration is generous enough that loaded CI runners can still
+	// observe the waiting_for_timer status before the timer fires.
+	const sleepDuration = 2 * time.Second
+
 	sleepWorkflow := DefineWorkflow[string, string](
 		"sleep_workflow",
 		func(ctx *WorkflowContext, input string) (string, error) {
-			// Sleep for 1 second (long enough to check status)
-			if err := Sleep(ctx, 1*time.Second); err != nil {
+			if err := Sleep(ctx, sleepDuration); err != nil {
 				return "", err
 			}
-
 			return "completed after sleep", nil
 		},
 	)
@@ -210,34 +211,40 @@ func TestWorkflowWithSleep(t *testing.T) {
 		t.Fatalf("failed to start workflow: %v", err)
 	}
 
-	// Wait a bit for workflow to register sleep timer
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify workflow is waiting for timer
-	instance, err := app.GetInstance(ctx, instanceID)
-	if err != nil {
-		t.Fatalf("failed to get instance: %v", err)
-	}
-	if instance.Status != storage.StatusWaitingForTimer {
-		t.Errorf("expected status 'waiting_for_timer', got '%s'", instance.Status)
+	// Poll until workflow registers the sleep timer.
+	if !waitForStatus(t, ctx, app, instanceID, storage.StatusWaitingForTimer, sleepDuration) {
+		instance, _ := app.GetInstance(ctx, instanceID)
+		t.Fatalf("expected status 'waiting_for_timer', got '%s'", instance.Status)
 	}
 
-	// Wait for sleep to expire and workflow to complete
-	time.Sleep(1500 * time.Millisecond)
+	// Poll until workflow completes (timer fires + resumption + commit).
+	if !waitForStatus(t, ctx, app, instanceID, storage.StatusCompleted, sleepDuration+3*time.Second) {
+		instance, _ := app.GetInstance(ctx, instanceID)
+		t.Fatalf("expected status 'completed', got '%s'", instance.Status)
+	}
 
-	// Get the result
 	result, err := GetWorkflowResult[string](ctx, app, instanceID)
 	if err != nil {
 		t.Fatalf("failed to get result: %v", err)
 	}
-
-	if result.Status != "completed" {
-		t.Errorf("expected status 'completed', got '%s'", result.Status)
-	}
-
 	if result.Output != "completed after sleep" {
 		t.Errorf("expected output 'completed after sleep', got '%s'", result.Output)
 	}
+}
+
+// waitForStatus polls for the given workflow status until the timeout elapses.
+// Returns true when the status is observed, false otherwise.
+func waitForStatus(t *testing.T, ctx context.Context, app *App, instanceID string, want storage.WorkflowStatus, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		instance, err := app.GetInstance(ctx, instanceID)
+		if err == nil && instance != nil && instance.Status == want {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
 
 // mustMarshal marshals data to JSON, panicking on error.
