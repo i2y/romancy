@@ -2,6 +2,7 @@ package romancy
 
 import (
 	"context"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -97,8 +98,11 @@ func TestLeaderElection_LeadershipState(t *testing.T) {
 		t.Fatalf("failed to shutdown app: %v", err)
 	}
 
-	// After shutdown, isLeader may still be true (we don't explicitly clear it)
-	// but leader tasks should be stopped
+	// Shutdown explicitly clears isLeader and releases the leader lock
+	// so a fresh process can take over without waiting for the lease TTL.
+	if app.isLeader.Load() {
+		t.Error("expected isLeader=false after shutdown")
+	}
 }
 
 func TestLeaderElection_LeaderTasksRunning(t *testing.T) {
@@ -124,6 +128,81 @@ func TestLeaderElection_LeaderTasksRunning(t *testing.T) {
 
 	if !tasksRunning {
 		t.Error("expected leaderTasksRunning=true after becoming leader")
+	}
+}
+
+// TestLeaderElection_PostShutdownTakeover verifies that after a clean
+// Shutdown, a fresh App pointed at the same database can immediately
+// acquire leadership without waiting for the previous worker's lease
+// TTL to expire. Regression test for the bug where Shutdown left the
+// "romancy_leader" system lock in place, costing single-node
+// deployments up to LeaseDuration of unavailability after every
+// graceful restart.
+func TestLeaderElection_PostShutdownTakeover(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "romancy-takeover-*.db")
+	if err != nil {
+		t.Fatalf("create temp db: %v", err)
+	}
+	dbPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	defer os.Remove(dbPath)
+
+	// Initialize schema once via a throwaway storage handle, mirroring
+	// what createTestApp does so both apps below can skip auto-migrate.
+	store, err := storage.NewSQLiteStorage(dbPath)
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
+		_ = store.Close()
+		t.Fatalf("init schema: %v", err)
+	}
+	_ = store.Close()
+
+	mkApp := func(workerID string) *App {
+		return NewApp(
+			WithDatabase(dbPath),
+			WithAutoMigrate(false),
+			WithWorkerID(workerID),
+			// Long lease intentionally - the test verifies takeover
+			// happens BEFORE the lease would naturally expire.
+			WithLeaderHeartbeatInterval(50*time.Millisecond),
+			WithLeaderLeaseDuration(10*time.Second),
+		)
+	}
+
+	ctx := context.Background()
+	app1 := mkApp("worker-1")
+	if err := app1.Start(ctx); err != nil {
+		t.Fatalf("start app1: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !app1.isLeader.Load() {
+		_ = app1.Shutdown(ctx)
+		t.Fatal("app1 did not become leader")
+	}
+	if err := app1.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown app1: %v", err)
+	}
+
+	// Immediate takeover: with the lock released, app2 should win on
+	// its first leader-election tick (~50ms here), well under the
+	// 10-second lease TTL.
+	app2 := mkApp("worker-2")
+	if err := app2.Start(ctx); err != nil {
+		t.Fatalf("start app2: %v", err)
+	}
+	defer func() { _ = app2.Shutdown(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if app2.isLeader.Load() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !app2.isLeader.Load() {
+		t.Fatal("app2 did not become leader within 2s of clean takeover; the lease TTL is 10s, so the post-shutdown lock release is broken")
 	}
 }
 

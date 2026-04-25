@@ -171,6 +171,24 @@ func (a *App) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("shutdown timed out after %v", a.config.shutdownTimeout)
 	}
 
+	// Release the leader lock if we held it. Without this, a fresh
+	// process starting after a graceful shutdown has to wait the full
+	// leader-lease TTL (default 45s) before it can become leader and
+	// resume timer / channel / recur checks. The TTL is the safety
+	// net for crash scenarios; clean shutdowns should release the
+	// lock symmetrically with TryAcquireSystemLock.
+	//
+	// Background tasks have already stopped at this point so
+	// a.isLeader is stable.
+	if a.isLeader.Load() && a.storage != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := a.storage.ReleaseSystemLock(releaseCtx, "romancy_leader", a.config.workerID); err != nil {
+			slog.Debug("failed to release leader lock on shutdown", "error", err)
+		}
+		cancel()
+		a.isLeader.Store(false)
+	}
+
 	// Close storage
 	if a.storage != nil {
 		if err := a.storage.Close(); err != nil {
