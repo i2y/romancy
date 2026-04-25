@@ -466,31 +466,54 @@ func (s *PostgresStorage) FindResumableWorkflows(ctx context.Context, limit int)
 // --- Lock Manager ---
 
 // TryAcquireLock attempts to acquire a lock on a workflow instance.
+// Uses SELECT FOR UPDATE SKIP LOCKED pattern (matches Edda/Shikibu).
+// SKIP LOCKED allows concurrent workers to not block on locked rows.
 func (s *PostgresStorage) TryAcquireLock(ctx context.Context, instanceID, workerID string, timeoutSec int) (bool, error) {
 	conn := s.getConn(ctx)
 	now := time.Now().UTC()
 	expiresAt := now.Add(time.Duration(timeoutSec) * time.Second)
 
-	// Allow acquiring if:
-	// 1. No lock exists (locked_by IS NULL)
-	// 2. Lock is expired (lock_expires_at < now)
+	// SELECT FOR UPDATE SKIP LOCKED to avoid blocking
+	var currentLockedBy sql.NullString
+	var currentLockExpiresAt sql.NullTime
+	err := conn.QueryRowContext(ctx, `
+		SELECT locked_by, lock_expires_at
+		FROM workflow_instances
+		WHERE instance_id = $1
+		FOR UPDATE SKIP LOCKED
+	`, instanceID).Scan(&currentLockedBy, &currentLockExpiresAt)
+
+	if err == sql.ErrNoRows {
+		// Row is locked by another transaction, skip
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// Check lock conditions:
+	// 1. No lock exists (locked_by IS NULL or empty)
+	// 2. Lock is expired
 	// 3. Same worker already holds the lock (re-entrant)
-	result, err := conn.ExecContext(ctx, `
+	canAcquire := !currentLockedBy.Valid ||
+		currentLockedBy.String == "" ||
+		currentLockedBy.String == workerID ||
+		(currentLockExpiresAt.Valid && currentLockExpiresAt.Time.Before(now))
+
+	if !canAcquire {
+		return false, nil
+	}
+
+	_, err = conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET locked_by = $1, locked_at = $2, lock_expires_at = $3, updated_at = $2
 		WHERE instance_id = $4
-		AND (locked_by IS NULL OR lock_expires_at < NOW() OR locked_by = $1)
 	`, workerID, now, expiresAt, instanceID)
 	if err != nil {
 		return false, err
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-
-	return affected > 0, nil
+	return true, nil
 }
 
 // ReleaseLock releases a lock on a workflow instance.
