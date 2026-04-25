@@ -34,9 +34,9 @@ func setupPostgresStorage(t *testing.T) *PostgresStorage {
 	}
 
 	ctx := context.Background()
-	if err := store.Initialize(ctx); err != nil {
+	if err := InitializeTestSchemaPostgres(ctx, store); err != nil {
 		store.Close()
-		t.Fatalf("Failed to initialize storage: %v", err)
+		t.Fatalf("Failed to initialize test schema: %v", err)
 	}
 
 	// Clean up tables for test isolation
@@ -51,12 +51,19 @@ func cleanupTables(t *testing.T, store *PostgresStorage) {
 
 	// Order matters due to foreign key constraints
 	tables := []string{
+		"channel_message_claims",
+		"channel_delivery_cursors",
+		"channel_messages",
+		"channel_subscriptions",
+		"workflow_group_memberships",
 		"workflow_compensations",
-		"workflow_outbox",
+		"outbox_events",
 		"workflow_timer_subscriptions",
-		"workflow_event_subscriptions",
+		"workflow_history_archive",
 		"workflow_history",
 		"workflow_instances",
+		"workflow_definitions",
+		"system_locks",
 	}
 
 	for _, table := range tables {
@@ -89,8 +96,7 @@ func TestPostgresStorage_CreateAndGetInstance(t *testing.T) {
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
 		InputData:    []byte(`{"key": "value"}`),
-		SourceCode:   "func test() {}",
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 
@@ -133,7 +139,7 @@ func TestPostgresStorage_UpdateInstanceStatus(t *testing.T) {
 		InstanceID:   "test-status-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -159,7 +165,7 @@ func TestPostgresStorage_LockOperations(t *testing.T) {
 		InstanceID:   "test-lock-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -218,7 +224,7 @@ func TestPostgresStorage_HistoryOperations(t *testing.T) {
 		InstanceID:   "test-history-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -266,7 +272,7 @@ func TestPostgresStorage_TimerSubscription(t *testing.T) {
 		InstanceID:   "test-timer-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusWaitingForTimer,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -276,7 +282,7 @@ func TestPostgresStorage_TimerSubscription(t *testing.T) {
 		InstanceID: "test-timer-1",
 		TimerID:    "timer-1",
 		ExpiresAt:  time.Now().Add(-1 * time.Hour), // Past time
-		Step:       1,
+		ActivityID: "activity:1",
 	}
 
 	if err := store.RegisterTimerSubscription(ctx, sub); err != nil {
@@ -284,7 +290,7 @@ func TestPostgresStorage_TimerSubscription(t *testing.T) {
 	}
 
 	// Find expired timers
-	timers, err := store.FindExpiredTimers(ctx)
+	timers, err := store.FindExpiredTimers(ctx, 100)
 	if err != nil {
 		t.Fatalf("FindExpiredTimers failed: %v", err)
 	}
@@ -354,7 +360,7 @@ func TestPostgresStorage_CompensationOperations(t *testing.T) {
 		InstanceID:   "test-comp-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(ctx, instance)
@@ -365,16 +371,14 @@ func TestPostgresStorage_CompensationOperations(t *testing.T) {
 		ActivityID:   "activity:1",
 		ActivityName: "rollback_activity1",
 		Args:         []byte(`{"id": "1"}`),
-		Order:        1,
-		Status:       "pending",
 	}
+	// Small delay to ensure ordering by created_at
+	time.Sleep(10 * time.Millisecond)
 	comp2 := &CompensationEntry{
 		InstanceID:   "test-comp-1",
 		ActivityID:   "activity:2",
 		ActivityName: "rollback_activity2",
 		Args:         []byte(`{"id": "2"}`),
-		Order:        2,
-		Status:       "pending",
 	}
 
 	store.AddCompensation(ctx, comp1)
@@ -390,17 +394,12 @@ func TestPostgresStorage_CompensationOperations(t *testing.T) {
 		t.Fatalf("len(comps) = %d, want 2", len(comps))
 	}
 
-	// LIFO: comp2 should come first
-	if comps[0].Order != 2 {
-		t.Errorf("comps[0].Order = %d, want 2 (LIFO)", comps[0].Order)
+	// LIFO: comp2 should come first (most recently added)
+	if comps[0].ActivityID != "activity:2" {
+		t.Errorf("comps[0].ActivityID = %s, want activity:2 (LIFO)", comps[0].ActivityID)
 	}
-	if comps[1].Order != 1 {
-		t.Errorf("comps[1].Order = %d, want 1 (LIFO)", comps[1].Order)
-	}
-
-	// Mark first as executed
-	if err := store.MarkCompensationExecuted(ctx, comps[0].ID); err != nil {
-		t.Fatalf("MarkCompensationExecuted failed: %v", err)
+	if comps[1].ActivityID != "activity:1" {
+		t.Errorf("comps[1].ActivityID = %s, want activity:1 (LIFO)", comps[1].ActivityID)
 	}
 }
 
@@ -427,7 +426,7 @@ func TestPostgresStorage_Transaction(t *testing.T) {
 		InstanceID:   "test-tx-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(txCtx, instance)
@@ -460,7 +459,7 @@ func TestPostgresStorage_TransactionCommit(t *testing.T) {
 		InstanceID:   "test-tx-commit-1",
 		WorkflowName: "test_workflow",
 		Status:       StatusRunning,
-		CreatedAt:    now,
+		StartedAt:    now,
 		UpdatedAt:    now,
 	}
 	store.CreateInstance(txCtx, instance)
