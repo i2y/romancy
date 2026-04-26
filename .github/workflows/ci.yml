@@ -54,6 +54,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Check schema sync (internal/migrations/sql vs schema/ submodule)
+        run: make check-schema-sync
+
       - name: Run tests
         env:
           ROMANCY_TEST_POSTGRES_URL: postgres://romancy:romancy_test_password@localhost:5432/romancy_test?sslmode=disable
