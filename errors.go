@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/i2y/romancy/internal/replay"
+	"github.com/i2y/romancy/internal/storage"
 )
 
 // TerminalError wraps an error to indicate it should not be retried.
@@ -189,3 +190,18 @@ var ErrGroupNotJoined = errors.New("not a member of group")
 // ErrWorkflowNotCancellable indicates that the workflow cannot be cancelled.
 // This happens when the workflow is already completed, cancelled, failed, or does not exist.
 var ErrWorkflowNotCancellable = errors.New("workflow cannot be cancelled")
+
+// ErrInstanceAlreadyExists indicates that a workflow was started with an
+// instance ID that already exists. Starting the same instance ID twice
+// results in a single instance, which makes it usable as an idempotency key.
+var ErrInstanceAlreadyExists = storage.ErrInstanceAlreadyExists
+
+// ErrLockNotHeld indicates that a worker lost the instance's lock while
+// running (the lease expired and another worker acquired it, or the lock was
+// released): the run is aborted instead of writing over the new owner's.
+var ErrLockNotHeld = storage.ErrLockNotHeld
+
+// ErrSourceHashMismatch indicates that an instance was started under another
+// version of the workflow's source than the one this worker has registered.
+// The instance is left for a worker that has its version of the code.
+var ErrSourceHashMismatch = errors.New("workflow source hash mismatch")

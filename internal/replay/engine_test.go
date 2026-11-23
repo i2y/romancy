@@ -613,7 +613,13 @@ func TestEngine_RecordActivityResult(t *testing.T) {
 			}
 			require.NoError(t, store.CreateInstance(context.Background(), instance))
 
-			err := engine.RecordActivityResult(context.Background(), instance.InstanceID, tt.activityID, tt.result, tt.activityErr)
+			// The engine only calls RecordActivityResult while holding the
+			// instance lock; the append is fenced on the holder.
+			acquired, err := store.TryAcquireLock(context.Background(), instance.InstanceID, "worker-1", 300)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			err = engine.RecordActivityResult(context.Background(), instance.InstanceID, "worker-1", tt.activityID, tt.result, tt.activityErr)
 			require.NoError(t, err)
 
 			history, _, err := store.GetHistoryPaginated(context.Background(), instance.InstanceID, 0, 10)
@@ -686,7 +692,7 @@ func TestEngine_executeCompensations(t *testing.T) {
 				return tt.runnerError
 			})
 
-			err := engine.executeCompensations(context.Background(), instance.InstanceID)
+			err := engine.executeCompensations(context.Background(), instance.InstanceID, "worker-1")
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -718,7 +724,7 @@ func TestEngine_executeCompensations_NoRunner(t *testing.T) {
 	}
 	require.NoError(t, store.AddCompensation(context.Background(), entry))
 
-	err := engine.executeCompensations(context.Background(), instance.InstanceID)
+	err := engine.executeCompensations(context.Background(), instance.InstanceID, "worker-1")
 	require.NoError(t, err)
 }
 

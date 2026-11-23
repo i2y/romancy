@@ -3,13 +3,28 @@ package replay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/i2y/romancy/hooks"
 	"github.com/i2y/romancy/internal/storage"
 )
+
+// LockLeaseSeconds is how long a worker's lock on an instance lasts (the
+// stale-lock timeout); lockRefreshEvery is how often a running execution
+// extends it. The refresh must come often enough that a run pausing between
+// two refreshes still loses its lock before the lease runs out and another
+// worker takes over.
+const (
+	LockLeaseSeconds = 300
+)
+
+// lockRefreshEvery is how often a running execution extends its lease.
+// A var so tests can shorten it; production code should treat it as fixed.
+var lockRefreshEvery = 60 * time.Second
 
 // CachedResult holds both raw JSON bytes and the unmarshaled value.
 // This avoids re-serialization when the raw JSON is needed.
@@ -44,6 +59,7 @@ type ExecutionContext struct {
 	ctx        context.Context
 	instanceID string
 	engine     *Engine
+	lockID     string
 
 	// Activity tracking
 	activityCounter map[string]int
@@ -141,7 +157,7 @@ func (ec *ExecutionContext) RecordActivityResult(activityID string, result any, 
 	ec.counterMu.Lock()
 	ec.newActivities++
 	ec.counterMu.Unlock()
-	return ec.engine.RecordActivityResult(ec.ctx, ec.instanceID, activityID, result, activityErr)
+	return ec.engine.RecordActivityResult(ec.ctx, ec.instanceID, ec.lockID, activityID, result, activityErr)
 }
 
 // RecordActivityResultWithContext records an activity result to storage using the provided context.
@@ -150,7 +166,7 @@ func (ec *ExecutionContext) RecordActivityResultWithContext(ctx context.Context,
 	ec.counterMu.Lock()
 	ec.newActivities++
 	ec.counterMu.Unlock()
-	return ec.engine.RecordActivityResult(ctx, ec.instanceID, activityID, result, activityErr)
+	return ec.engine.RecordActivityResult(ctx, ec.instanceID, ec.lockID, activityID, result, activityErr)
 }
 
 // Storage returns the storage interface for advanced use cases.
@@ -171,23 +187,27 @@ func (e *Engine) StartWorkflow(
 	inputData []byte,
 	runner WorkflowRunner,
 ) error {
-	// Try to acquire lock
-	acquired, err := e.storage.TryAcquireLock(ctx, instanceID, e.workerID, 300)
+	// Try to acquire lock under a fresh per-run lock identity. Every fenced
+	// write for this run passes the same identity, so a write attempted after
+	// the lease was lost and re-claimed (even by this same workerID) is
+	// rejected by the `locked_by = holder` check.
+	lockID := storage.NewLockIdentity(e.workerID)
+	acquired, err := e.storage.TryAcquireLock(ctx, instanceID, lockID, LockLeaseSeconds)
 	if err != nil {
 		return fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	if !acquired {
 		return fmt.Errorf("failed to acquire lock for instance %s", instanceID)
 	}
-	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, e.workerID) }()
+	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
 
 	// Update status to running
-	if err := e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusRunning, ""); err != nil {
+	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusRunning, "", lockID); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
 	// Execute the workflow
-	return e.executeWorkflow(ctx, instanceID, runner)
+	return e.executeWorkflow(ctx, instanceID, runner, lockID)
 }
 
 // ResumeWorkflow resumes a workflow from its history.
@@ -196,27 +216,40 @@ func (e *Engine) ResumeWorkflow(
 	instanceID string,
 	runner WorkflowRunner,
 ) error {
+	return e.ResumeWorkflowWithLockID(ctx, instanceID, storage.NewLockIdentity(e.workerID), runner)
+}
+
+// ResumeWorkflowWithLockID resumes a workflow under an existing lock
+// identity. Callers that batch-claimed instances (ClaimResumableWorkflows)
+// pass the identity they claimed with, so the engine's re-acquisition is a
+// self-reclaim of the same epoch rather than a competing claim.
+func (e *Engine) ResumeWorkflowWithLockID(
+	ctx context.Context,
+	instanceID string,
+	lockID string,
+	runner WorkflowRunner,
+) error {
 	// Try to acquire lock
-	acquired, err := e.storage.TryAcquireLock(ctx, instanceID, e.workerID, 300)
+	acquired, err := e.storage.TryAcquireLock(ctx, instanceID, lockID, LockLeaseSeconds)
 	if err != nil {
 		return fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	if !acquired {
 		return fmt.Errorf("failed to acquire lock for instance %s", instanceID)
 	}
-	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, e.workerID) }()
+	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
 
 	// Update status to running
-	if err := e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusRunning, ""); err != nil {
+	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusRunning, "", lockID); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
 	// Execute the workflow
-	return e.executeWorkflow(ctx, instanceID, runner)
+	return e.executeWorkflow(ctx, instanceID, runner, lockID)
 }
 
 // executeWorkflow executes or replays a workflow.
-func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner WorkflowRunner) error {
+func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner WorkflowRunner, lockID string) error {
 	// Load history using iterator (streams from storage in batches)
 	iter := storage.NewHistoryIterator(ctx, e.storage, instanceID, &storage.HistoryIteratorOptions{
 		BatchSize: 1000,
@@ -261,12 +294,41 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 		return fmt.Errorf("failed to load history: %w", err)
 	}
 
+	// The run holds the instance's lock for its whole duration. A refresher
+	// extends the lease so a run longer than the timeout is not taken over by
+	// another worker; when the refresh answers that the lock is gone (it
+	// expired during a long pause and another worker acquired it), the run is
+	// cancelled and its writes are fenced out instead of landing over the new
+	// owner's.
+	runCtx, stopRun := context.WithCancel(ctx)
+	var lockLost atomic.Bool
+	lockWatch := make(chan struct{})
+	go func() {
+		defer close(lockWatch)
+		ticker := time.NewTicker(lockRefreshEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if err := e.storage.RefreshLock(runCtx, instanceID, lockID, LockLeaseSeconds); errors.Is(err, storage.ErrLockNotHeld) {
+					lockLost.Store(true)
+					stopRun()
+					return
+				}
+			}
+		}
+	}()
+	defer func() { stopRun(); <-lockWatch }()
+
 	// Create execution context
 	isReplaying := historyCount > 0
 	execCtx := &ExecutionContext{
-		ctx:             ctx,
+		ctx:             runCtx,
 		instanceID:      instanceID,
 		engine:          e,
+		lockID:          lockID,
 		activityCounter: make(map[string]int),
 		history:         nil, // History is processed via iterator, not stored
 		historyIndex:    0,
@@ -299,14 +361,20 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 
 	duration := time.Since(startTime)
 
+	// A run that lost its lock stops here: whatever it would record now
+	// belongs to the run the new owner is making, or will make.
+	if lockLost.Load() {
+		return storage.ErrLockNotHeld
+	}
+
 	if err != nil {
 		// Check for SuspendSignal
 		if sig := AsSuspendSignal(err); sig != nil {
-			return e.handleSuspendSignal(ctx, instanceID, sig)
+			return e.handleSuspendSignal(ctx, instanceID, sig, lockID)
 		}
 
 		// Regular error - run compensations before marking as failed
-		if compErr := e.executeCompensations(ctx, instanceID); compErr != nil {
+		if compErr := e.executeCompensations(ctx, instanceID, lockID); compErr != nil {
 			// Log compensation error but continue
 			e.hooks.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{
 				InstanceID: instanceID,
@@ -317,15 +385,15 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 
 		// Record workflow failure in history
 		eventData, _ := json.Marshal(map[string]any{"error": err.Error()})
-		_ = e.storage.AppendHistory(ctx, &storage.HistoryEvent{
+		_ = e.storage.AppendHistoryIfLocked(ctx, &storage.HistoryEvent{
 			InstanceID: instanceID,
 			EventType:  storage.HistoryWorkflowFailed,
 			EventData:  eventData,
 			DataType:   "json",
-		})
+		}, lockID)
 
 		// Mark as failed
-		_ = e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusFailed, err.Error())
+		_ = e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusFailed, err.Error(), lockID)
 
 		e.hooks.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{
 			InstanceID: instanceID,
@@ -339,15 +407,15 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 	// Success - serialize result and mark as completed
 	resultData, err := json.Marshal(result)
 	if err != nil {
-		_ = e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusFailed, "failed to serialize result")
+		_ = e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusFailed, "failed to serialize result", lockID)
 		return fmt.Errorf("failed to serialize result: %w", err)
 	}
 
-	if err := e.storage.UpdateInstanceOutput(ctx, instanceID, resultData); err != nil {
+	if err := e.storage.UpdateInstanceOutputIfLocked(ctx, instanceID, resultData, lockID); err != nil {
 		return fmt.Errorf("failed to set result: %w", err)
 	}
 
-	if err := e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusCompleted, ""); err != nil {
+	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusCompleted, "", lockID); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -372,21 +440,21 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 }
 
 // handleSuspendSignal handles all workflow suspension cases.
-func (e *Engine) handleSuspendSignal(ctx context.Context, instanceID string, sig *SuspendSignal) error {
+func (e *Engine) handleSuspendSignal(ctx context.Context, instanceID string, sig *SuspendSignal, lockID string) error {
 	switch sig.Type {
 	case SuspendForTimer:
-		return e.handleTimerSuspend(ctx, instanceID, sig)
+		return e.handleTimerSuspend(ctx, instanceID, sig, lockID)
 	case SuspendForChannelMessage:
-		return e.handleChannelMessageSuspend(ctx, instanceID, sig)
+		return e.handleChannelMessageSuspend(ctx, instanceID, sig, lockID)
 	case SuspendForRecur:
-		return e.handleRecurSuspend(ctx, instanceID, sig)
+		return e.handleRecurSuspend(ctx, instanceID, sig, lockID)
 	default:
 		return fmt.Errorf("unknown suspend type: %v", sig.Type)
 	}
 }
 
 // handleTimerSuspend handles the timer suspension case.
-func (e *Engine) handleTimerSuspend(ctx context.Context, instanceID string, sig *SuspendSignal) error {
+func (e *Engine) handleTimerSuspend(ctx context.Context, instanceID string, sig *SuspendSignal, lockID string) error {
 	// Register timer subscription
 	timer := &storage.TimerSubscription{
 		InstanceID: instanceID,
@@ -400,7 +468,7 @@ func (e *Engine) handleTimerSuspend(ctx context.Context, instanceID string, sig 
 	}
 
 	// Update status to waiting
-	if err := e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusWaitingForTimer, ""); err != nil {
+	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusWaitingForTimer, "", lockID); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -408,14 +476,17 @@ func (e *Engine) handleTimerSuspend(ctx context.Context, instanceID string, sig 
 }
 
 // handleChannelMessageSuspend handles the channel message suspension case (via Receive or WaitEvent).
-func (e *Engine) handleChannelMessageSuspend(ctx context.Context, instanceID string, sig *SuspendSignal) error {
+func (e *Engine) handleChannelMessageSuspend(ctx context.Context, instanceID string, sig *SuspendSignal, lockID string) error {
 	// Register channel receive and set waiting=TRUE
 	var timeoutAt *time.Time
 	if sig.Timeout != nil {
 		t := time.Now().Add(*sig.Timeout)
 		timeoutAt = &t
 	}
-	if err := e.storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, sig.Channel, e.workerID, sig.ActivityID, timeoutAt); err != nil {
+	// registered=false means a message was already pending at registration
+	// time: the instance is left 'running' and unlocked so a resumption
+	// replays it and Receive drains the pending message.
+	if _, err := e.storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, sig.Channel, lockID, sig.ActivityID, timeoutAt); err != nil {
 		return fmt.Errorf("failed to register channel receive: %w", err)
 	}
 
@@ -423,7 +494,7 @@ func (e *Engine) handleChannelMessageSuspend(ctx context.Context, instanceID str
 }
 
 // handleRecurSuspend handles the Recur case (Erlang-style tail recursion).
-func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig *SuspendSignal) error {
+func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig *SuspendSignal, lockID string) error {
 	// 1. Archive current history
 	if err := e.storage.ArchiveHistory(ctx, instanceID); err != nil {
 		return fmt.Errorf("failed to archive history: %w", err)
@@ -453,12 +524,12 @@ func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig 
 		EventData:  inputData,
 		DataType:   "json",
 	}
-	if err := e.storage.AppendHistory(ctx, recurEvent); err != nil {
+	if err := e.storage.AppendHistoryIfLocked(ctx, recurEvent, lockID); err != nil {
 		return fmt.Errorf("failed to record recur event: %w", err)
 	}
 
 	// 6. Update status to recurred (will be picked up and restarted)
-	if err := e.storage.UpdateInstanceStatus(ctx, instanceID, storage.StatusRecurred, ""); err != nil {
+	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusRecurred, "", lockID); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -469,6 +540,7 @@ func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig 
 func (e *Engine) RecordActivityResult(
 	ctx context.Context,
 	instanceID string,
+	lockID string,
 	activityID string,
 	result any,
 	activityErr error,
@@ -492,7 +564,7 @@ func (e *Engine) RecordActivityResult(
 		event.EventData = resultData
 	}
 
-	return e.storage.AppendHistory(ctx, event)
+	return e.storage.AppendHistoryIfLocked(ctx, event, lockID)
 }
 
 // CompensationRunner is a function that executes a compensation.
@@ -506,7 +578,7 @@ func (e *Engine) SetCompensationRunner(runner CompensationRunner) {
 
 // executeCompensations runs all pending compensations for a workflow in LIFO order.
 // Status is tracked via history events (CompensationExecuted, CompensationFailed).
-func (e *Engine) executeCompensations(ctx context.Context, instanceID string) error {
+func (e *Engine) executeCompensations(ctx context.Context, instanceID, lockID string) error {
 	entries, err := e.storage.GetCompensations(ctx, instanceID)
 	if err != nil {
 		return fmt.Errorf("failed to get compensations: %w", err)
@@ -537,7 +609,7 @@ func (e *Engine) executeCompensations(ctx context.Context, instanceID string) er
 		execErr := e.compensationRunner(ctx, entry.ActivityName, entry.Args)
 		if execErr != nil {
 			// Record failure in history
-			_ = e.recordCompensationResult(ctx, instanceID, entry, false, execErr.Error())
+			_ = e.recordCompensationResult(ctx, instanceID, lockID, entry, false, execErr.Error())
 			if firstErr == nil {
 				firstErr = fmt.Errorf("compensation %s failed: %w", entry.ActivityID, execErr)
 			}
@@ -546,7 +618,7 @@ func (e *Engine) executeCompensations(ctx context.Context, instanceID string) er
 		}
 
 		// Record success in history
-		_ = e.recordCompensationResult(ctx, instanceID, entry, true, "")
+		_ = e.recordCompensationResult(ctx, instanceID, lockID, entry, true, "")
 	}
 
 	return firstErr
@@ -585,7 +657,7 @@ func (e *Engine) getExecutedCompensationIDs(ctx context.Context, instanceID stri
 }
 
 // recordCompensationResult records a compensation execution result to history.
-func (e *Engine) recordCompensationResult(ctx context.Context, instanceID string, entry *storage.CompensationEntry, success bool, errorMsg string) error {
+func (e *Engine) recordCompensationResult(ctx context.Context, instanceID, lockID string, entry *storage.CompensationEntry, success bool, errorMsg string) error {
 	eventType := storage.HistoryCompensationExecuted
 	if !success {
 		eventType = storage.HistoryCompensationFailed
@@ -605,11 +677,11 @@ func (e *Engine) recordCompensationResult(ctx context.Context, instanceID string
 		return err
 	}
 
-	return e.storage.AppendHistory(ctx, &storage.HistoryEvent{
+	return e.storage.AppendHistoryIfLocked(ctx, &storage.HistoryEvent{
 		InstanceID: instanceID,
 		ActivityID: fmt.Sprintf("compensation:%d", entry.ID),
 		EventType:  eventType,
 		EventData:  eventDataBytes,
 		DataType:   "json",
-	})
+	}, lockID)
 }

@@ -302,21 +302,29 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 		return nil, fmt.Errorf("failed to check pending messages: %w", err)
 	}
 
+	var msg *storage.ChannelMessage
 	if len(pendingMessages) > 0 {
-		// Message is already available - process it immediately
-		msg := pendingMessages[0]
-
-		// For competing mode, claim the message
 		if sub.Mode == storage.ChannelModeCompeting {
-			claimed, err := s.ClaimChannelMessage(ctx.Context(), msg.ID, ctx.InstanceID())
-			if err != nil {
-				return nil, fmt.Errorf("failed to claim message: %w", err)
+			// Claim the first claimable message; a fresh claim by another
+			// live instance just skips it rather than retrying the whole
+			// pending scan.
+			for _, m := range pendingMessages {
+				claimed, err := s.ClaimChannelMessage(ctx.Context(), m.ID, ctx.InstanceID())
+				if err != nil {
+					return nil, fmt.Errorf("failed to claim message: %w", err)
+				}
+				if claimed {
+					msg = m
+					break
+				}
 			}
-			if !claimed {
-				// Message was claimed by another instance, try again
-				return Receive[T](ctx, channelName, opts...)
-			}
+		} else {
+			msg = pendingMessages[0]
 		}
+	}
+
+	if msg != nil {
+		// Message is already available - process it immediately
 
 		// Update cursor for broadcast mode
 		if sub.Mode == storage.ChannelModeBroadcast {
@@ -349,6 +357,14 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 		// Record to history for replay (synchronous message processing)
 		if err := ctx.RecordActivityResult(activityID, result, nil); err != nil {
 			return nil, fmt.Errorf("failed to record activity result: %w", err)
+		}
+
+		// Competing mode consumes the message: delete it (cascading the claim)
+		// once history is durable so it cannot be delivered again.
+		if sub.Mode == storage.ChannelModeCompeting {
+			if err := s.DeleteChannelMessage(ctx.Context(), msg.ID); err != nil {
+				return nil, fmt.Errorf("failed to delete consumed message: %w", err)
+			}
 		}
 
 		// Cache for replay

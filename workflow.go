@@ -114,6 +114,18 @@ type WorkflowOption func(*workflowOptions)
 
 type workflowOptions struct {
 	eventHandler bool
+	sourceHash   string
+}
+
+// WithWorkflowSourceHash registers the hash of the workflow's source (the
+// code, or the definition it was generated from). Instances started under
+// this workflow carry the hash, and a worker whose registered hash differs
+// leaves them for a worker that has their version of the code. An empty hash
+// (the default) imposes no check.
+func WithWorkflowSourceHash(hash string) WorkflowOption {
+	return func(o *workflowOptions) {
+		o.sourceHash = hash
+	}
 }
 
 // WithEventHandler marks the workflow as an event handler.
@@ -165,7 +177,7 @@ type StartOption func(*startOptions)
 
 type startOptions struct {
 	instanceID string
-	// Additional options can be added here
+	sourceHash string
 }
 
 // WithInstanceID specifies a custom instance ID.
@@ -173,6 +185,15 @@ type startOptions struct {
 func WithInstanceID(id string) StartOption {
 	return func(o *startOptions) {
 		o.instanceID = id
+	}
+}
+
+// WithSourceHash records the hash of the workflow's source on the instance.
+// When empty, the hash the workflow was registered with is used; when both
+// are empty no version check applies on resume.
+func WithSourceHash(hash string) StartOption {
+	return func(o *startOptions) {
+		o.sourceHash = hash
 	}
 }
 
