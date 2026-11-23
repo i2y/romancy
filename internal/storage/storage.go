@@ -101,6 +101,8 @@ type Storage interface {
 
 	BlobStore
 
+	FileStore
+
 	// System Lock Operations
 	SystemLockManager
 
@@ -507,6 +509,34 @@ type BlobStore interface {
 
 	// GetBlob returns the data stored under hash, or nil if absent.
 	GetBlob(ctx context.Context, hash string) ([]byte, error)
+}
+
+// FSObject is a versioned file in the shared actor filesystem.
+type FSObject struct {
+	Path    string
+	Owner   string
+	Data    []byte
+	Version int64
+}
+
+// ErrFSConflict is returned by FS writes when the expected version does
+// not match the stored version (optimistic concurrency).
+var ErrFSConflict = errors.New("actor_fs: version conflict")
+
+// FileStore is the shared actor filesystem. Writes are CAS on version:
+// expectedVersion 0 means "create (must not exist)"; >0 means update only
+// if the stored version matches.
+type FileStore interface {
+	// FSGet returns the object at path, or nil if absent.
+	FSGet(ctx context.Context, path string) (*FSObject, error)
+
+	// FSPut writes data at path with CAS on version.
+	// expectedVersion 0 = create; ErrFSConflict if path already exists.
+	// expectedVersion >0 = update; ErrFSConflict if stored version differs.
+	FSPut(ctx context.Context, path string, data []byte, owner string, expectedVersion int64) error
+
+	// FSDelete removes path only when expectedVersion matches (0 = unconditional).
+	FSDelete(ctx context.Context, path string, expectedVersion int64) error
 }
 
 // ========================================

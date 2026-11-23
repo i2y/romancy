@@ -314,6 +314,18 @@ func (m *mockStorage) RevokeCapability(ctx context.Context, capabilityID string)
 	return nil
 }
 
+func (m *mockStorage) FSGet(ctx context.Context, path string) (*storage.FSObject, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) FSPut(ctx context.Context, path string, data []byte, owner string, expectedVersion int64) error {
+	return nil
+}
+
+func (m *mockStorage) FSDelete(ctx context.Context, path string, expectedVersion int64) error {
+	return nil
+}
+
 func (m *mockStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
 	return nil
 }

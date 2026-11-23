@@ -251,6 +251,15 @@ CREATE TABLE IF NOT EXISTS actor_capabilities (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_caps_token ON actor_capabilities(kind, target, secret_hash);
 CREATE INDEX IF NOT EXISTS idx_actor_caps_target ON actor_capabilities(kind, target);
+CREATE TABLE IF NOT EXISTS actor_fs (
+    path TEXT PRIMARY KEY,
+    owner TEXT,
+    data BLOB NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS payload_blobs (
     hash TEXT PRIMARY KEY,
     data BLOB NOT NULL,
@@ -539,6 +548,15 @@ CREATE TABLE IF NOT EXISTS actor_capabilities (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_caps_token ON actor_capabilities(kind, target, secret_hash);
 CREATE INDEX IF NOT EXISTS idx_actor_caps_target ON actor_capabilities(kind, target);
+CREATE TABLE IF NOT EXISTS actor_fs (
+    path TEXT PRIMARY KEY,
+    owner TEXT,
+    data BYTEA NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS payload_blobs (
     hash TEXT PRIMARY KEY,
     data BYTEA NOT NULL,
@@ -813,6 +831,15 @@ CREATE TABLE IF NOT EXISTS actor_capabilities (
 );
 CREATE UNIQUE INDEX idx_actor_caps_token ON actor_capabilities(kind, target, secret_hash);
 CREATE INDEX idx_actor_caps_target ON actor_capabilities(kind, target);
+CREATE TABLE IF NOT EXISTS actor_fs (
+    path TEXT PRIMARY KEY,
+    owner TEXT,
+    data BYTEA NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS payload_blobs (
     hash TEXT PRIMARY KEY,
     data BYTEA NOT NULL,

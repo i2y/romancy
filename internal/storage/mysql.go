@@ -2225,3 +2225,104 @@ func (s *MySQLStorage) GetBlob(ctx context.Context, hash string) ([]byte, error)
 	}
 	return data, nil
 }
+
+func (s *MySQLStorage) FSGet(ctx context.Context, path string) (*FSObject, error) {
+	{
+		var obj FSObject
+		err := s.getConn(ctx).QueryRowContext(ctx,
+			`SELECT path, COALESCE(owner, ''), data, version FROM actor_fs WHERE path = ?1`,
+			path).Scan(&obj.Path, &obj.Owner, &obj.Data, &obj.Version)
+		if err == sql.ErrNoRows {
+			{
+				return nil, nil
+			}
+		}
+		if err != nil {
+			{
+				return nil, err
+			}
+		}
+		return &obj, nil
+	}
+}
+
+func (s *MySQLStorage) FSPut(ctx context.Context, path string, data []byte, owner string, expectedVersion int64) error {
+	{
+		var res sql.Result
+		var err error
+		now := time.Now().UTC()
+		if expectedVersion == 0 {
+			{
+				res, err = s.getConn(ctx).ExecContext(ctx, `
+			INSERT INTO actor_fs (path, owner, data, version, created_at, updated_at)
+			SELECT ?1, ?2, ?3, 1, ?4, ?4
+			WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = ?5)`,
+					path, owner, data, now, path)
+			}
+		} else {
+			{
+				res, err = s.getConn(ctx).ExecContext(ctx, `
+			UPDATE actor_fs SET data = ?1, owner = ?2, version = version + 1, updated_at = ?3
+			WHERE path = ?4 AND version = ?5`,
+					data, owner, now, path, expectedVersion)
+			}
+		}
+		if err != nil {
+			{
+				return err
+			}
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			{
+				return err
+			}
+		}
+		if n == 0 {
+			{
+				return ErrFSConflict
+			}
+		}
+		return nil
+	}
+}
+
+func (s *MySQLStorage) FSDelete(ctx context.Context, path string, expectedVersion int64) error {
+	{
+		var res sql.Result
+		var err error
+		if expectedVersion == 0 {
+			{
+				res, err = s.getConn(ctx).ExecContext(ctx,
+					`DELETE FROM actor_fs WHERE path = ?1`, path)
+			}
+		} else {
+			{
+				res, err = s.getConn(ctx).ExecContext(ctx,
+					`DELETE FROM actor_fs WHERE path = ?1 AND version = ?2`, path, expectedVersion)
+			}
+		}
+		if err != nil {
+			{
+				return err
+			}
+		}
+		if expectedVersion == 0 {
+			{
+				return nil
+			}
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			{
+				return err
+			}
+		}
+		if n == 0 {
+			{
+				return ErrFSConflict
+			}
+		}
+		return nil
+	}
+}

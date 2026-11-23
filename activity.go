@@ -294,7 +294,13 @@ func (a *Activity[I, O]) executeWithRetry(ctx *WorkflowContext, input I, activit
 		execCtx = ContextWithWorkflowContext(execCtx, ctx)
 
 		// Execute the activity
+		if ctx.activityDepth != nil {
+			*ctx.activityDepth++
+		}
 		result, err := a.fn(execCtx, input)
+		if ctx.activityDepth != nil {
+			*ctx.activityDepth--
+		}
 
 		if cancel != nil {
 			cancel()

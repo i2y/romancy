@@ -64,6 +64,10 @@ type WorkflowContext struct {
 	activityCounts map[string]int // function_name → counter
 	mu             sync.Mutex
 
+	// activityDepth is >0 while executing an activity body. Shared across
+	// WithContext copies so FS ops can verify they run inside an activity.
+	activityDepth *int
+
 	// Reference to the replay execution context (when using replay engine)
 	execCtx *replay.ExecutionContext
 
@@ -91,6 +95,7 @@ func NewWorkflowContext(
 		isReplaying:    isReplaying,
 		historyCache:   historyCache,
 		activityCounts: make(map[string]int),
+		activityDepth:  new(int),
 	}
 }
 
@@ -103,6 +108,7 @@ func NewWorkflowContextFromExecution(execCtx *replay.ExecutionContext) *Workflow
 		instanceID:     execCtx.InstanceID(),
 		isReplaying:    execCtx.IsReplaying(),
 		activityCounts: make(map[string]int),
+		activityDepth:  new(int),
 		execCtx:        execCtx,
 	}
 }
@@ -124,6 +130,7 @@ func (c *WorkflowContext) WithContext(ctx context.Context) *WorkflowContext {
 		isReplaying:         c.isReplaying,
 		historyCache:        c.historyCache,
 		activityCounts:      c.activityCounts,
+		activityDepth:       c.activityDepth,
 		execCtx:             c.execCtx,
 		directSubscriptions: c.directSubscriptions,
 	}
@@ -147,6 +154,11 @@ func (c *WorkflowContext) WorkerID() string {
 // IsReplaying returns true if the workflow is being replayed.
 func (c *WorkflowContext) IsReplaying() bool {
 	return c.isReplaying
+}
+
+// InActivity returns true while executing an activity body (non-replay).
+func (c *WorkflowContext) InActivity() bool {
+	return c.activityDepth != nil && *c.activityDepth > 0
 }
 
 // GenerateActivityID generates a unique activity ID for the given function name.

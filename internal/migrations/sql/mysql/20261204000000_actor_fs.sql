@@ -1,0 +1,13 @@
+-- migrate:up
+CREATE TABLE IF NOT EXISTS actor_fs (
+    path VARCHAR(512) PRIMARY KEY,
+    owner VARCHAR(64),
+    data LONGBLOB NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_actor_fs_owner ON actor_fs(owner);
+
+-- migrate:down
+DROP TABLE IF EXISTS actor_fs;
