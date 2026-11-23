@@ -93,6 +93,9 @@ type Storage interface {
 	// Group Operations
 	GroupManager
 
+	// Actor Registry/Monitor Operations
+	ActorRegistryManager
+
 	// System Lock Operations
 	SystemLockManager
 
@@ -418,6 +421,40 @@ type GroupManager interface {
 
 	// LeaveAllGroups removes an instance from all groups.
 	LeaveAllGroups(ctx context.Context, instanceID string) error
+}
+
+// ========================================
+// Actor Registry Manager
+// ========================================
+
+// ActorRegistryManager provides Erlang-style actor naming and monitoring:
+// register/whereis for name lookup, and monitor/emit-down for termination
+// notification (Erlang 'DOWN' messages delivered over a channel).
+type ActorRegistryManager interface {
+	// RegisterActorName binds a unique name to an instance. Returns an error
+	// if the name is already taken by a different (live) instance.
+	RegisterActorName(ctx context.Context, name, instanceID, framework string) error
+
+	// UnregisterActorName removes a name binding (idempotent).
+	UnregisterActorName(ctx context.Context, name string) error
+
+	// WhereisActor resolves a name to an instance ID. Returns "" if unbound.
+	WhereisActor(ctx context.Context, name string) (string, error)
+
+	// MonitorActor registers that watcherInstanceID be notified on channel
+	// (typically its direct channel, "channel:{watcher}") when targetInstanceID
+	// reaches a terminal status. Idempotent per (watcher, target).
+	MonitorActor(ctx context.Context, watcherInstanceID, targetInstanceID, channel string) error
+
+	// UnmonitorActor removes a monitor registration (idempotent).
+	UnmonitorActor(ctx context.Context, watcherInstanceID, targetInstanceID string) error
+
+	// EmitActorDownForTerminated publishes a DOWN message to each monitor's
+	// channel for every target already in a terminal status, then removes the
+	// monitor rows and the target's actor_names bindings — all in one
+	// transaction so it is safe to run repeatedly (leader sweep).
+	// Returns the number of DOWN notifications emitted.
+	EmitActorDownForTerminated(ctx context.Context) (int, error)
 }
 
 // ========================================

@@ -281,6 +281,31 @@ func (m *mockStorage) LeaveGroup(ctx context.Context, instanceID, groupName stri
 func (m *mockStorage) GetGroupMembers(ctx context.Context, groupName string) ([]string, error) {
 	return nil, nil
 }
+
+func (m *mockStorage) RegisterActorName(ctx context.Context, name, instanceID, framework string) error {
+	return nil
+}
+
+func (m *mockStorage) UnregisterActorName(ctx context.Context, name string) error {
+	return nil
+}
+
+func (m *mockStorage) WhereisActor(ctx context.Context, name string) (string, error) {
+	return "", nil
+}
+
+func (m *mockStorage) MonitorActor(ctx context.Context, watcherInstanceID, targetInstanceID, channel string) error {
+	return nil
+}
+
+func (m *mockStorage) UnmonitorActor(ctx context.Context, watcherInstanceID, targetInstanceID string) error {
+	return nil
+}
+
+func (m *mockStorage) EmitActorDownForTerminated(ctx context.Context) (int, error) {
+	return 0, nil
+}
+
 func (m *mockStorage) LeaveAllGroups(ctx context.Context, instanceID string) error { return nil }
 
 // SystemLockManager stubs

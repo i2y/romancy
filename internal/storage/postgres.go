@@ -2019,3 +2019,102 @@ func (s *PostgresStorage) CleanupInstanceSubscriptions(ctx context.Context, inst
 
 	return nil
 }
+
+// ========================================
+// Actor Registry
+// ========================================
+
+func (s *PostgresStorage) RegisterActorName(ctx context.Context, name, instanceID, framework string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO actor_names (name, instance_id, framework) VALUES ($1, $2, $3)
+	`, name, instanceID, framework)
+	return err
+}
+
+func (s *PostgresStorage) UnregisterActorName(ctx context.Context, name string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `DELETE FROM actor_names WHERE name = $1`, name)
+	return err
+}
+
+func (s *PostgresStorage) WhereisActor(ctx context.Context, name string) (string, error) {
+	var id string
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT instance_id FROM actor_names WHERE name = $1
+	`, name).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return id, err
+}
+
+func (s *PostgresStorage) MonitorActor(ctx context.Context, watcherInstanceID, targetInstanceID, channel string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO actor_monitors (watcher_instance_id, target_instance_id, channel)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (watcher_instance_id, target_instance_id) DO NOTHING
+	`, watcherInstanceID, targetInstanceID, channel)
+	return err
+}
+
+func (s *PostgresStorage) UnmonitorActor(ctx context.Context, watcherInstanceID, targetInstanceID string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		DELETE FROM actor_monitors WHERE watcher_instance_id = $1 AND target_instance_id = $2
+	`, watcherInstanceID, targetInstanceID)
+	return err
+}
+
+func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT m.id, m.target_instance_id, m.channel, w.status
+		FROM actor_monitors m
+		JOIN workflow_instances w ON w.instance_id = m.target_instance_id
+		WHERE w.status IN ('completed', 'failed', 'cancelled', 'recurred')
+	`)
+	if err != nil {
+		return 0, err
+	}
+	type monitorRow struct {
+		id       int64
+		targetID string
+		channel  string
+		status   string
+	}
+	var monitors []monitorRow
+	targetSet := map[string]bool{}
+	for rows.Next() {
+		var m monitorRow
+		if err := rows.Scan(&m.id, &m.targetID, &m.channel, &m.status); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		monitors = append(monitors, m)
+		targetSet[m.targetID] = true
+	}
+	rows.Close()
+
+	for _, m := range monitors {
+		payload := fmt.Sprintf(`{"type":"DOWN","actor":%q,"status":%q}`, m.targetID, m.status)
+		msgID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), m.id)
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO channel_messages (channel, data, message_id, data_type)
+			VALUES ($1, $2, $3, 'json')
+		`, m.channel, payload, msgID); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM actor_monitors WHERE id = $1`, m.id); err != nil {
+			return 0, err
+		}
+	}
+	for targetID := range targetSet {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM actor_names WHERE instance_id = $1`, targetID); err != nil {
+			return 0, err
+		}
+	}
+	return len(monitors), tx.Commit()
+}

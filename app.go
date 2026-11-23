@@ -637,6 +637,13 @@ func (a *App) cleanupStaleLocks() error {
 		slog.Error("error requeuing channel waits", "error", err)
 	}
 
+	// Deliver DOWN notifications for terminated actors and free their names.
+	if n, err := a.storage.EmitActorDownForTerminated(a.ctx); err != nil {
+		slog.Error("error emitting actor down notifications", "error", err)
+	} else if n > 0 {
+		slog.Debug("emitted actor down notifications", "count", n)
+	}
+
 	timeoutSec := int(a.config.staleLockTimeout.Seconds())
 	staleWorkflows, err := a.storage.CleanupStaleLocks(a.ctx, timeoutSec)
 	if err != nil {
