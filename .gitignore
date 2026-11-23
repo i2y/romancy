@@ -81,3 +81,6 @@ local-docs/
 # Environment files
 .env
 .env.local
+
+# TLC model checker output
+spec/states/
