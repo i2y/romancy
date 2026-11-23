@@ -2152,3 +2152,23 @@ func (s *PostgresStorage) CheckCapability(ctx context.Context, kind, target, sec
 	}
 	return expiresAt == nil || expiresAt.After(time.Now()), nil
 }
+
+func (s *PostgresStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO payload_blobs (hash, data, size_bytes, created_by)
+		VALUES ($1, $2, $3, $4) ON CONFLICT (hash) DO NOTHING`, hash, data, len(data), createdBy)
+	return err
+}
+
+func (s *PostgresStorage) GetBlob(ctx context.Context, hash string) ([]byte, error) {
+	var data []byte
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT data FROM payload_blobs WHERE hash = $1`, hash).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}

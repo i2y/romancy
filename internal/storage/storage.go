@@ -99,6 +99,8 @@ type Storage interface {
 	// Capability Operations
 	CapabilityManager
 
+	BlobStore
+
 	// System Lock Operations
 	SystemLockManager
 
@@ -495,6 +497,16 @@ type CapabilityManager interface {
 	// CheckCapability verifies a presented secret for (kind, target) against
 	// the stored hash and expiry. Returns false for unknown/expired grants.
 	CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error)
+}
+
+// BlobStore is a content-addressed store for large payloads. The key is
+// the content hash (e.g. sha256 hex); writes are idempotent.
+type BlobStore interface {
+	// PutBlob stores data under its content hash (idempotent).
+	PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error
+
+	// GetBlob returns the data stored under hash, or nil if absent.
+	GetBlob(ctx context.Context, hash string) ([]byte, error)
 }
 
 // ========================================

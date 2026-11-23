@@ -2233,3 +2233,23 @@ func (s *SQLiteStorage) CheckCapability(ctx context.Context, kind, target, secre
 	}
 	return expiresAt == nil || expiresAt.After(time.Now()), nil
 }
+
+func (s *SQLiteStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT OR IGNORE INTO payload_blobs (hash, data, size_bytes, created_by)
+		VALUES (?, ?, ?, ?)`, hash, data, len(data), createdBy)
+	return err
+}
+
+func (s *SQLiteStorage) GetBlob(ctx context.Context, hash string) ([]byte, error) {
+	var data []byte
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT data FROM payload_blobs WHERE hash = ?1`, hash).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}

@@ -2205,3 +2205,23 @@ func (s *MySQLStorage) CheckCapability(ctx context.Context, kind, target, secret
 	}
 	return expiresAt == nil || expiresAt.After(time.Now()), nil
 }
+
+func (s *MySQLStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT IGNORE INTO payload_blobs (hash, data, size_bytes, created_by)
+		VALUES (?, ?, ?, ?)`, hash, data, len(data), createdBy)
+	return err
+}
+
+func (s *MySQLStorage) GetBlob(ctx context.Context, hash string) ([]byte, error) {
+	var data []byte
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT data FROM payload_blobs WHERE hash = ?1`, hash).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}

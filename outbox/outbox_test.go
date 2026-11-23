@@ -314,6 +314,14 @@ func (m *mockStorage) RevokeCapability(ctx context.Context, capabilityID string)
 	return nil
 }
 
+func (m *mockStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
+	return nil
+}
+
+func (m *mockStorage) GetBlob(ctx context.Context, hash string) ([]byte, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
 	return true, nil
 }
