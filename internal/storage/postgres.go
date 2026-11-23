@@ -2118,3 +2118,37 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 	}
 	return len(monitors), tx.Commit()
 }
+
+// ========================================
+// Capability Manager
+// ========================================
+
+func (s *PostgresStorage) GrantCapability(ctx context.Context, cap *ActorCapability) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO actor_capabilities (id, kind, target, secret_hash, granted_by, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy, cap.ExpiresAt)
+	return err
+}
+
+func (s *PostgresStorage) RevokeCapability(ctx context.Context, capabilityID string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		DELETE FROM actor_capabilities WHERE id = $1
+	`, capabilityID)
+	return err
+}
+
+func (s *PostgresStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
+	var expiresAt *time.Time
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT expires_at FROM actor_capabilities
+		WHERE kind = $1 AND target = $2 AND secret_hash = $3
+	`, kind, target, secretHash).Scan(&expiresAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return expiresAt == nil || expiresAt.After(time.Now()), nil
+}

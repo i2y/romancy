@@ -2171,3 +2171,37 @@ func (s *MySQLStorage) EmitActorDownForTerminated(ctx context.Context) (int, err
 	}
 	return len(monitors), tx.Commit()
 }
+
+// ========================================
+// Capability Manager
+// ========================================
+
+func (s *MySQLStorage) GrantCapability(ctx context.Context, cap *ActorCapability) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO actor_capabilities (id, kind, target, secret_hash, granted_by, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy, cap.ExpiresAt)
+	return err
+}
+
+func (s *MySQLStorage) RevokeCapability(ctx context.Context, capabilityID string) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		DELETE FROM actor_capabilities WHERE id = ?
+	`, capabilityID)
+	return err
+}
+
+func (s *MySQLStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
+	var expiresAt *time.Time
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT expires_at FROM actor_capabilities
+		WHERE kind = ? AND target = ? AND secret_hash = ?
+	`, kind, target, secretHash).Scan(&expiresAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return expiresAt == nil || expiresAt.After(time.Now()), nil
+}

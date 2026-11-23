@@ -1,7 +1,14 @@
 package romancy
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/i2y/romancy/internal/storage"
 )
 
 // Actor-style API: name registry (Erlang register/whereis) and monitors
@@ -68,4 +75,73 @@ func Unmonitor(ctx *WorkflowContext, targetInstanceID string) error {
 		return fmt.Errorf("storage not available")
 	}
 	return s.UnmonitorActor(ctx.Context(), ctx.InstanceID(), targetInstanceID)
+}
+
+// ========================================
+// Capabilities
+// ========================================
+
+// Capability token format: "cap:{kind}:{target}:{secret}". The plaintext
+// secret appears only in the issued token; the database stores its SHA-256.
+// Enforcement integration (Phase B: sandboxed spawn) is intentionally not
+// wired into channel operations yet — these are the primitives.
+
+// hashCapabilitySecret returns the SHA-256 hex of a capability secret.
+func hashCapabilitySecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+// IssueCapability mints a new capability for (kind, target) and stores only
+// its hash. Returns a bearer token "cap:{kind}:{target}:{secret}" —
+// the plaintext secret is not recoverable afterwards.
+func IssueCapability(ctx *WorkflowContext, kind, target string) (string, error) {
+	s := ctx.Storage()
+	if s == nil {
+		return "", fmt.Errorf("storage not available")
+	}
+	secretBytes := make([]byte, 24)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return "", fmt.Errorf("failed to mint capability secret: %w", err)
+	}
+	secret := hex.EncodeToString(secretBytes)
+
+	cap := &storage.ActorCapability{
+		ID:         fmt.Sprintf("cap-%s", uuid.NewString()),
+		Kind:       kind,
+		Target:     target,
+		SecretHash: hashCapabilitySecret(secret),
+		GrantedBy:  ctx.InstanceID(),
+	}
+	if err := s.GrantCapability(ctx.Context(), cap); err != nil {
+		return "", fmt.Errorf("failed to grant capability: %w", err)
+	}
+	return fmt.Sprintf("cap:%s:%s:%s", kind, target, secret), nil
+}
+
+// CheckCapability verifies a capability token's secret for (kind, target).
+// Accepts either a raw secret or a full "cap:kind:target:secret" token.
+func CheckCapability(ctx *WorkflowContext, kind, target, secret string) (bool, error) {
+	s := ctx.Storage()
+	if s == nil {
+		return false, fmt.Errorf("storage not available")
+	}
+	// Accept full token form: use the trailing secret segment if present.
+	if strings.HasPrefix(secret, "cap:") {
+		parts := strings.Split(secret, ":")
+		if len(parts) >= 4 {
+			secret = parts[len(parts)-1]
+		}
+	}
+	return s.CheckCapability(ctx.Context(), kind, target, hashCapabilitySecret(secret))
+}
+
+// RevokeCapability removes a capability grant by its capability ID
+// ("cap-…" returned implicitly via IssueCapability's stored grant).
+func RevokeCapability(ctx *WorkflowContext, capabilityID string) error {
+	s := ctx.Storage()
+	if s == nil {
+		return fmt.Errorf("storage not available")
+	}
+	return s.RevokeCapability(ctx.Context(), capabilityID)
 }

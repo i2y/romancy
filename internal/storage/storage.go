@@ -96,6 +96,9 @@ type Storage interface {
 	// Actor Registry/Monitor Operations
 	ActorRegistryManager
 
+	// Capability Operations
+	CapabilityManager
+
 	// System Lock Operations
 	SystemLockManager
 
@@ -455,6 +458,43 @@ type ActorRegistryManager interface {
 	// transaction so it is safe to run repeatedly (leader sweep).
 	// Returns the number of DOWN notifications emitted.
 	EmitActorDownForTerminated(ctx context.Context) (int, error)
+}
+
+// ========================================
+// Capability Manager
+// ========================================
+
+// Capability kinds for the actor permission model.
+const (
+	CapabilityKindActor      = "actor"       // operate on an actor (send/cancel/inspect)
+	CapabilityKindChannelPub = "channel_pub" // publish to a channel
+	CapabilityKindChannelSub = "channel_sub" // receive/drain a channel
+	CapabilityKindFSWrite    = "fs_write"    // write to a shared-FS path
+)
+
+// ActorCapability is a stored capability grant. Only the secret's hash is
+// persisted — the plaintext secret leaves the system in the issued token.
+type ActorCapability struct {
+	ID         string
+	Kind       string
+	Target     string
+	SecretHash string
+	GrantedBy  string
+	ExpiresAt  *time.Time
+}
+
+// CapabilityManager manages capability grants: issue (store hash), check
+// (hash+expiry lookup), and revoke.
+type CapabilityManager interface {
+	// GrantCapability stores a capability grant.
+	GrantCapability(ctx context.Context, cap *ActorCapability) error
+
+	// RevokeCapability removes a grant by its capability ID (idempotent).
+	RevokeCapability(ctx context.Context, capabilityID string) error
+
+	// CheckCapability verifies a presented secret for (kind, target) against
+	// the stored hash and expiry. Returns false for unknown/expired grants.
+	CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error)
 }
 
 // ========================================

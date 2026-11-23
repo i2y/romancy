@@ -306,6 +306,18 @@ func (m *mockStorage) EmitActorDownForTerminated(ctx context.Context) (int, erro
 	return 0, nil
 }
 
+func (m *mockStorage) GrantCapability(ctx context.Context, cap *storage.ActorCapability) error {
+	return nil
+}
+
+func (m *mockStorage) RevokeCapability(ctx context.Context, capabilityID string) error {
+	return nil
+}
+
+func (m *mockStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
+	return true, nil
+}
+
 func (m *mockStorage) LeaveAllGroups(ctx context.Context, instanceID string) error { return nil }
 
 // SystemLockManager stubs

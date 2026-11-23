@@ -240,6 +240,18 @@ CREATE TABLE IF NOT EXISTS actor_monitors (
 );
 CREATE INDEX IF NOT EXISTS idx_actor_monitors_target ON actor_monitors(target_instance_id);
 CREATE INDEX IF NOT EXISTS idx_actor_monitors_watcher ON actor_monitors(watcher_instance_id);
+CREATE TABLE IF NOT EXISTS actor_capabilities (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    secret_hash TEXT NOT NULL,
+    granted_by TEXT,
+    expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_caps_token ON actor_capabilities(kind, target, secret_hash);
+CREATE INDEX IF NOT EXISTS idx_actor_caps_target ON actor_capabilities(kind, target);
+
 
 
 -- System locks (for coordinating background tasks across pods)
@@ -508,6 +520,18 @@ CREATE TABLE IF NOT EXISTS actor_monitors (
 );
 CREATE INDEX IF NOT EXISTS idx_actor_monitors_target ON actor_monitors(target_instance_id);
 CREATE INDEX IF NOT EXISTS idx_actor_monitors_watcher ON actor_monitors(watcher_instance_id);
+CREATE TABLE IF NOT EXISTS actor_capabilities (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    secret_hash TEXT NOT NULL,
+    granted_by TEXT,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_caps_token ON actor_capabilities(kind, target, secret_hash);
+CREATE INDEX IF NOT EXISTS idx_actor_caps_target ON actor_capabilities(kind, target);
+
 
 
 -- System locks (for coordinating background tasks across pods)
@@ -762,6 +786,18 @@ CREATE TABLE IF NOT EXISTS actor_monitors (
 );
 CREATE INDEX idx_actor_monitors_target ON actor_monitors(target_instance_id);
 CREATE INDEX idx_actor_monitors_watcher ON actor_monitors(watcher_instance_id);
+CREATE TABLE IF NOT EXISTS actor_capabilities (
+    id VARCHAR(64) PRIMARY KEY,
+    kind VARCHAR(32) NOT NULL,
+    target VARCHAR(255) NOT NULL,
+    secret_hash VARCHAR(128) NOT NULL,
+    granted_by VARCHAR(64),
+    expires_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_actor_caps_token ON actor_capabilities(kind, target, secret_hash);
+CREATE INDEX idx_actor_caps_target ON actor_capabilities(kind, target);
+
 
 
 -- System locks (for coordinating background tasks across pods)
