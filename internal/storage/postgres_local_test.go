@@ -102,7 +102,7 @@ func TestPGLocal_FindResumable_FrameworkFilter(t *testing.T) {
 	pgLocalInsertInstance(t, s, "py-1", "wf-py", "python", StatusRunning)
 	pgLocalInsertInstance(t, s, "py-2", "wf-py", "python", StatusRunning)
 
-	got, err := s.FindResumableWorkflows(ctx, 100)
+	got, err := s.FindResumableWorkflows(ctx, nil, 100)
 	if err != nil {
 		t.Fatalf("FindResumableWorkflows: %v", err)
 	}

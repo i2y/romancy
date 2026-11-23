@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,17 +15,29 @@ import (
 // mockStorage implements storage.Storage interface for testing.
 // Only outbox-related methods are implemented; others are stubs.
 type mockStorage struct {
+	mu     sync.Mutex
 	events []*storage.OutboxEvent
+}
+
+// statusOf returns the status of the i-th stored event (mutex-guarded).
+func (m *mockStorage) statusOf(i int) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.events[i].Status
 }
 
 // OutboxManager methods (implemented)
 
 func (m *mockStorage) AddOutboxEvent(ctx context.Context, event *storage.OutboxEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.events = append(m.events, event)
 	return nil
 }
 
 func (m *mockStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*storage.OutboxEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var pending []*storage.OutboxEvent
 	for _, e := range m.events {
 		if e.Status == "pending" {
@@ -37,7 +50,37 @@ func (m *mockStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]
 	return pending, nil
 }
 
+func (m *mockStorage) ClaimOutboxEvents(ctx context.Context, staleBefore time.Time, limit int) ([]*storage.OutboxEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var claimed []*storage.OutboxEvent
+	for _, e := range m.events {
+		if e.Status == "pending" {
+			e.Status = "processing"
+			claimed = append(claimed, e)
+			if len(claimed) >= limit {
+				break
+			}
+		}
+	}
+	return claimed, nil
+}
+
+func (m *mockStorage) ReleaseOutboxEvent(ctx context.Context, eventID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.events {
+		if e.EventID == eventID && e.Status == "processing" {
+			e.Status = "pending"
+			break
+		}
+	}
+	return nil
+}
+
 func (m *mockStorage) MarkOutboxEventSent(ctx context.Context, eventID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, e := range m.events {
 		if e.EventID == eventID {
 			e.Status = "published"
@@ -48,6 +91,8 @@ func (m *mockStorage) MarkOutboxEventSent(ctx context.Context, eventID string) e
 }
 
 func (m *mockStorage) MarkOutboxEventFailed(ctx context.Context, eventID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, e := range m.events {
 		if e.EventID == eventID {
 			e.Status = "failed"
@@ -58,6 +103,8 @@ func (m *mockStorage) MarkOutboxEventFailed(ctx context.Context, eventID string)
 }
 
 func (m *mockStorage) IncrementOutboxAttempts(ctx context.Context, eventID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, e := range m.events {
 		if e.EventID == eventID {
 			e.RetryCount++
@@ -97,10 +144,16 @@ func (m *mockStorage) GetInstance(ctx context.Context, instanceID string) (*stor
 func (m *mockStorage) UpdateInstanceStatus(ctx context.Context, instanceID string, status storage.WorkflowStatus, errorMsg string) error {
 	return nil
 }
+func (m *mockStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instanceID string, status storage.WorkflowStatus, errorMsg string, workerID string) error {
+	return nil
+}
 func (m *mockStorage) UpdateInstanceActivity(ctx context.Context, instanceID string, activityID string) error {
 	return nil
 }
 func (m *mockStorage) UpdateInstanceOutput(ctx context.Context, instanceID string, outputData []byte) error {
+	return nil
+}
+func (m *mockStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instanceID string, outputData []byte, workerID string) error {
 	return nil
 }
 func (m *mockStorage) CancelInstance(ctx context.Context, instanceID string, reason string) error {
@@ -109,7 +162,7 @@ func (m *mockStorage) CancelInstance(ctx context.Context, instanceID string, rea
 func (m *mockStorage) ListInstances(ctx context.Context, opts storage.ListInstancesOptions) (*storage.PaginationResult, error) {
 	return &storage.PaginationResult{}, nil
 }
-func (m *mockStorage) FindResumableWorkflows(ctx context.Context, limit int) ([]*storage.ResumableWorkflow, error) {
+func (m *mockStorage) FindResumableWorkflows(ctx context.Context, workflowNames []string, limit int) ([]*storage.ResumableWorkflow, error) {
 	return nil, nil
 }
 
@@ -124,9 +177,15 @@ func (m *mockStorage) RefreshLock(ctx context.Context, instanceID, workerID stri
 func (m *mockStorage) CleanupStaleLocks(ctx context.Context, timeoutSec int) ([]storage.StaleWorkflowInfo, error) {
 	return nil, nil
 }
+func (m *mockStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*storage.ResumableWorkflow, error) {
+	return nil, nil
+}
 
 // HistoryManager stubs
 func (m *mockStorage) AppendHistory(ctx context.Context, event *storage.HistoryEvent) error {
+	return nil
+}
+func (m *mockStorage) AppendHistoryIfLocked(ctx context.Context, event *storage.HistoryEvent, workerID string) error {
 	return nil
 }
 func (m *mockStorage) GetHistoryPaginated(ctx context.Context, instanceID string, afterID int64, limit int) ([]*storage.HistoryEvent, bool, error) {
@@ -138,9 +197,6 @@ func (m *mockStorage) GetHistoryCount(ctx context.Context, instanceID string) (i
 
 // TimerSubscriptionManager stubs
 func (m *mockStorage) RegisterTimerSubscription(ctx context.Context, sub *storage.TimerSubscription) error {
-	return nil
-}
-func (m *mockStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Context, sub *storage.TimerSubscription, instanceID, workerID string) error {
 	return nil
 }
 func (m *mockStorage) FindExpiredTimers(ctx context.Context, limit int) ([]*storage.TimerSubscription, error) {
@@ -174,8 +230,11 @@ func (m *mockStorage) GetChannelSubscription(ctx context.Context, instanceID, ch
 func (m *mockStorage) GetChannelMode(ctx context.Context, channelName string) (storage.ChannelMode, error) {
 	return "", nil
 }
-func (m *mockStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
-	return nil
+func (m *mockStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+	return true, nil
+}
+func (m *mockStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int, error) {
+	return 0, nil
 }
 func (m *mockStorage) GetPendingChannelMessages(ctx context.Context, channelName string, afterID int64, limit int) ([]*storage.ChannelMessage, error) {
 	return nil, nil
@@ -321,7 +380,7 @@ func TestRelayerWithCustomSender(t *testing.T) {
 		EventSource: "test",
 		Status:      "pending",
 	}
-	s.events = append(s.events, event)
+	_ = s.AddOutboxEvent(context.Background(), event)
 
 	// Process events
 	_, _ = r.RelayOnce(context.Background())
@@ -331,8 +390,8 @@ func TestRelayerWithCustomSender(t *testing.T) {
 	}
 
 	// Check event was marked as published
-	if s.events[0].Status != "published" {
-		t.Errorf("expected status=published, got %s", s.events[0].Status)
+	if s.statusOf(0) != "published" {
+		t.Errorf("expected status=published, got %s", s.statusOf(0))
 	}
 }
 
@@ -359,14 +418,14 @@ func TestRelayerMaxRetries(t *testing.T) {
 		Status:      "pending",
 		RetryCount:  3, // Already at max
 	}
-	s.events = append(s.events, event)
+	_ = s.AddOutboxEvent(context.Background(), event)
 
 	// Process events
 	_, _ = r.RelayOnce(context.Background())
 
 	// Check event was marked as failed (not retried)
-	if s.events[0].Status != "failed" {
-		t.Errorf("expected status=failed, got %s", s.events[0].Status)
+	if s.statusOf(0) != "failed" {
+		t.Errorf("expected status=failed, got %s", s.statusOf(0))
 	}
 }
 
@@ -393,7 +452,7 @@ func TestRelayerStartStop(t *testing.T) {
 		EventSource: "test",
 		Status:      "pending",
 	}
-	s.events = append(s.events, event)
+	_ = s.AddOutboxEvent(context.Background(), event)
 
 	ctx := context.Background()
 	r.Start(ctx)
@@ -496,7 +555,7 @@ func TestRelayerAdaptiveBackoffWithEvents(t *testing.T) {
 			EventSource: "test",
 			Status:      "pending",
 		}
-		s.events = append(s.events, event)
+		_ = s.AddOutboxEvent(context.Background(), event)
 	}
 
 	// Process events - should process all quickly without increasing backoff
@@ -555,7 +614,7 @@ func TestRelayerWakeEvent(t *testing.T) {
 		EventSource: "test",
 		Status:      "pending",
 	}
-	s.events = append(s.events, event)
+	_ = s.AddOutboxEvent(context.Background(), event)
 
 	// Send wake signal
 	wakeChan <- struct{}{}

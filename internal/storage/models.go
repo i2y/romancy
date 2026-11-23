@@ -196,8 +196,7 @@ type ChannelDeliveryCursor struct {
 
 // ChannelMessageClaim tracks which instance claimed a message in competing mode.
 type ChannelMessageClaim struct {
-	ID         int64     `json:"id"`
-	MessageID  int64     `json:"message_id"`
+	MessageID  string    `json:"message_id"` // UUID from channel_messages.message_id
 	InstanceID string    `json:"instance_id"`
 	ClaimedAt  time.Time `json:"claimed_at"`
 }

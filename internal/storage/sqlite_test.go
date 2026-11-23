@@ -384,8 +384,12 @@ func TestSQLiteStorage(t *testing.T) {
 			t.Fatal("expected to acquire lock")
 		}
 
-		if err := storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, channelName, workerID, "receive:1", nil); err != nil {
+		registered, err := storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, channelName, workerID, "receive:1", nil)
+		if err != nil {
 			t.Fatalf("failed to register channel receive: %v", err)
+		}
+		if !registered {
+			t.Fatal("expected wait to be registered")
 		}
 
 		// 4. Publish a message to the channel

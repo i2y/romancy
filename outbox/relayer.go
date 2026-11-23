@@ -33,6 +33,8 @@ type Relayer struct {
 	// When a message is received, the relayer immediately checks for pending events.
 	wakeEvent <-chan struct{}
 
+	processingTimeout time.Duration
+
 	running bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
@@ -55,6 +57,11 @@ type RelayerConfig struct {
 	// MaxBackoff is the maximum backoff duration when no events are pending.
 	// Default: 30 seconds.
 	MaxBackoff time.Duration
+	// ProcessingTimeout is how long a claimed ('processing') event may sit
+	// before another relayer may reclaim it. It bounds the time a crashed
+	// relayer's claim blocks its events.
+	// Default: 5 minutes.
+	ProcessingTimeout time.Duration
 	// CustomSender is an optional custom event sender.
 	// If nil, the default CloudEvents HTTP sender is used.
 	CustomSender EventSender
@@ -78,16 +85,20 @@ func NewRelayer(s storage.Storage, config RelayerConfig) *Relayer {
 	if config.MaxBackoff == 0 {
 		config.MaxBackoff = 30 * time.Second
 	}
+	if config.ProcessingTimeout == 0 {
+		config.ProcessingTimeout = 5 * time.Minute
+	}
 
 	r := &Relayer{
-		storage:      s,
-		targetURL:    config.TargetURL,
-		pollInterval: config.PollInterval,
-		batchSize:    config.BatchSize,
-		maxRetries:   config.MaxRetries,
-		maxBackoff:   config.MaxBackoff,
-		wakeEvent:    config.WakeEvent,
-		stopCh:       make(chan struct{}),
+		storage:           s,
+		targetURL:         config.TargetURL,
+		pollInterval:      config.PollInterval,
+		batchSize:         config.BatchSize,
+		maxRetries:        config.MaxRetries,
+		maxBackoff:        config.MaxBackoff,
+		processingTimeout: config.ProcessingTimeout,
+		wakeEvent:         config.WakeEvent,
+		stopCh:            make(chan struct{}),
 	}
 
 	if config.CustomSender != nil {
@@ -196,10 +207,11 @@ func (r *Relayer) calculateBackoff(consecutiveEmpty int) time.Duration {
 	return backoff
 }
 
-// processPendingEvents processes a batch of pending events.
-// Returns the number of events processed and any error that occurred during fetch.
+// processPendingEvents claims a batch of events (atomically moved to
+// 'processing' so concurrent relayers take disjoint sets) and sends them.
+// Returns the number of events claimed and any error that occurred during fetch.
 func (r *Relayer) processPendingEvents(ctx context.Context) (int, error) {
-	events, err := r.storage.GetPendingOutboxEvents(ctx, r.batchSize)
+	events, err := r.storage.ClaimOutboxEvents(ctx, time.Now().Add(-r.processingTimeout), r.batchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -228,7 +240,9 @@ func (r *Relayer) processPendingEvents(ctx context.Context) (int, error) {
 
 		// Send event
 		if err := r.sender(ctx, event); err != nil {
-			// Event will be retried on next poll
+			// Back to 'pending' for a later attempt instead of sitting in
+			// 'processing' until the claim goes stale.
+			_ = r.storage.ReleaseOutboxEvent(ctx, event.EventID)
 			continue
 		}
 

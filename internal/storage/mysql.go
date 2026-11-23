@@ -5,13 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 // MySQLStorage implements the Storage interface using MySQL 8.0+.
@@ -224,6 +225,12 @@ func (s *MySQLStorage) CreateInstance(ctx context.Context, instance *WorkflowIns
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
 		string(instance.InputData), instance.SourceHash, instance.OwnerService, "go",
 		instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
+	if err != nil {
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1062 {
+			return fmt.Errorf("%w: %w", ErrInstanceAlreadyExists, err)
+		}
+	}
 	return err
 }
 
@@ -303,6 +310,59 @@ func (s *MySQLStorage) UpdateInstanceStatus(ctx context.Context, instanceID stri
 	return err
 }
 
+// lockHolder answers the worker that holds the instance's lock, or "" when it
+// is unlocked or the instance does not exist.
+func (s *MySQLStorage) lockHolder(ctx context.Context, instanceID string) (string, error) {
+	var lockedBy sql.NullString
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT locked_by FROM workflow_instances WHERE instance_id = ?
+	`, instanceID).Scan(&lockedBy)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return lockedBy.String, nil
+}
+
+// lockLost checks, after a fenced write affected no row, whether the worker
+// still holds the lock: it answers ErrLockNotHeld when the lock is gone, and
+// nil when the lock is held (the write was a no-op for another reason, such
+// as writing a value the row already had).
+func (s *MySQLStorage) lockLost(ctx context.Context, instanceID, workerID string) error {
+	holder, err := s.lockHolder(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	if holder == workerID {
+		return nil
+	}
+	return ErrLockNotHeld
+}
+
+// UpdateInstanceStatusIfLocked updates the status only while workerID holds
+// the instance's lock; it answers ErrLockNotHeld otherwise.
+func (s *MySQLStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET status = ?, updated_at = NOW()
+		WHERE instance_id = ? AND locked_by = ?
+	`, status, instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
 // UpdateInstanceActivity updates the current activity ID.
 func (s *MySQLStorage) UpdateInstanceActivity(ctx context.Context, instanceID, activityID string) error {
 	conn := s.getConn(ctx)
@@ -323,6 +383,28 @@ func (s *MySQLStorage) UpdateInstanceOutput(ctx context.Context, instanceID stri
 		WHERE instance_id = ?
 	`, string(outputData), instanceID)
 	return err
+}
+
+// UpdateInstanceOutputIfLocked updates the output only while workerID holds
+// the instance's lock; it answers ErrLockNotHeld otherwise.
+func (s *MySQLStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instanceID string, outputData []byte, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET output_data = ?, status = 'completed', updated_at = NOW()
+		WHERE instance_id = ? AND locked_by = ?
+	`, string(outputData), instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
 }
 
 // CancelInstance cancels a workflow instance.
@@ -459,7 +541,7 @@ func (s *MySQLStorage) ListInstances(ctx context.Context, opts ListInstancesOpti
 
 // FindResumableWorkflows finds workflows with status='running' that don't have an active lock.
 // These are workflows that had a message delivered and are waiting for a worker to resume them.
-func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context, limit int) ([]*ResumableWorkflow, error) {
+func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context, workflowNames []string, limit int) ([]*ResumableWorkflow, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -470,11 +552,20 @@ func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context, limit int) ([
 		WHERE status = ?
 		AND (locked_by IS NULL OR locked_by = '')
 		AND framework = 'go'
-		ORDER BY updated_at ASC
-		LIMIT ?
 	`
+	args := []any{StatusRunning}
+	if len(workflowNames) > 0 {
+		placeholders := make([]string, len(workflowNames))
+		for i, name := range workflowNames {
+			placeholders[i] = "?"
+			args = append(args, name)
+		}
+		query += fmt.Sprintf(" AND workflow_name IN (%s)", strings.Join(placeholders, ","))
+	}
+	query += " ORDER BY updated_at ASC LIMIT ?"
+	args = append(args, limit)
 
-	rows, err := conn.QueryContext(ctx, query, StatusRunning, limit)
+	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -497,56 +588,116 @@ func (s *MySQLStorage) FindResumableWorkflows(ctx context.Context, limit int) ([
 
 // --- Lock Manager ---
 
+// ClaimResumableWorkflows atomically selects claimable instances and installs
+// the lease. MySQL allows FOR UPDATE only at the top level, so the selection
+// and the update run inside one transaction: the SELECT FOR UPDATE
+// SKIP LOCKED holds the rows until commit and concurrent workers take
+// disjoint sets.
+func (s *MySQLStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*ResumableWorkflow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if len(workflowNames) == 0 {
+		return nil, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	placeholders := make([]string, len(workflowNames))
+	for i := range workflowNames {
+		placeholders[i] = "?"
+	}
+	now := time.Now().UTC()
+	args := make([]any, 0, len(workflowNames)+3)
+	args = append(args, StatusRunning)
+	for _, name := range workflowNames {
+		args = append(args, name)
+	}
+	args = append(args, now, limit)
+
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT instance_id, workflow_name
+		FROM workflow_instances
+		WHERE status = ?
+		AND framework = 'go'
+		AND workflow_name IN (%s)
+		AND (locked_by IS NULL OR locked_by = '' OR lock_expires_at < ?)
+		ORDER BY updated_at ASC
+		LIMIT ?
+		FOR UPDATE SKIP LOCKED
+	`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	var workflows []*ResumableWorkflow
+	var ids []string
+	for rows.Next() {
+		var wf ResumableWorkflow
+		if err := rows.Scan(&wf.InstanceID, &wf.WorkflowName); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		workflows = append(workflows, &wf)
+		ids = append(ids, wf.InstanceID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	if len(ids) == 0 {
+		return nil, tx.Commit()
+	}
+
+	expiresAt := now.Add(time.Duration(leaseSec) * time.Second)
+	idPlaceholders := make([]string, len(ids))
+	updateArgs := make([]any, 0, len(ids)+4)
+	updateArgs = append(updateArgs, workerID, now, expiresAt, now)
+	for i, id := range ids {
+		idPlaceholders[i] = "?"
+		updateArgs = append(updateArgs, id)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE workflow_instances
+		SET locked_by = ?, locked_at = ?, lock_expires_at = ?, updated_at = ?
+		WHERE instance_id IN (%s)
+	`, strings.Join(idPlaceholders, ",")), updateArgs...); err != nil {
+		return nil, err
+	}
+
+	return workflows, tx.Commit()
+}
+
 // TryAcquireLock attempts to acquire a lock on a workflow instance.
-// Uses SELECT FOR UPDATE SKIP LOCKED pattern (matches Edda/Shikibu).
-// SKIP LOCKED allows concurrent workers to not block on locked rows.
-// Requires MySQL 8.0+.
+// A single conditional UPDATE makes the check and the claim one atomic
+// operation (see PostgresStorage.TryAcquireLock); RowsAffected is the verdict.
 func (s *MySQLStorage) TryAcquireLock(ctx context.Context, instanceID, workerID string, timeoutSec int) (bool, error) {
 	conn := s.getConn(ctx)
 	now := time.Now().UTC()
 	expiresAt := now.Add(time.Duration(timeoutSec) * time.Second)
 
-	// SELECT FOR UPDATE SKIP LOCKED to avoid blocking
-	var currentLockedBy sql.NullString
-	var currentLockExpiresAt sql.NullTime
-	err := conn.QueryRowContext(ctx, `
-		SELECT locked_by, lock_expires_at
-		FROM workflow_instances
-		WHERE instance_id = ?
-		FOR UPDATE SKIP LOCKED
-	`, instanceID).Scan(&currentLockedBy, &currentLockExpiresAt)
-
-	if err == sql.ErrNoRows {
-		// Row is locked by another transaction, skip
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-
-	// Check lock conditions:
-	// 1. No lock exists (locked_by IS NULL or empty)
-	// 2. Lock is expired
-	// 3. Same worker already holds the lock (re-entrant)
-	canAcquire := !currentLockedBy.Valid ||
-		currentLockedBy.String == "" ||
-		currentLockedBy.String == workerID ||
-		(currentLockExpiresAt.Valid && currentLockExpiresAt.Time.Before(now))
-
-	if !canAcquire {
-		return false, nil
-	}
-
-	_, err = conn.ExecContext(ctx, `
+	result, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET locked_by = ?, locked_at = ?, lock_expires_at = ?, updated_at = ?
 		WHERE instance_id = ?
-	`, workerID, now, expiresAt, now, instanceID)
+		AND (locked_by IS NULL OR locked_by = '' OR locked_by = ? OR lock_expires_at < ?)
+	`, workerID, now, expiresAt, now, instanceID, workerID, now)
 	if err != nil {
 		return false, err
 	}
 
-	return true, nil
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return affected > 0, nil
 }
 
 // ReleaseLock releases a lock on a workflow instance.
@@ -564,12 +715,22 @@ func (s *MySQLStorage) ReleaseLock(ctx context.Context, instanceID, workerID str
 func (s *MySQLStorage) RefreshLock(ctx context.Context, instanceID, workerID string, timeoutSec int) error {
 	conn := s.getConn(ctx)
 	expiresAt := time.Now().UTC().Add(time.Duration(timeoutSec) * time.Second)
-	_, err := conn.ExecContext(ctx, `
+	result, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET lock_expires_at = ?, updated_at = NOW()
 		WHERE instance_id = ? AND locked_by = ?
 	`, expiresAt, instanceID, workerID)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrLockNotHeld
+	}
+	return nil
 }
 
 // CleanupStaleLocks cleans up expired locks and returns workflows to resume.
@@ -624,6 +785,32 @@ func (s *MySQLStorage) AppendHistory(ctx context.Context, event *HistoryEvent) e
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, event.InstanceID, event.ActivityID, event.EventType, string(event.EventData), event.EventDataBinary, event.DataType)
 	return err
+}
+
+// AppendHistoryIfLocked appends the event only while workerID holds the
+// instance's lock; it answers ErrLockNotHeld otherwise. A duplicate event is
+// a no-op, as for AppendHistory.
+func (s *MySQLStorage) AppendHistoryIfLocked(ctx context.Context, event *HistoryEvent, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		INSERT IGNORE INTO workflow_history (instance_id, activity_id, event_type, event_data, event_data_binary, data_type)
+		SELECT ?, ?, ?, ?, ?, ? FROM DUAL
+		WHERE EXISTS (
+			SELECT 1 FROM workflow_instances
+			WHERE instance_id = ? AND locked_by = ?
+		)
+	`, event.InstanceID, event.ActivityID, event.EventType, string(event.EventData), event.EventDataBinary, event.DataType, event.InstanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, event.InstanceID, workerID)
+	}
+	return nil
 }
 
 // GetHistoryPaginated retrieves history events with pagination.
@@ -695,64 +882,6 @@ func (s *MySQLStorage) RegisterTimerSubscription(ctx context.Context, sub *Timer
 	return err
 }
 
-// RegisterTimerSubscriptionAndReleaseLock atomically registers timer and releases lock.
-func (s *MySQLStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Context, sub *TimerSubscription, instanceID, workerID string) error {
-	var needTx bool
-	if !s.InTransaction(ctx) {
-		var err error
-		ctx, err = s.BeginTransaction(ctx)
-		if err != nil {
-			return err
-		}
-		needTx = true
-		defer func() {
-			if needTx {
-				_ = s.RollbackTransaction(ctx)
-			}
-		}()
-	}
-
-	conn := s.getConn(ctx)
-
-	// Register timer
-	_, err := conn.ExecContext(ctx, `
-		INSERT IGNORE INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
-		VALUES (?, ?, ?, ?)
-	`, sub.InstanceID, sub.TimerID, sub.ExpiresAt.UTC(), sub.ActivityID)
-	if err != nil {
-		return err
-	}
-
-	// Update status
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET status = 'waiting_for_timer', updated_at = NOW()
-		WHERE instance_id = ?
-	`, instanceID)
-	if err != nil {
-		return err
-	}
-
-	// Release lock
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL
-		WHERE instance_id = ? AND locked_by = ?
-	`, instanceID, workerID)
-	if err != nil {
-		return err
-	}
-
-	if needTx {
-		if err := s.CommitTransaction(ctx); err != nil {
-			return err
-		}
-		needTx = false
-	}
-
-	return nil
-}
-
 // RemoveTimerSubscription removes a timer subscription.
 func (s *MySQLStorage) RemoveTimerSubscription(ctx context.Context, instanceID, timerID string) error {
 	conn := s.getConn(ctx)
@@ -809,7 +938,8 @@ func (s *MySQLStorage) AddOutboxEvent(ctx context.Context, event *OutboxEvent) e
 }
 
 // GetPendingOutboxEvents retrieves pending outbox events.
-// Uses SELECT FOR UPDATE SKIP LOCKED for concurrent workers.
+// Peek only: concurrent relayers must use ClaimOutboxEvents, which moves the
+// rows to 'processing' atomically.
 func (s *MySQLStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
@@ -818,7 +948,6 @@ func (s *MySQLStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
 		LIMIT ?
-		FOR UPDATE SKIP LOCKED
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -841,12 +970,94 @@ func (s *MySQLStorage) GetPendingOutboxEvents(ctx context.Context, limit int) ([
 	return events, rows.Err()
 }
 
+// ClaimOutboxEvents atomically moves a batch of events to 'processing' and
+// returns them. The SELECT FOR UPDATE SKIP LOCKED inside the transaction
+// gives concurrent relayers disjoint batches. published_at is stamped with
+// the claim time so a claim left behind by a crashed relayer becomes
+// claimable again past staleBefore.
+func (s *MySQLStorage) ClaimOutboxEvents(ctx context.Context, staleBefore time.Time, limit int) ([]*OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
+		FROM outbox_events
+		WHERE status = 'pending'
+		OR (status = 'processing' AND COALESCE(claimed_at, published_at) < ?)
+		ORDER BY created_at ASC
+		LIMIT ?
+		FOR UPDATE SKIP LOCKED
+	`, staleBefore.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var events []*OutboxEvent
+	var ids []string
+	for rows.Next() {
+		var e OutboxEvent
+		var eventData sql.NullString
+		if err := rows.Scan(&e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &e.CreatedAt); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if eventData.Valid {
+			e.EventData = []byte(eventData.String)
+		}
+		events = append(events, &e)
+		ids = append(ids, e.EventID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	if len(ids) == 0 {
+		return nil, tx.Commit()
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE outbox_events
+		SET status = 'processing', claimed_at = NOW()
+		WHERE event_id IN (%s)
+	`, strings.Join(placeholders, ",")), args...); err != nil {
+		return nil, err
+	}
+
+	return events, tx.Commit()
+}
+
+// ReleaseOutboxEvent returns a claimed event to 'pending'.
+func (s *MySQLStorage) ReleaseOutboxEvent(ctx context.Context, eventID string) error {
+	conn := s.getConn(ctx)
+	_, err := conn.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'pending', claimed_at = NULL
+		WHERE event_id = ? AND status = 'processing'
+	`, eventID)
+	return err
+}
+
 // MarkOutboxEventSent marks an outbox event as published.
 func (s *MySQLStorage) MarkOutboxEventSent(ctx context.Context, eventID string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE outbox_events
-		SET status = 'published', published_at = NOW()
+		SET status = 'published', published_at = NOW(), claimed_at = NULL
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -857,7 +1068,7 @@ func (s *MySQLStorage) MarkOutboxEventFailed(ctx context.Context, eventID string
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE outbox_events
-		SET status = 'failed'
+		SET status = 'failed', claimed_at = NULL
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -1041,36 +1252,166 @@ func (s *MySQLStorage) GetChannelMode(ctx context.Context, channelName string) (
 }
 
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
-func (s *MySQLStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
+func (s *MySQLStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+	var needTx bool
+	if !s.InTransaction(ctx) {
+		var err error
+		ctx, err = s.BeginTransaction(ctx)
+		if err != nil {
+			return false, err
+		}
+		needTx = true
+		defer func() {
+			if needTx {
+				_ = s.RollbackTransaction(ctx)
+			}
+		}()
+	}
+
 	conn := s.getConn(ctx)
 
-	// Update subscription with activity_id
-	_, err := conn.ExecContext(ctx, `
+	// A publish committed between the caller's pending check and this
+	// registration would never be delivered to a freshly registered wait;
+	// detect it here and keep the instance running instead of suspending.
+	pending, err := s.hasPendingChannelMessage(ctx, instanceID, channelName)
+	if err != nil {
+		return false, err
+	}
+	if pending {
+		_, err = conn.ExecContext(ctx, `
+			UPDATE workflow_instances
+			SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
+			WHERE instance_id = ? AND locked_by = ?
+		`, instanceID, workerID)
+		if err != nil {
+			return false, err
+		}
+		if needTx {
+			if err := s.CommitTransaction(ctx); err != nil {
+				return false, err
+			}
+			needTx = false
+		}
+		return false, nil
+	}
+
+	// Update subscription with activity_id (non-null = waiting state)
+	_, err = conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
 		SET timeout_at = ?, activity_id = ?
 		WHERE instance_id = ? AND channel = ?
 	`, timeoutAt, activityID, instanceID, channelName)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	// Update instance status
+	// Update instance status and release the lock
 	_, err = conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET status = ?, locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
+		WHERE instance_id = ? AND locked_by = ?
+	`, StatusWaitingForMessage, instanceID, workerID)
+	if err != nil {
+		return false, err
+	}
+
+	if needTx {
+		if err := s.CommitTransaction(ctx); err != nil {
+			return false, err
+		}
+		needTx = false
+	}
+	return true, nil
+}
+
+// hasPendingChannelMessage reports whether the instance has an undelivered
+// message on the channel, using the same semantics as
+// GetPendingChannelMessagesForInstance. It must be called on a connection or
+// transaction that sees a consistent snapshot (inside the registration tx).
+func (s *MySQLStorage) hasPendingChannelMessage(ctx context.Context, instanceID, channelName string) (bool, error) {
+	conn := s.getConn(ctx)
+
+	var mode string
+	err := conn.QueryRowContext(ctx, `
+		SELECT mode FROM channel_subscriptions
+		WHERE instance_id = ? AND channel = ?
+	`, instanceID, channelName).Scan(&mode)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var exists int
+	if mode == string(ChannelModeCompeting) {
+		err = conn.QueryRowContext(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
+				LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+				WHERE m.channel = ? AND (
+					c.message_id IS NULL
+					OR c.instance_id = ?
+					OR c.claimed_at < ?
+					OR ci.status IN ('completed', 'failed', 'cancelled')
+				)
+			)
+		`, channelName, instanceID, time.Now().UTC().Add(-ChannelClaimStaleSeconds*time.Second)).Scan(&exists)
+	} else {
+		err = conn.QueryRowContext(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_delivery_cursors dc
+					ON dc.instance_id = ? AND dc.channel = ?
+				WHERE m.channel = ? AND m.id > COALESCE(dc.last_delivered_id, 0)
+			)
+		`, instanceID, channelName, channelName).Scan(&exists)
+	}
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
+}
+
+func (s *MySQLStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int, error) {
+	conn := s.getConn(ctx)
+	res, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET status = ?, updated_at = NOW()
-		WHERE instance_id = ?
-	`, StatusWaitingForMessage, instanceID)
+		WHERE status = ? AND locked_by IS NULL
+		AND instance_id IN (
+			SELECT s.instance_id FROM channel_subscriptions s
+			WHERE s.activity_id IS NOT NULL AND s.activity_id != ''
+			AND (
+				(s.mode = ? AND EXISTS (
+					SELECT 1 FROM channel_messages m
+					LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
+					LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+					WHERE m.channel = s.channel AND (
+						c.message_id IS NULL
+						OR c.instance_id = s.instance_id
+						OR c.claimed_at < ?
+						OR ci.status IN ('completed', 'failed', 'cancelled')
+					)
+				))
+				OR
+				(s.mode != ? AND EXISTS (
+					SELECT 1 FROM channel_messages m
+					LEFT JOIN channel_delivery_cursors dc
+						ON dc.instance_id = s.instance_id AND dc.channel = s.channel
+					WHERE m.channel = s.channel AND m.id > COALESCE(dc.last_delivered_id, 0)
+				))
+			)
+		)
+	`, StatusRunning, StatusWaitingForMessage, string(ChannelModeCompeting),
+		time.Now().UTC().Add(-ChannelClaimStaleSeconds*time.Second),
+		string(ChannelModeCompeting))
 	if err != nil {
-		return err
+		return 0, err
 	}
-
-	// Release lock
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
-		WHERE instance_id = ? AND locked_by = ?
-	`, instanceID, workerID)
-	return err
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // GetPendingChannelMessages retrieves pending messages for a channel after a given ID.
@@ -1151,16 +1492,24 @@ func (s *MySQLStorage) GetPendingChannelMessagesForInstance(ctx context.Context,
 		`
 		args = []any{channelName, cursorID}
 	} else {
-		// Competing mode: Get unclaimed messages
+		// Competing mode: messages no live other instance has claimed. Claims
+		// by this instance stay visible so a replay can drain them after a
+		// crash; stale claims and claims by terminal owners are void.
 		query = `
 			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
 			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
-			WHERE m.channel = ? AND c.message_id IS NULL
+			LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+			WHERE m.channel = ? AND (
+				c.message_id IS NULL
+				OR c.instance_id = ?
+				OR c.claimed_at < ?
+				OR ci.status IN ('completed', 'failed', 'cancelled')
+			)
 			ORDER BY m.id ASC
 			LIMIT 10
 		`
-		args = []any{channelName}
+		args = []any{channelName, instanceID, time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second)}
 	}
 
 	rows, err := conn.QueryContext(ctx, query, args...)
@@ -1193,11 +1542,36 @@ func (s *MySQLStorage) GetPendingChannelMessagesForInstance(ctx context.Context,
 // ClaimChannelMessage claims a message for competing mode.
 func (s *MySQLStorage) ClaimChannelMessage(ctx context.Context, messageID int64, instanceID string) (bool, error) {
 	conn := s.getConn(ctx)
-	// MySQL uses INSERT IGNORE instead of ON CONFLICT DO NOTHING
+
+	// Insert resolves the numeric row id to the message_id UUID the claims
+	// table references; a missing message simply inserts nothing.
 	result, err := conn.ExecContext(ctx, `
 		INSERT IGNORE INTO channel_message_claims (message_id, instance_id)
-		VALUES (?, ?)
-	`, messageID, instanceID)
+		SELECT m.message_id, ? FROM channel_messages m WHERE m.id = ?
+	`, instanceID, messageID)
+	if err != nil {
+		return false, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return false, err
+	} else if affected > 0 {
+		return true, nil
+	}
+
+	// Take over our own claim (idempotent), a stale claim, or one whose owner
+	// reached a terminal status without consuming the message.
+	now := time.Now().UTC()
+	result, err = conn.ExecContext(ctx, `
+		UPDATE channel_message_claims
+		SET instance_id = ?, claimed_at = ?
+		WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = ?)
+			AND (instance_id = ?
+				OR claimed_at < ?
+				OR instance_id IN (
+					SELECT instance_id FROM workflow_instances
+					WHERE status IN ('completed', 'failed', 'cancelled')
+				))
+	`, instanceID, now, messageID, instanceID, now.Add(-ChannelClaimStaleSeconds*time.Second))
 	if err != nil {
 		return false, err
 	}
@@ -1211,7 +1585,14 @@ func (s *MySQLStorage) ClaimChannelMessage(ctx context.Context, messageID int64,
 // DeleteChannelMessage deletes a message from the channel.
 func (s *MySQLStorage) DeleteChannelMessage(ctx context.Context, messageID int64) error {
 	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `DELETE FROM channel_messages WHERE id = ?`, messageID)
+	_, err := conn.ExecContext(ctx, `
+		DELETE FROM channel_message_claims
+		WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = ?)
+	`, messageID)
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `DELETE FROM channel_messages WHERE id = ?`, messageID)
 	return err
 }
 
@@ -1344,6 +1725,20 @@ func (s *MySQLStorage) DeliverChannelMessageWithLock(
 		return nil, fmt.Errorf("failed to get subscription info: %w", err)
 	}
 
+	// Step 3.5: For competing mode, claim the message for this instance first
+	// so other competing subscribers cannot also consume it (exactly-once).
+	if subscriptionMode == string(ChannelModeCompeting) {
+		claimed, err := s.ClaimChannelMessage(ctx, message.ID, instanceID)
+		if err != nil {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, fmt.Errorf("failed to claim message: %w", err)
+		}
+		if !claimed {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, nil
+		}
+	}
+
 	// Step 4: Record message in history using the activity_id from subscription
 	// Wrap the message in ReceivedMessage format so Receive can unmarshal it correctly
 	wrappedData := map[string]any{
@@ -1371,6 +1766,19 @@ func (s *MySQLStorage) DeliverChannelMessageWithLock(
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to record history: %w", err)
+	}
+
+	// Competing mode consumes the message: delete it (cascading the claim)
+	// once history is durable so it cannot be delivered again.
+	if subscriptionMode == string(ChannelModeCompeting) {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM channel_message_claims WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = ?)`, message.ID); err != nil {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, fmt.Errorf("failed to delete consumed claim: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM channel_messages WHERE id = ?`, message.ID); err != nil {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, fmt.Errorf("failed to delete consumed message: %w", err)
+		}
 	}
 
 	// Step 4.5: Update delivery cursor for broadcast mode

@@ -2,14 +2,47 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 )
 
 // ErrWorkflowNotCancellable indicates that the workflow cannot be cancelled.
 // This happens when the workflow is already completed, cancelled, failed, or does not exist.
 var ErrWorkflowNotCancellable = errors.New("workflow cannot be cancelled")
+
+// ErrInstanceAlreadyExists indicates that CreateInstance found an instance
+// with the same ID. Callers can use it for idempotent starts: starting the
+// same instance ID twice results in a single instance.
+var ErrInstanceAlreadyExists = errors.New("workflow instance already exists")
+
+// ErrLockNotHeld is returned by the IfLocked operations and by RefreshLock
+// when the worker no longer holds the instance's lock (it expired and another
+// worker acquired it, or it was released). Writes guarded by it are fencing
+// checks: they are refused instead of being applied over a lost lock.
+var ErrLockNotHeld = errors.New("workflow instance lock is not held by this worker")
+
+// ChannelClaimStaleSeconds bounds how long a competing-mode message claim may
+// stay unconsumed before another instance may take it over. A claim normally
+// lives only for the window between claiming and the workflow recording the
+// receive result, so a claim older than this implies its owner died
+// mid-consume. Aligned with the workflow lock lease duration.
+const ChannelClaimStaleSeconds = 300
+
+// NewLockIdentity returns a fresh lock-holder identity for one claim epoch
+// ("workerID#epoch"). Store it in place of the plain workerID everywhere a
+// lock operation expects a holder: every fenced write (`...IfLocked`) checks
+// `locked_by = holder`, so a stale write issued after the instance was
+// re-claimed under a newer epoch is rejected — even when the new holder is
+// the same worker process (e.g. a run that lost its lease, or a restarted
+// worker reusing the same workerID).
+func NewLockIdentity(workerID string) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%s#%x", workerID, b[:])
+}
 
 // Executor is a database executor interface that can be either *sql.DB or *sql.Tx.
 // This allows users to execute custom SQL queries within the same transaction
@@ -105,11 +138,20 @@ type InstanceManager interface {
 	// UpdateInstanceStatus updates the status and related fields.
 	UpdateInstanceStatus(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string) error
 
+	// UpdateInstanceStatusIfLocked is UpdateInstanceStatus with a fencing
+	// check: the update is applied only while workerID holds the instance's
+	// lock, and ErrLockNotHeld is returned otherwise.
+	UpdateInstanceStatusIfLocked(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string, workerID string) error
+
 	// UpdateInstanceActivity updates the current activity ID.
 	UpdateInstanceActivity(ctx context.Context, instanceID string, activityID string) error
 
 	// UpdateInstanceOutput updates the output data for a completed workflow.
 	UpdateInstanceOutput(ctx context.Context, instanceID string, outputData []byte) error
+
+	// UpdateInstanceOutputIfLocked is UpdateInstanceOutput with a fencing
+	// check on workerID, as UpdateInstanceStatusIfLocked.
+	UpdateInstanceOutputIfLocked(ctx context.Context, instanceID string, outputData []byte, workerID string) error
 
 	// CancelInstance marks a workflow as cancelled.
 	CancelInstance(ctx context.Context, instanceID string, reason string) error
@@ -122,8 +164,11 @@ type InstanceManager interface {
 	// Returns workflows with status='running' that don't have an active lock.
 	// These are typically workflows that had a message delivered and are waiting
 	// for a worker to pick them up and resume execution.
+	// workflowNames narrows the result to the named workflows: a worker asks
+	// for only the workflows it can run, so that instances of other workflows
+	// are left for other workers. nil (or empty) matches every workflow.
 	// limit specifies the maximum number of workflows to return (0 = default 100).
-	FindResumableWorkflows(ctx context.Context, limit int) ([]*ResumableWorkflow, error)
+	FindResumableWorkflows(ctx context.Context, workflowNames []string, limit int) ([]*ResumableWorkflow, error)
 }
 
 // ListInstancesOptions defines options for listing instances.
@@ -157,18 +202,33 @@ type LockManager interface {
 	// ReleaseLock releases the lock on a workflow instance.
 	ReleaseLock(ctx context.Context, instanceID, workerID string) error
 
-	// RefreshLock extends the lock timeout.
+	// RefreshLock extends the lock timeout. It answers ErrLockNotHeld when the
+	// worker no longer holds the lock.
 	RefreshLock(ctx context.Context, instanceID, workerID string, timeoutSec int) error
 
 	// CleanupStaleLocks releases locks that have expired and returns
 	// information about running workflows that need to be resumed.
 	CleanupStaleLocks(ctx context.Context, timeoutSec int) ([]StaleWorkflowInfo, error)
+
+	// ClaimResumableWorkflows atomically claims up to limit resumable
+	// instances for workerID: one statement both selects claimable rows
+	// (running, this worker's workflow names, unlocked or lease-expired) and
+	// installs the lease, so concurrent workers take disjoint sets instead of
+	// all racing to claim the same head rows that FindResumableWorkflows
+	// returns. workflowNames must be non-empty.
+	ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*ResumableWorkflow, error)
 }
 
 // HistoryManager handles workflow execution history.
 type HistoryManager interface {
 	// AppendHistory adds a new history event.
 	AppendHistory(ctx context.Context, event *HistoryEvent) error
+
+	// AppendHistoryIfLocked is AppendHistory with a fencing check: the event
+	// is appended only while workerID holds the instance's lock, and
+	// ErrLockNotHeld is returned otherwise. A duplicate (instance_id,
+	// activity_id) is a no-op as it is for AppendHistory.
+	AppendHistoryIfLocked(ctx context.Context, event *HistoryEvent, workerID string) error
 
 	// GetHistoryPaginated retrieves history events for an instance with pagination.
 	// Returns events with id > afterID, up to limit events.
@@ -184,14 +244,6 @@ type TimerSubscriptionManager interface {
 	// RegisterTimerSubscription registers a workflow to wait for a timer.
 	RegisterTimerSubscription(ctx context.Context, sub *TimerSubscription) error
 
-	// RegisterTimerSubscriptionAndReleaseLock atomically registers a timer
-	// and releases the workflow lock.
-	RegisterTimerSubscriptionAndReleaseLock(
-		ctx context.Context,
-		sub *TimerSubscription,
-		instanceID, workerID string,
-	) error
-
 	// FindExpiredTimers finds timers that have expired.
 	// limit specifies the maximum number of timers to return (0 = default 100).
 	FindExpiredTimers(ctx context.Context, limit int) ([]*TimerSubscription, error)
@@ -206,8 +258,21 @@ type OutboxManager interface {
 	AddOutboxEvent(ctx context.Context, event *OutboxEvent) error
 
 	// GetPendingOutboxEvents retrieves pending events for sending.
-	// Uses SELECT FOR UPDATE SKIP LOCKED for concurrent workers.
+	// Peek only: concurrent relayers must use ClaimOutboxEvents, which moves
+	// the rows to 'processing' atomically.
 	GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error)
+
+	// ClaimOutboxEvents atomically moves up to limit events to 'processing'
+	// and returns them, so concurrent relayers take disjoint batches. It
+	// claims 'pending' events and 'processing' events whose claim is older
+	// than staleBefore (a crashed relayer's leftovers: at-least-once delivery
+	// already tolerates the resulting rare duplicate). For 'processing' rows
+	// published_at holds the claim time.
+	ClaimOutboxEvents(ctx context.Context, staleBefore time.Time, limit int) ([]*OutboxEvent, error)
+
+	// ReleaseOutboxEvent returns a claimed ('processing') event to 'pending'
+	// for a later attempt, e.g. after a transient send failure.
+	ReleaseOutboxEvent(ctx context.Context, eventID string) error
 
 	// MarkOutboxEventSent marks an event as successfully sent.
 	MarkOutboxEventSent(ctx context.Context, eventID string) error
@@ -256,12 +321,25 @@ type ChannelManager interface {
 	GetChannelMode(ctx context.Context, channelName string) (ChannelMode, error)
 
 	// RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait
-	// and releases the workflow lock.
+	// and releases the workflow lock, in a single transaction. It re-checks pending
+	// messages inside that transaction: a message committed between the caller's
+	// earlier pending check and this call must not leave the instance waiting
+	// forever. When a pending message exists it does not register the wait; it
+	// only releases the lock with the instance still 'running' so a resumption
+	// drains the message, and returns registered=false.
 	RegisterChannelReceiveAndReleaseLock(
 		ctx context.Context,
 		instanceID, channelName, workerID, activityID string,
 		timeoutAt *time.Time,
-	) error
+	) (registered bool, err error)
+
+	// RequeueChannelWaitsWithPending flips instances back to 'running' when they
+	// are waiting for a channel message that has already arrived. This is the
+	// backstop for the publish/registration race the registration transaction
+	// cannot cover (a publisher's waiter scan that ran between the pending check
+	// and the commit): it bounds the wakeup delay to one sweep interval and also
+	// heals waits stranded by notification loss. Returns the number requeued.
+	RequeueChannelWaitsWithPending(ctx context.Context) (int, error)
 
 	// GetPendingChannelMessages retrieves pending messages for a channel after a given ID.
 	GetPendingChannelMessages(ctx context.Context, channelName string, afterID int64, limit int) ([]*ChannelMessage, error)
@@ -271,7 +349,13 @@ type ChannelManager interface {
 	// For competing mode: Returns unclaimed messages (not yet claimed by any instance)
 	GetPendingChannelMessagesForInstance(ctx context.Context, instanceID, channelName string) ([]*ChannelMessage, error)
 
-	// ClaimChannelMessage claims a message for competing mode (returns false if already claimed).
+	// ClaimChannelMessage claims a channel_messages row (identified by its
+	// numeric id) for competing mode. The claim is keyed on the row's
+	// message_id UUID, matching channel_message_claims's foreign key. It is
+	// idempotent for the same instance and allows takeover of claims whose
+	// owner is in a terminal status or whose claimed_at is older than
+	// ChannelClaimStaleSeconds (crash between claim and history record).
+	// Returns false only when another live instance holds a fresh claim.
 	ClaimChannelMessage(ctx context.Context, messageID int64, instanceID string) (bool, error)
 
 	// DeleteChannelMessage deletes a message from the channel.

@@ -473,7 +473,12 @@ func TestMySQLIntegration_TransactionCommit(t *testing.T) {
 	}
 }
 
-func TestMySQLIntegration_SelectForUpdateSkipLocked(t *testing.T) {
+// TestMySQLIntegration_OutboxClaimSkipLocked verifies the production claim
+// path on a real database: ClaimOutboxEvents atomically marks events
+// 'processing' inside a transaction via FOR UPDATE SKIP LOCKED, so
+// concurrent relayers receive disjoint batches, released events become
+// claimable again, and stale claims are reclaimed.
+func TestMySQLIntegration_OutboxClaimSkipLocked(t *testing.T) {
 	store, cleanup := setupMySQLContainer(t)
 	defer cleanup()
 
@@ -493,48 +498,57 @@ func TestMySQLIntegration_SelectForUpdateSkipLocked(t *testing.T) {
 		store.AddOutboxEvent(ctx, event)
 	}
 
-	// Start transaction 1 and get pending events
-	ctx1, _ := store.BeginTransaction(ctx)
+	stale := time.Now().Add(-time.Minute)
 
-	events1, err := store.GetPendingOutboxEvents(ctx1, 2)
+	// Relayer A claims a batch of 2 -> marked 'processing'
+	claimed1, err := store.ClaimOutboxEvents(ctx, stale, 2)
 	if err != nil {
-		t.Fatalf("GetPendingOutboxEvents (tx1) failed: %v", err)
+		t.Fatalf("ClaimOutboxEvents (A) failed: %v", err)
 	}
-	if len(events1) != 2 {
-		t.Errorf("tx1: len(events) = %d, want 2", len(events1))
+	if len(claimed1) != 2 {
+		t.Errorf("A: len(claimed) = %d, want 2", len(claimed1))
 	}
 
-	// Start transaction 2 and get pending events
-	// With FOR UPDATE SKIP LOCKED, it should skip the locked rows
-	ctx2, _ := store.BeginTransaction(ctx)
-
-	events2, err := store.GetPendingOutboxEvents(ctx2, 2)
+	// Relayer B claims -> only the remaining pending row (disjoint from A)
+	claimed2, err := store.ClaimOutboxEvents(ctx, stale, 2)
 	if err != nil {
-		t.Fatalf("GetPendingOutboxEvents (tx2) failed: %v", err)
+		t.Fatalf("ClaimOutboxEvents (B) failed: %v", err)
 	}
-
-	// With SKIP LOCKED, tx2 should not get the same locked rows as tx1.
-	// It should get at most 1 event (the unlocked one).
-	// Note: MySQL may return 0 events in some cases due to different
-	// SKIP LOCKED behavior compared to PostgreSQL.
-	if len(events2) > 1 {
-		t.Errorf("tx2: len(events) = %d, want <= 1 (SKIP LOCKED)", len(events2))
+	if len(claimed2) != 1 {
+		t.Errorf("B: len(claimed) = %d, want 1", len(claimed2))
 	}
-
-	// Verify that tx2 didn't get any of the same events as tx1
-	eventIDs1 := make(map[string]bool)
-	for _, e := range events1 {
-		eventIDs1[e.EventID] = true
+	seen := make(map[string]bool)
+	for _, e := range claimed1 {
+		seen[e.EventID] = true
 	}
-	for _, e := range events2 {
-		if eventIDs1[e.EventID] {
-			t.Errorf("tx2 got same event as tx1: %s", e.EventID)
+	for _, e := range claimed2 {
+		if seen[e.EventID] {
+			t.Errorf("B claimed an event already held by A: %s", e.EventID)
 		}
 	}
 
-	// Cleanup transactions
-	store.RollbackTransaction(ctx1)
-	store.RollbackTransaction(ctx2)
+	// Releasing an event returns it to pending and makes it claimable again
+	if err := store.ReleaseOutboxEvent(ctx, "event-1"); err != nil {
+		t.Fatalf("ReleaseOutboxEvent failed: %v", err)
+	}
+	claimed3, err := store.ClaimOutboxEvents(ctx, stale, 5)
+	if err != nil {
+		t.Fatalf("ClaimOutboxEvents (C) failed: %v", err)
+	}
+	if len(claimed3) != 1 || claimed3[0].EventID != "event-1" {
+		t.Errorf("C: expected only released event-1, got %v", claimed3)
+	}
+
+	// Stale reclaim: every claimed row is older than the cutoff, so all three
+	// events are claimable again (pending event-1 plus stale processing rows).
+	future := time.Now().Add(time.Minute)
+	claimed4, err := store.ClaimOutboxEvents(ctx, future, 5)
+	if err != nil {
+		t.Fatalf("ClaimOutboxEvents (stale) failed: %v", err)
+	}
+	if len(claimed4) != 3 {
+		t.Errorf("stale: len(claimed) = %d, want 3", len(claimed4))
+	}
 }
 
 func TestMySQLIntegration_ChannelOperations(t *testing.T) {
@@ -694,4 +708,10 @@ func TestMySQLIntegration_ListInstances(t *testing.T) {
 	if len(result2.Instances) != 2 {
 		t.Errorf("len(instances) page 2 = %d, want 2", len(result2.Instances))
 	}
+}
+
+func TestMySQLIntegration_CompetingClaims(t *testing.T) {
+	store, cleanup := setupMySQLContainer(t)
+	defer cleanup()
+	testCompetingClaims(t, store, store.db, func(int) string { return "?" })
 }

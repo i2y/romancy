@@ -5,12 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite"
 )
 
 // txKey is the context key for transactions.
@@ -207,6 +208,14 @@ func (s *SQLiteStorage) CreateInstance(ctx context.Context, instance *WorkflowIn
 		string(instance.InputData), instance.SourceHash, instance.OwnerService,
 		instance.StartedAt.UTC().Format("2006-01-02 15:04:05"),
 		instance.UpdatedAt.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		var sqErr *sqlite3.Error
+		// SQLITE_CONSTRAINT (19): the insert's only constraint is the instance
+		// ID's uniqueness, so a violation means the instance exists.
+		if errors.As(err, &sqErr) && sqErr.Code()&0xff == 19 {
+			return fmt.Errorf("%w: %w", ErrInstanceAlreadyExists, err)
+		}
+	}
 	return err
 }
 
@@ -303,6 +312,58 @@ func (s *SQLiteStorage) UpdateInstanceStatus(ctx context.Context, instanceID str
 	return err
 }
 
+// lockHolder answers the worker that holds the instance's lock, or "" when it
+// is unlocked or the instance does not exist.
+func (s *SQLiteStorage) lockHolder(ctx context.Context, instanceID string) (string, error) {
+	var lockedBy sql.NullString
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT locked_by FROM workflow_instances WHERE instance_id = ?
+	`, instanceID).Scan(&lockedBy)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return lockedBy.String, nil
+}
+
+// lockLost checks, after a fenced write affected no row, whether the worker
+// still holds the lock: it answers ErrLockNotHeld when the lock is gone, and
+// nil when the lock is held (the write was a no-op for another reason).
+func (s *SQLiteStorage) lockLost(ctx context.Context, instanceID, workerID string) error {
+	holder, err := s.lockHolder(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	if holder == workerID {
+		return nil
+	}
+	return ErrLockNotHeld
+}
+
+// UpdateInstanceStatusIfLocked updates the status only while workerID holds
+// the instance's lock; it answers ErrLockNotHeld otherwise.
+func (s *SQLiteStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET status = ?, updated_at = datetime('now')
+		WHERE instance_id = ? AND locked_by = ?
+	`, status, instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
 // UpdateInstanceActivity updates the current activity ID.
 func (s *SQLiteStorage) UpdateInstanceActivity(ctx context.Context, instanceID, activityID string) error {
 	conn := s.getConn(ctx)
@@ -323,6 +384,28 @@ func (s *SQLiteStorage) UpdateInstanceOutput(ctx context.Context, instanceID str
 		WHERE instance_id = ?
 	`, string(outputData), instanceID)
 	return err
+}
+
+// UpdateInstanceOutputIfLocked updates the output only while workerID holds
+// the instance's lock; it answers ErrLockNotHeld otherwise.
+func (s *SQLiteStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instanceID string, outputData []byte, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET output_data = ?, status = 'completed', updated_at = datetime('now')
+		WHERE instance_id = ? AND locked_by = ?
+	`, string(outputData), instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
 }
 
 // CancelInstance cancels a workflow instance.
@@ -473,7 +556,7 @@ func (s *SQLiteStorage) ListInstances(ctx context.Context, opts ListInstancesOpt
 
 // FindResumableWorkflows finds workflows with status='running' that don't have an active lock.
 // These are workflows that had a message delivered and are waiting for a worker to resume them.
-func (s *SQLiteStorage) FindResumableWorkflows(ctx context.Context, limit int) ([]*ResumableWorkflow, error) {
+func (s *SQLiteStorage) FindResumableWorkflows(ctx context.Context, workflowNames []string, limit int) ([]*ResumableWorkflow, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -484,11 +567,20 @@ func (s *SQLiteStorage) FindResumableWorkflows(ctx context.Context, limit int) (
 		WHERE status = ?
 		AND (locked_by IS NULL OR locked_by = '')
 		AND framework = 'go'
-		ORDER BY updated_at ASC
-		LIMIT ?
 	`
+	args := []any{StatusRunning}
+	if len(workflowNames) > 0 {
+		placeholders := make([]string, len(workflowNames))
+		for i, name := range workflowNames {
+			placeholders[i] = "?"
+			args = append(args, name)
+		}
+		query += fmt.Sprintf(" AND workflow_name IN (%s)", strings.Join(placeholders, ","))
+	}
+	query += " ORDER BY updated_at ASC LIMIT ?"
+	args = append(args, limit)
 
-	rows, err := conn.QueryContext(ctx, query, StatusRunning, limit)
+	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -510,6 +602,67 @@ func (s *SQLiteStorage) FindResumableWorkflows(ctx context.Context, limit int) (
 }
 
 // --- Lock Manager ---
+
+// ClaimResumableWorkflows atomically selects claimable instances and installs
+// the lease in one statement. On SQLite the UPDATE itself is atomic under the
+// write lock, so no FOR UPDATE is needed; the IN-subquery's row set is
+// evaluated as of the statement, and two concurrent claimants take disjoint
+// sets because a row claimed by the first no longer matches.
+func (s *SQLiteStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*ResumableWorkflow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if len(workflowNames) == 0 {
+		return nil, nil
+	}
+	conn := s.getConn(ctx)
+	now := time.Now().UTC()
+	nowStr := now.Format("2006-01-02 15:04:05")
+	expiresStr := now.Add(time.Duration(leaseSec) * time.Second).Format("2006-01-02 15:04:05")
+
+	placeholders := make([]string, len(workflowNames))
+	for i := range workflowNames {
+		placeholders[i] = "?"
+	}
+	args := []any{workerID, nowStr, expiresStr, nowStr}
+	for _, name := range workflowNames {
+		args = append(args, name)
+	}
+	args = append(args, limit)
+
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
+		UPDATE workflow_instances
+		SET locked_by = ?, locked_at = ?, lock_expires_at = ?, updated_at = ?
+		WHERE instance_id IN (
+			SELECT instance_id FROM workflow_instances
+			WHERE status = '%s'
+			AND framework = 'go'
+			AND workflow_name IN (%s)
+			AND (locked_by IS NULL OR locked_by = '' OR datetime(lock_expires_at) < datetime('now'))
+			ORDER BY updated_at ASC
+			LIMIT ?
+		)
+		RETURNING instance_id, workflow_name
+	`, StatusRunning, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var workflows []*ResumableWorkflow
+	for rows.Next() {
+		var wf ResumableWorkflow
+		if err := rows.Scan(&wf.InstanceID, &wf.WorkflowName); err != nil {
+			return nil, err
+		}
+		workflows = append(workflows, &wf)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return workflows, nil
+}
 
 // TryAcquireLock attempts to acquire a lock on a workflow instance.
 func (s *SQLiteStorage) TryAcquireLock(ctx context.Context, instanceID, workerID string, timeoutSec int) (bool, error) {
@@ -557,12 +710,22 @@ func (s *SQLiteStorage) RefreshLock(ctx context.Context, instanceID, workerID st
 	conn := s.getConn(ctx)
 	expiresAt := time.Now().UTC().Add(time.Duration(timeoutSec) * time.Second)
 	expiresStr := expiresAt.Format("2006-01-02 15:04:05")
-	_, err := conn.ExecContext(ctx, `
+	result, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET lock_expires_at = ?, updated_at = datetime('now')
 		WHERE instance_id = ? AND locked_by = ?
 	`, expiresStr, instanceID, workerID)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrLockNotHeld
+	}
+	return nil
 }
 
 // CleanupStaleLocks cleans up expired locks and returns workflows to resume.
@@ -617,6 +780,33 @@ func (s *SQLiteStorage) AppendHistory(ctx context.Context, event *HistoryEvent) 
 		ON CONFLICT (instance_id, activity_id) DO NOTHING
 	`, event.InstanceID, event.ActivityID, event.EventType, string(event.EventData), event.EventDataBinary, event.DataType)
 	return err
+}
+
+// AppendHistoryIfLocked appends the event only while workerID holds the
+// instance's lock; it answers ErrLockNotHeld otherwise. A duplicate event is
+// a no-op, as for AppendHistory.
+func (s *SQLiteStorage) AppendHistoryIfLocked(ctx context.Context, event *HistoryEvent, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, event_data_binary, data_type)
+		SELECT ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (
+			SELECT 1 FROM workflow_instances
+			WHERE instance_id = ? AND locked_by = ?
+		)
+		ON CONFLICT (instance_id, activity_id) DO NOTHING
+	`, event.InstanceID, event.ActivityID, event.EventType, string(event.EventData), event.EventDataBinary, event.DataType, event.InstanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, event.InstanceID, workerID)
+	}
+	return nil
 }
 
 // GetHistoryPaginated retrieves history events with pagination.
@@ -689,66 +879,6 @@ func (s *SQLiteStorage) RegisterTimerSubscription(ctx context.Context, sub *Time
 		ON CONFLICT (instance_id, timer_id) DO NOTHING
 	`, sub.InstanceID, sub.TimerID, expiresStr, sub.ActivityID)
 	return err
-}
-
-// RegisterTimerSubscriptionAndReleaseLock atomically registers timer and releases lock.
-func (s *SQLiteStorage) RegisterTimerSubscriptionAndReleaseLock(ctx context.Context, sub *TimerSubscription, instanceID, workerID string) error {
-	var needTx bool
-	if !s.InTransaction(ctx) {
-		var err error
-		ctx, err = s.BeginTransaction(ctx)
-		if err != nil {
-			return err
-		}
-		needTx = true
-		defer func() {
-			if needTx {
-				_ = s.RollbackTransaction(ctx)
-			}
-		}()
-	}
-
-	conn := s.getConn(ctx)
-	expiresStr := sub.ExpiresAt.UTC().Format("2006-01-02 15:04:05")
-
-	// Register timer
-	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_timer_subscriptions (instance_id, timer_id, expires_at, activity_id)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT (instance_id, timer_id) DO NOTHING
-	`, sub.InstanceID, sub.TimerID, expiresStr, sub.ActivityID)
-	if err != nil {
-		return err
-	}
-
-	// Update status
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET status = 'waiting_for_timer', updated_at = datetime('now')
-		WHERE instance_id = ?
-	`, instanceID)
-	if err != nil {
-		return err
-	}
-
-	// Release lock
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL
-		WHERE instance_id = ? AND locked_by = ?
-	`, instanceID, workerID)
-	if err != nil {
-		return err
-	}
-
-	if needTx {
-		if err := s.CommitTransaction(ctx); err != nil {
-			return err
-		}
-		needTx = false
-	}
-
-	return nil
 }
 
 // RemoveTimerSubscription removes a timer subscription.
@@ -832,12 +962,59 @@ func (s *SQLiteStorage) GetPendingOutboxEvents(ctx context.Context, limit int) (
 	}
 	defer func() { _ = rows.Close() }()
 
+	return scanOutboxEvents(rows)
+}
+
+// ClaimOutboxEvents atomically moves a batch of events to 'processing' and
+// returns them. claimed_at is stamped with the claim time so a claim left
+// behind by a crashed relayer becomes claimable again past staleBefore.
+// SQLite serializes writers, so the single UPDATE is atomic without
+// FOR UPDATE; concurrent claimants take disjoint sets.
+func (s *SQLiteStorage) ClaimOutboxEvents(ctx context.Context, staleBefore time.Time, limit int) ([]*OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	conn := s.getConn(ctx)
+	nowStr := time.Now().UTC().Format("2006-01-02 15:04:05")
+	staleStr := staleBefore.UTC().Format("2006-01-02 15:04:05")
+
+	rows, err := conn.QueryContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'processing', claimed_at = ?
+		WHERE event_id IN (
+			SELECT event_id FROM outbox_events
+			WHERE status = 'pending'
+			OR (status = 'processing' AND datetime(COALESCE(claimed_at, published_at)) < datetime(?))
+			ORDER BY created_at ASC
+			LIMIT ?
+		)
+		RETURNING event_id, event_type, event_source, event_data, data_type, content_type, status, retry_count, created_at
+	`, nowStr, staleStr, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanOutboxEvents(rows)
+}
+
+// ReleaseOutboxEvent returns a claimed event to 'pending'.
+func (s *SQLiteStorage) ReleaseOutboxEvent(ctx context.Context, eventID string) error {
+	conn := s.getConn(ctx)
+	_, err := conn.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'pending', claimed_at = NULL
+		WHERE event_id = ? AND status = 'processing'
+	`, eventID)
+	return err
+}
+
+func scanOutboxEvents(rows *sql.Rows) ([]*OutboxEvent, error) {
 	var events []*OutboxEvent
 	for rows.Next() {
 		var e OutboxEvent
 		var eventData sql.NullString
 		var createdAtStr string
-
 		if err := rows.Scan(&e.EventID, &e.EventType, &e.EventSource, &eventData, &e.DataType, &e.ContentType, &e.Status, &e.RetryCount, &createdAtStr); err != nil {
 			return nil, err
 		}
@@ -855,7 +1032,7 @@ func (s *SQLiteStorage) MarkOutboxEventSent(ctx context.Context, eventID string)
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE outbox_events
-		SET status = 'published', published_at = datetime('now')
+		SET status = 'published', published_at = datetime('now'), claimed_at = NULL
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -866,7 +1043,7 @@ func (s *SQLiteStorage) MarkOutboxEventFailed(ctx context.Context, eventID strin
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE outbox_events
-		SET status = 'failed'
+		SET status = 'failed', claimed_at = NULL
 		WHERE event_id = ?
 	`, eventID)
 	return err
@@ -1068,40 +1245,171 @@ func (s *SQLiteStorage) GetChannelMode(ctx context.Context, channelName string) 
 
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
 // Waiting state is indicated by activity_id being non-null.
-func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) error {
+func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+	var needTx bool
+	if !s.InTransaction(ctx) {
+		var err error
+		ctx, err = s.BeginTransaction(ctx)
+		if err != nil {
+			return false, err
+		}
+		needTx = true
+		defer func() {
+			if needTx {
+				_ = s.RollbackTransaction(ctx)
+			}
+		}()
+	}
+
 	conn := s.getConn(ctx)
+
+	// A publish committed between the caller's pending check and this
+	// registration would never be delivered to a freshly registered wait;
+	// detect it here and keep the instance running instead of suspending.
+	pending, err := s.hasPendingChannelMessage(ctx, instanceID, channelName)
+	if err != nil {
+		return false, err
+	}
+	if pending {
+		_, err = conn.ExecContext(ctx, `
+			UPDATE workflow_instances
+			SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = datetime('now')
+			WHERE instance_id = ? AND locked_by = ?
+		`, instanceID, workerID)
+		if err != nil {
+			return false, err
+		}
+		if needTx {
+			if err := s.CommitTransaction(ctx); err != nil {
+				return false, err
+			}
+			needTx = false
+		}
+		return false, nil
+	}
 
 	// Update subscription to set activity_id (non-null = waiting state)
 	var timeoutStr sql.NullString
 	if timeoutAt != nil {
 		timeoutStr = sql.NullString{String: timeoutAt.UTC().Format("2006-01-02 15:04:05"), Valid: true}
 	}
-	_, err := conn.ExecContext(ctx, `
+	_, err = conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
 		SET timeout_at = ?, activity_id = ?
 		WHERE instance_id = ? AND channel = ?
 	`, timeoutStr, activityID, instanceID, channelName)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	// Update instance status
+	// Update instance status and release the lock
 	_, err = conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET status = ?, locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = datetime('now')
+		WHERE instance_id = ? AND locked_by = ?
+	`, StatusWaitingForMessage, instanceID, workerID)
+	if err != nil {
+		return false, err
+	}
+
+	if needTx {
+		if err := s.CommitTransaction(ctx); err != nil {
+			return false, err
+		}
+		needTx = false
+	}
+	return true, nil
+}
+
+// hasPendingChannelMessage reports whether the instance has an undelivered
+// message on the channel, using the same semantics as
+// GetPendingChannelMessagesForInstance. It must be called on a connection or
+// transaction that sees a consistent snapshot (inside the registration tx).
+func (s *SQLiteStorage) hasPendingChannelMessage(ctx context.Context, instanceID, channelName string) (bool, error) {
+	conn := s.getConn(ctx)
+
+	var mode string
+	err := conn.QueryRowContext(ctx, `
+		SELECT mode FROM channel_subscriptions
+		WHERE instance_id = ? AND channel = ?
+	`, instanceID, channelName).Scan(&mode)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var exists int
+	if mode == string(ChannelModeCompeting) {
+		staleBefore := time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second).Format("2006-01-02 15:04:05")
+		err = conn.QueryRowContext(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
+				LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+				WHERE m.channel = ? AND (
+					c.message_id IS NULL
+					OR c.instance_id = ?
+					OR c.claimed_at < ?
+					OR ci.status IN ('completed', 'failed', 'cancelled')
+				)
+			)
+		`, channelName, instanceID, staleBefore).Scan(&exists)
+	} else {
+		err = conn.QueryRowContext(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_delivery_cursors dc
+					ON dc.instance_id = ? AND dc.channel = ?
+				WHERE m.channel = ? AND m.id > COALESCE(dc.last_delivered_id, 0)
+			)
+		`, instanceID, channelName, channelName).Scan(&exists)
+	}
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
+}
+
+func (s *SQLiteStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int, error) {
+	conn := s.getConn(ctx)
+	res, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET status = ?, updated_at = datetime('now')
-		WHERE instance_id = ?
-	`, StatusWaitingForMessage, instanceID)
+		WHERE status = ? AND locked_by IS NULL
+		AND instance_id IN (
+			SELECT s.instance_id FROM channel_subscriptions s
+			WHERE s.activity_id IS NOT NULL AND s.activity_id != ''
+			AND (
+				(s.mode = ? AND EXISTS (
+					SELECT 1 FROM channel_messages m
+					LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
+					LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+					WHERE m.channel = s.channel AND (
+						c.message_id IS NULL
+						OR c.instance_id = s.instance_id
+						OR c.claimed_at < ?
+						OR ci.status IN ('completed', 'failed', 'cancelled')
+					)
+				))
+				OR
+				(s.mode != ? AND EXISTS (
+					SELECT 1 FROM channel_messages m
+					LEFT JOIN channel_delivery_cursors dc
+						ON dc.instance_id = s.instance_id AND dc.channel = s.channel
+					WHERE m.channel = s.channel AND m.id > COALESCE(dc.last_delivered_id, 0)
+				))
+			)
+		)
+	`, StatusRunning, StatusWaitingForMessage, string(ChannelModeCompeting),
+		time.Now().UTC().Add(-ChannelClaimStaleSeconds*time.Second).Format("2006-01-02 15:04:05"),
+		string(ChannelModeCompeting))
 	if err != nil {
-		return err
+		return 0, err
 	}
-
-	// Release lock
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = datetime('now')
-		WHERE instance_id = ? AND locked_by = ?
-	`, instanceID, workerID)
-	return err
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // GetPendingChannelMessages retrieves pending messages for a channel after a given ID.
@@ -1187,16 +1495,25 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 		`
 		args = []any{channelName, cursorID}
 	} else {
-		// Competing mode: Get unclaimed messages
+		// Competing mode: messages no live other instance has claimed. Claims by
+		// this instance stay visible so a replay can drain them after a crash;
+		// stale claims and claims by terminal owners are void.
+		staleBefore := time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second).Format("2006-01-02 15:04:05")
 		query = `
 			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
 			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
-			WHERE m.channel = ? AND c.message_id IS NULL
+			LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+			WHERE m.channel = ? AND (
+				c.message_id IS NULL
+				OR c.instance_id = ?
+				OR c.claimed_at < ?
+				OR ci.status IN ('completed', 'failed', 'cancelled')
+			)
 			ORDER BY m.id ASC
 			LIMIT 10
 		`
-		args = []any{channelName}
+		args = []any{channelName, instanceID, staleBefore}
 	}
 
 	rows, err := conn.QueryContext(ctx, query, args...)
@@ -1234,11 +1551,37 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 // ClaimChannelMessage claims a message for competing mode.
 func (s *SQLiteStorage) ClaimChannelMessage(ctx context.Context, messageID int64, instanceID string) (bool, error) {
 	conn := s.getConn(ctx)
+
+	// Insert resolves the numeric row id to the message_id UUID the claims
+	// table references; a missing message simply inserts nothing.
 	result, err := conn.ExecContext(ctx, `
 		INSERT INTO channel_message_claims (message_id, instance_id)
-		VALUES (?, ?)
+		SELECT m.message_id, ? FROM channel_messages m WHERE m.id = ?
 		ON CONFLICT (message_id) DO NOTHING
-	`, messageID, instanceID)
+	`, instanceID, messageID)
+	if err != nil {
+		return false, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return false, err
+	} else if affected > 0 {
+		return true, nil
+	}
+
+	// Take over our own claim (idempotent), a stale claim, or one whose owner
+	// reached a terminal status without consuming the message.
+	staleBefore := time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second).Format("2006-01-02 15:04:05")
+	result, err = conn.ExecContext(ctx, `
+		UPDATE channel_message_claims
+		SET instance_id = ?, claimed_at = datetime('now')
+		WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = ?)
+			AND (instance_id = ?
+				OR claimed_at < ?
+				OR instance_id IN (
+					SELECT instance_id FROM workflow_instances
+					WHERE status IN ('completed', 'failed', 'cancelled')
+				))
+	`, instanceID, messageID, instanceID, staleBefore)
 	if err != nil {
 		return false, err
 	}
@@ -1252,7 +1595,14 @@ func (s *SQLiteStorage) ClaimChannelMessage(ctx context.Context, messageID int64
 // DeleteChannelMessage deletes a message from the channel.
 func (s *SQLiteStorage) DeleteChannelMessage(ctx context.Context, messageID int64) error {
 	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `DELETE FROM channel_messages WHERE id = ?`, messageID)
+	_, err := conn.ExecContext(ctx, `
+		DELETE FROM channel_message_claims
+		WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = ?)
+	`, messageID)
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `DELETE FROM channel_messages WHERE id = ?`, messageID)
 	return err
 }
 
@@ -1397,6 +1747,20 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 		historyActivityID = fmt.Sprintf("channel:%s:%d", channelName, message.ID)
 	}
 
+	// For competing mode, claim the message for this instance first so other
+	// competing subscribers cannot also consume it (exactly-once).
+	if subscriptionMode == string(ChannelModeCompeting) {
+		claimed, err := s.ClaimChannelMessage(ctx, message.ID, instanceID)
+		if err != nil {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, fmt.Errorf("failed to claim message: %w", err)
+		}
+		if !claimed {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, nil
+		}
+	}
+
 	// Step 3: Record message in history using the correct activity ID
 	// Wrap the message in ReceivedMessage format so Receive can unmarshal it correctly
 	wrappedData := map[string]any{
@@ -1424,6 +1788,19 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to record history: %w", err)
+	}
+
+	// Competing mode consumes the message: delete it (cascading the claim)
+	// once history is durable so it cannot be delivered again.
+	if subscriptionMode == string(ChannelModeCompeting) {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM channel_message_claims WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = ?)`, message.ID); err != nil {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, fmt.Errorf("failed to delete consumed claim: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM channel_messages WHERE id = ?`, message.ID); err != nil {
+			_ = s.ReleaseLock(ctx, instanceID, workerID)
+			return nil, fmt.Errorf("failed to delete consumed message: %w", err)
+		}
 	}
 
 	// Step 3.5: Update delivery cursor for broadcast mode
