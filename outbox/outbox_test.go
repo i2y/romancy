@@ -362,6 +362,10 @@ func (m *mockStorage) FSDelete(ctx context.Context, path string, expectedVersion
 	return nil
 }
 
+func (m *mockStorage) FSList(ctx context.Context, prefix string) ([]*storage.FSObject, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
 	return nil
 }

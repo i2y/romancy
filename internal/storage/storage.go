@@ -14,6 +14,12 @@ import (
 // This happens when the workflow is already completed, cancelled, failed, or does not exist.
 var ErrWorkflowNotCancellable = errors.New("workflow cannot be cancelled")
 
+// likeEscape escapes LIKE wildcards (plus the backslash escape char) so a
+// caller-supplied prefix is matched literally under ESCAPE '\'.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+func likeEscape(s string) string { return likeEscaper.Replace(s) }
+
 // ErrInstanceAlreadyExists indicates that CreateInstance found an instance
 // with the same ID. Callers can use it for idempotent starts: starting the
 // same instance ID twice results in a single instance.
@@ -600,6 +606,10 @@ type FileStore interface {
 
 	// FSDelete removes path only when expectedVersion matches (0 = unconditional).
 	FSDelete(ctx context.Context, path string, expectedVersion int64) error
+
+	// FSList returns objects whose path starts with prefix, ordered by
+	// path. Listing is metadata-only — Data is left nil.
+	FSList(ctx context.Context, prefix string) ([]*FSObject, error)
 }
 
 // ActorTask is a claimable unit of work posted to a channel (Vercel

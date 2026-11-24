@@ -48,3 +48,43 @@ func TestSQLiteStorage_ActorFS(t *testing.T) {
 		t.Fatal("deleted obj still present")
 	}
 }
+
+func TestSQLiteStorage_FSList(t *testing.T) {
+	s, ctx := newClaimTestStorage(t)
+	put := func(p, owner string) {
+		if err := s.FSPut(ctx, p, []byte("x"), owner, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("/actor/wf-1/a.txt", "wf-1")
+	put("/actor/wf-1/b.txt", "wf-1")
+	put("/actor/wf-2/c.txt", "wf-2")
+	put("/shared/pub/x.txt", "wf-1")
+	put("/shared/pub/y.txt", "wf-1")
+
+	lst, err := s.FSList(ctx, "/actor/wf-1/")
+	if err != nil || len(lst) != 2 {
+		t.Fatalf("list = %d, %v", len(lst), err)
+	}
+	if lst[0].Path != "/actor/wf-1/a.txt" || lst[1].Path != "/actor/wf-1/b.txt" {
+		t.Fatalf("paths = %v, %v", lst[0].Path, lst[1].Path)
+	}
+	if lst[0].Data != nil || lst[0].Version != 1 || lst[0].Owner != "wf-1" {
+		t.Fatalf("metadata = %+v", lst[0])
+	}
+	pub, err := s.FSList(ctx, "/shared/")
+	if err != nil || len(pub) != 2 {
+		t.Fatalf("shared = %d, %v", len(pub), err)
+	}
+	if none, _ := s.FSList(ctx, "/actor/nope/"); len(none) != 0 {
+		t.Fatalf("nope = %+v", none)
+	}
+	// LIKE metachars in prefix are matched literally
+	if err := s.FSPut(ctx, "/shared/100%/real", []byte("x"), "wf-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	lst, err = s.FSList(ctx, "/shared/100%/")
+	if err != nil || len(lst) != 1 || lst[0].Path != "/shared/100%/real" {
+		t.Fatalf("escaped = %+v, %v", lst, err)
+	}
+}

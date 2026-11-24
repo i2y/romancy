@@ -2331,6 +2331,34 @@ func (s *MySQLStorage) FSDelete(ctx context.Context, path string, expectedVersio
 	}
 }
 
+func (s *MySQLStorage) FSList(ctx context.Context, prefix string) ([]*FSObject, error) {
+	{
+		rows, err := s.getConn(ctx).QueryContext(ctx,
+			`SELECT path, COALESCE(owner, ''), version FROM actor_fs
+			WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path`,
+			likeEscape(prefix)+"%")
+		if err != nil {
+			{
+				return nil, err
+			}
+		}
+		defer rows.Close()
+		var objs []*FSObject
+		for rows.Next() {
+			{
+				var obj FSObject
+				if err := rows.Scan(&obj.Path, &obj.Owner, &obj.Version); err != nil {
+					{
+						return nil, err
+					}
+				}
+				objs = append(objs, &obj)
+			}
+		}
+		return objs, rows.Err()
+	}
+}
+
 func (s *MySQLStorage) GetBlobInfo(ctx context.Context, hash string) (*BlobInfo, error) {
 	var info BlobInfo
 	var rawCreatedAt any

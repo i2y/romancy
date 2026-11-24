@@ -113,6 +113,29 @@ func FSWrite(ctx *WorkflowContext, path string, data []byte, expectedVersion int
 	return s.FSPut(ctx.Context(), path, data, ctx.InstanceID(), expectedVersion)
 }
 
+// FSList returns the objects whose path starts with prefix, ordered by
+// path. Listing is metadata-only (path, owner, version — no data).
+// Permission rules follow FSRead: an actor may only list its own
+// /actor/{id}/ space; /shared/ is open.
+func FSList(ctx *WorkflowContext, prefix string) ([]*storage.FSObject, error) {
+	if err := fsCheckActivity(ctx); err != nil {
+		return nil, err
+	}
+	s := ctx.Storage()
+	if s == nil {
+		return nil, fmt.Errorf("storage not available")
+	}
+	if rest, ok := strings.CutPrefix(prefix, "/actor/"); ok {
+		owner := strings.SplitN(rest, "/", 2)[0]
+		if owner != ctx.InstanceID() {
+			return nil, fmt.Errorf("%w: cannot list another actor's private space", ErrFSForbidden)
+		}
+	} else if !strings.HasPrefix(prefix, "/shared") {
+		return nil, fmt.Errorf("%w: prefix must be under /actor/{id}/ or /shared/", ErrFSForbidden)
+	}
+	return s.FSList(ctx.Context(), prefix)
+}
+
 // FSDelete removes path. expectedVersion follows FSWrite semantics
 // (0 deletes unconditionally). Permission rules are the same as FSWrite.
 func FSDelete(ctx *WorkflowContext, path string, expectedVersion int64, capabilityToken string) error {
