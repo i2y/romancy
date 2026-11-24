@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestSQLiteStorage_ActorTasks(t *testing.T) {
@@ -117,5 +118,50 @@ func TestSQLiteStorage_TaskNoticesAndGetTask(t *testing.T) {
 	}
 	if string(msgs[1].Data) != `{"type":"task_state","task_id":"t1","state":"done"}` {
 		t.Fatalf("state notice = %s", msgs[1].Data)
+	}
+}
+
+func TestSQLiteStorage_ReclaimStaleTasks(t *testing.T) {
+	s, ctx := newClaimTestStorage(t)
+
+	mk := func(id string) {
+		if err := s.PostTask(ctx, &ActorTask{ID: id, Channel: "tasks:r"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("t1")
+	mk("t2")
+	if _, err := s.ClaimTask(ctx, "tasks:r", "wf-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimTask(ctx, "tasks:r", "wf-2"); err != nil {
+		t.Fatal(err)
+	}
+	// attempts incremented on claim
+	task, _ := s.GetTask(ctx, "t1")
+	if task.Attempts != 1 {
+		t.Fatalf("attempts = %d", task.Attempts)
+	}
+	// nothing stale yet — claims are fresh
+	if n, err := s.ReclaimStaleTasks(ctx, time.Hour); err != nil || n != 0 {
+		t.Fatalf("reclaim fresh = %d, %v", n, err)
+	}
+	// backdate t1's claimed_at to simulate stale claim
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE actor_tasks SET claimed_at = '2000-01-01 00:00:00' WHERE id = 't1'`); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.ReclaimStaleTasks(ctx, time.Hour)
+	if err != nil || n != 1 {
+		t.Fatalf("reclaim = %d, %v", n, err)
+	}
+	task, _ = s.GetTask(ctx, "t1")
+	if task.State != "open" || task.ClaimedBy != "" {
+		t.Fatalf("reclaimed task = %+v", task)
+	}
+	// fresh claim (t2) untouched
+	task, _ = s.GetTask(ctx, "t2")
+	if task.State != "claimed" || task.ClaimedBy != "wf-2" {
+		t.Fatalf("fresh claim = %+v", task)
 	}
 }

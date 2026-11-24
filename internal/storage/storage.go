@@ -611,6 +611,7 @@ type ActorTask struct {
 	State     string // "open" | "claimed" | "done" | "failed"
 	ClaimedBy string
 	Result    []byte
+	Attempts  int
 }
 
 // ErrTaskConflict is returned when a task state transition loses the race
@@ -642,6 +643,11 @@ type TaskStore interface {
 	// ChannelMessagesSince returns messages on channel published after
 	// the given message_id cursor (empty = all, ordered by insertion id).
 	ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*ChannelMessage, error)
+
+	// ReclaimStaleTasks returns claimed tasks whose claim is older than
+	// maxAge back to 'open' (orphan recovery — a crashed claimant's task
+	// becomes claimable again). Returns the number reclaimed.
+	ReclaimStaleTasks(ctx context.Context, maxAge time.Duration) (int64, error)
 }
 
 // ========================================

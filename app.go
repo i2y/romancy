@@ -656,6 +656,14 @@ func (a *App) cleanupStaleLocks() error {
 		slog.Debug("emitted actor down notifications", "count", n)
 	}
 
+	// Reclaim tasks whose claim is older than the lock lease (orphaned
+	// by a crashed claimant) back to 'open'.
+	if n, err := a.storage.ReclaimStaleTasks(a.ctx, a.config.staleLockTimeout); err != nil {
+		slog.Error("error reclaiming stale tasks", "error", err)
+	} else if n > 0 {
+		slog.Debug("reclaimed stale tasks", "count", n)
+	}
+
 	timeoutSec := int(a.config.staleLockTimeout.Seconds())
 	staleWorkflows, err := a.storage.CleanupStaleLocks(a.ctx, timeoutSec)
 	if err != nil {

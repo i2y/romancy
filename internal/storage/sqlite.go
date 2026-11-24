@@ -2421,9 +2421,9 @@ func (s *SQLiteStorage) GetTask(ctx context.Context, taskID string) (*ActorTask,
 	var result sql.NullString
 	err := s.getConn(ctx).QueryRowContext(ctx, `
 		SELECT id, channel, COALESCE(data, ''), state,
-			COALESCE(claimed_by, ''), COALESCE(result, '')
+			COALESCE(claimed_by, ''), COALESCE(result, ''), attempts
 		FROM actor_tasks WHERE id = ?1`, taskID).Scan(
-		&t.ID, &t.Channel, &t.Data, &t.State, &t.ClaimedBy, &result)
+		&t.ID, &t.Channel, &t.Data, &t.State, &t.ClaimedBy, &result, &t.Attempts)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2437,7 +2437,8 @@ func (s *SQLiteStorage) GetTask(ctx context.Context, taskID string) (*ActorTask,
 func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string) (*ActorTask, error) {
 	for range 3 {
 		res, err := s.getConn(ctx).ExecContext(ctx, `
-			UPDATE actor_tasks SET state = 'claimed', claimed_by = ?1, updated_at = ?2
+			UPDATE actor_tasks SET state = 'claimed', claimed_by = ?1, updated_at = ?2,
+				claimed_at = ?2, attempts = attempts + 1
 			WHERE id = (
 				SELECT id FROM (SELECT id FROM actor_tasks
 					WHERE channel = ?3 AND state = 'open' ORDER BY created_at LIMIT 1) _t
@@ -2456,10 +2457,10 @@ func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string)
 		var t ActorTask
 		var claimedBy, result sql.NullString
 		err = s.getConn(ctx).QueryRowContext(ctx, `
-			SELECT id, channel, COALESCE(data, ''), claimed_by, COALESCE(result, '')
+			SELECT id, channel, COALESCE(data, ''), claimed_by, COALESCE(result, ''), attempts
 			FROM actor_tasks WHERE channel = ?3 AND claimed_by = ?1 AND state = 'claimed'
 			ORDER BY updated_at DESC LIMIT 1`, claimant, claimant, channel).Scan(
-			&t.ID, &t.Channel, &t.Data, &claimedBy, &result)
+			&t.ID, &t.Channel, &t.Data, &claimedBy, &result, &t.Attempts)
 		if err != nil {
 			return nil, err
 		}
@@ -2502,9 +2503,22 @@ func (s *SQLiteStorage) CompleteTask(ctx context.Context, taskID, claimant strin
 		`{"type":"task_state","task_id":%q,"state":%q}`, taskID, state))
 }
 
+func (s *SQLiteStorage) ReclaimStaleTasks(ctx context.Context, maxAge time.Duration) (int64, error) {
+	cutoff := time.Now().UTC().Add(-maxAge)
+	res, err := s.getConn(ctx).ExecContext(ctx, `
+		UPDATE actor_tasks SET state = 'open', claimed_by = NULL,
+			claimed_at = NULL, updated_at = ?1
+		WHERE state = 'claimed' AND claimed_at < ?2`,
+		time.Now().UTC(), cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *SQLiteStorage) ListTasks(ctx context.Context, channel, state string) ([]*ActorTask, error) {
 	query := `SELECT id, channel, COALESCE(data, ''), state,
-		COALESCE(claimed_by, ''), COALESCE(result, '')
+		COALESCE(claimed_by, ''), COALESCE(result, ''), attempts
 		FROM actor_tasks WHERE channel = ?1`
 	args := []any{channel}
 	if state != "" {
@@ -2520,7 +2534,7 @@ func (s *SQLiteStorage) ListTasks(ctx context.Context, channel, state string) ([
 	var tasks []*ActorTask
 	for rows.Next() {
 		var t ActorTask
-		if err := rows.Scan(&t.ID, &t.Channel, &t.Data, &t.State, &t.ClaimedBy, &t.Result); err != nil {
+		if err := rows.Scan(&t.ID, &t.Channel, &t.Data, &t.State, &t.ClaimedBy, &t.Result, &t.Attempts); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, &t)

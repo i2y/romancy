@@ -338,6 +338,10 @@ func (m *mockStorage) CompleteTask(ctx context.Context, taskID, claimant string,
 	return nil
 }
 
+func (m *mockStorage) ReclaimStaleTasks(ctx context.Context, maxAge time.Duration) (int64, error) {
+	return 0, nil
+}
+
 func (m *mockStorage) ListTasks(ctx context.Context, channel, state string) ([]*storage.ActorTask, error) {
 	return nil, nil
 }

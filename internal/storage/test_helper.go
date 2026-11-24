@@ -266,6 +266,8 @@ CREATE TABLE IF NOT EXISTS actor_tasks (
     state TEXT NOT NULL DEFAULT 'open',
     claimed_by TEXT,
     result TEXT,
+    claimed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -575,6 +577,8 @@ CREATE TABLE IF NOT EXISTS actor_tasks (
     state TEXT NOT NULL DEFAULT 'open',
     claimed_by TEXT,
     result TEXT,
+    claimed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -870,6 +874,8 @@ CREATE TABLE IF NOT EXISTS actor_tasks (
     state TEXT NOT NULL DEFAULT 'open',
     claimed_by TEXT,
     result TEXT,
+    claimed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
