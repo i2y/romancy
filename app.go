@@ -279,6 +279,11 @@ func (a *App) initStorage() error {
 		if !ok {
 			return fmt.Errorf("compensation executor not found for %s", funcName)
 		}
+		// Treat compensation as in-activity so FS ops are allowed.
+		if wfCtx := GetWorkflowContext(ctx); wfCtx != nil && wfCtx.activityDepth != nil {
+			*wfCtx.activityDepth++
+			defer func() { *wfCtx.activityDepth-- }()
+		}
 		return executor(ctx, arg)
 	})
 

@@ -93,30 +93,32 @@ func hashCapabilitySecret(secret string) string {
 }
 
 // IssueCapability mints a new capability for (kind, target) and stores only
-// its hash. Returns a bearer token "cap:{kind}:{target}:{secret}" —
-// the plaintext secret is not recoverable afterwards.
-func IssueCapability(ctx *WorkflowContext, kind, target string) (string, error) {
+// its hash. Returns a bearer token "cap:{kind}:{target}:{secret}" and the
+// capability ID needed for RevokeCapability — the plaintext secret is not
+// recoverable afterwards.
+func IssueCapability(ctx *WorkflowContext, kind, target string) (token, capabilityID string, err error) {
 	s := ctx.Storage()
 	if s == nil {
-		return "", fmt.Errorf("storage not available")
+		return "", "", fmt.Errorf("storage not available")
 	}
 	secretBytes := make([]byte, 24)
 	if _, err := rand.Read(secretBytes); err != nil {
-		return "", fmt.Errorf("failed to mint capability secret: %w", err)
+		return "", "", fmt.Errorf("failed to mint capability secret: %w", err)
 	}
 	secret := hex.EncodeToString(secretBytes)
 
+	capID := fmt.Sprintf("cap-%s", uuid.NewString())
 	cap := &storage.ActorCapability{
-		ID:         fmt.Sprintf("cap-%s", uuid.NewString()),
+		ID:         capID,
 		Kind:       kind,
 		Target:     target,
 		SecretHash: hashCapabilitySecret(secret),
 		GrantedBy:  ctx.InstanceID(),
 	}
 	if err := s.GrantCapability(ctx.Context(), cap); err != nil {
-		return "", fmt.Errorf("failed to grant capability: %w", err)
+		return "", "", fmt.Errorf("failed to grant capability: %w", err)
 	}
-	return fmt.Sprintf("cap:%s:%s:%s", kind, target, secret), nil
+	return fmt.Sprintf("cap:%s:%s:%s", kind, target, secret), capID, nil
 }
 
 // CheckCapability verifies a capability token's secret for (kind, target).
@@ -137,7 +139,7 @@ func CheckCapability(ctx *WorkflowContext, kind, target, secret string) (bool, e
 }
 
 // RevokeCapability removes a capability grant by its capability ID
-// ("cap-…" returned implicitly via IssueCapability's stored grant).
+// (returned by IssueCapability).
 func RevokeCapability(ctx *WorkflowContext, capabilityID string) error {
 	s := ctx.Storage()
 	if s == nil {
