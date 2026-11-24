@@ -104,6 +104,8 @@ type Storage interface {
 
 	FileStore
 
+	TaskStore
+
 	// System Lock Operations
 	SystemLockManager
 
@@ -599,6 +601,42 @@ type FileStore interface {
 
 	// FSDelete removes path only when expectedVersion matches (0 = unconditional).
 	FSDelete(ctx context.Context, path string, expectedVersion int64) error
+}
+
+
+// ActorTask is a claimable unit of work posted to a channel (Vercel
+// Board-style task primitive over competing channels).
+type ActorTask struct {
+	ID        string
+	Channel   string
+	Data      []byte
+	State     string // "open" | "claimed" | "done" | "failed"
+	ClaimedBy string
+	Result    []byte
+}
+
+// ErrTaskConflict is returned when a task state transition loses the race
+// (already claimed / completed by someone else).
+var ErrTaskConflict = errors.New("actor_tasks: state conflict")
+
+// TaskStore manages the durable task queue.
+type TaskStore interface {
+	// PostTask inserts a new open task.
+	PostTask(ctx context.Context, task *ActorTask) error
+
+	// ClaimTask atomically claims the oldest open task on channel for
+	// claimant. Returns nil, nil when no open task exists.
+	ClaimTask(ctx context.Context, channel, claimant string) (*ActorTask, error)
+
+	// CompleteTask marks a claimed task done or failed (CAS on claimant).
+	CompleteTask(ctx context.Context, taskID, claimant string, result []byte, failed bool) error
+
+	// ListTasks returns tasks on channel filtered by state ("" = all).
+	ListTasks(ctx context.Context, channel, state string) ([]*ActorTask, error)
+
+	// ChannelMessagesSince returns messages on channel published after
+	// the given message_id cursor (empty = all, ordered by insertion id).
+	ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*ChannelMessage, error)
 }
 
 // ========================================

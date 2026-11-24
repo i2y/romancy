@@ -322,6 +322,26 @@ func (m *mockStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, err
 	return 0, nil
 }
 
+func (m *mockStorage) PostTask(ctx context.Context, task *storage.ActorTask) error {
+	return nil
+}
+
+func (m *mockStorage) ClaimTask(ctx context.Context, channel, claimant string) (*storage.ActorTask, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) CompleteTask(ctx context.Context, taskID, claimant string, result []byte, failed bool) error {
+	return nil
+}
+
+func (m *mockStorage) ListTasks(ctx context.Context, channel, state string) ([]*storage.ActorTask, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*storage.ChannelMessage, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) FSGet(ctx context.Context, path string) (*storage.FSObject, error) {
 	return nil, nil
 }

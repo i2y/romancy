@@ -2391,3 +2391,133 @@ func (s *SQLiteStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, e
 	}
 	return res.RowsAffected()
 }
+
+func (s *SQLiteStorage) PostTask(ctx context.Context, task *ActorTask) error {
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO actor_tasks (id, channel, data, state)
+		VALUES (?1, ?2, ?3, 'open')`,
+		task.ID, task.Channel, string(task.Data))
+	return err
+}
+
+func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string) (*ActorTask, error) {
+	for range 3 {
+		res, err := s.getConn(ctx).ExecContext(ctx, `
+			UPDATE actor_tasks SET state = 'claimed', claimed_by = ?1, updated_at = ?2
+			WHERE id = (
+				SELECT id FROM (SELECT id FROM actor_tasks
+					WHERE channel = ?3 AND state = 'open' ORDER BY created_at LIMIT 1) _t
+			) AND state = 'open'`,
+			claimant, time.Now().UTC(), channel)
+		if err != nil {
+			return nil, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			continue
+		}
+		var t ActorTask
+		var claimedBy, result sql.NullString
+		err = s.getConn(ctx).QueryRowContext(ctx, `
+			SELECT id, channel, COALESCE(data, ''), claimed_by, COALESCE(result, '')
+			FROM actor_tasks WHERE channel = ?3 AND claimed_by = ?1 AND state = 'claimed'
+			ORDER BY updated_at DESC LIMIT 1`, claimant, claimant, channel).Scan(
+			&t.ID, &t.Channel, &t.Data, &claimedBy, &result)
+		if err != nil {
+			return nil, err
+		}
+		t.State = "claimed"
+		t.ClaimedBy = claimedBy.String
+		t.Result = []byte(result.String)
+		return &t, nil
+	}
+	return nil, nil
+}
+
+func (s *SQLiteStorage) CompleteTask(ctx context.Context, taskID, claimant string, result []byte, failed bool) error {
+	state := "done"
+	if failed {
+		state = "failed"
+	}
+	res, err := s.getConn(ctx).ExecContext(ctx, `
+		UPDATE actor_tasks SET state = ?1, result = ?2, updated_at = ?3
+		WHERE id = ?4 AND claimed_by = ?5 AND state = 'claimed'`,
+		state, string(result), time.Now().UTC(), taskID, claimant)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrTaskConflict
+	}
+	return nil
+}
+
+func (s *SQLiteStorage) ListTasks(ctx context.Context, channel, state string) ([]*ActorTask, error) {
+	query := `SELECT id, channel, COALESCE(data, ''), state,
+		COALESCE(claimed_by, ''), COALESCE(result, '')
+		FROM actor_tasks WHERE channel = ?1`
+	args := []any{channel}
+	if state != "" {
+		query += ` AND state = ?2`
+		args = append(args, state)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := s.getConn(ctx).QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tasks []*ActorTask
+	for rows.Next() {
+		var t ActorTask
+		if err := rows.Scan(&t.ID, &t.Channel, &t.Data, &t.State, &t.ClaimedBy, &t.Result); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, &t)
+	}
+	return tasks, rows.Err()
+}
+
+func (s *SQLiteStorage) ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*ChannelMessage, error) {
+	rows, err := s.getConn(ctx).QueryContext(ctx, `
+		SELECT id, channel, message_id, data_type, COALESCE(data, ''), data_binary, metadata, published_at
+		FROM channel_messages
+		WHERE channel = ?1
+		  AND id > COALESCE((SELECT id FROM channel_messages WHERE message_id = ?2), 0)
+		ORDER BY id`,
+		channel, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var msgs []*ChannelMessage
+	for rows.Next() {
+		var m ChannelMessage
+		var pub any
+		if err := rows.Scan(&m.ID, &m.Channel, &m.MessageID, &m.DataType,
+			&m.Data, &m.DataBinary, &m.Metadata, &pub); err != nil {
+			return nil, err
+		}
+		switch v := pub.(type) {
+		case time.Time:
+			m.PublishedAt = v
+		case string:
+			if t, err := time.Parse("2006-01-02 15:04:05", v); err == nil {
+				m.PublishedAt = t
+			}
+		case []byte:
+			if t, err := time.Parse("2006-01-02 15:04:05", string(v)); err == nil {
+				m.PublishedAt = t
+			}
+		}
+		msgs = append(msgs, &m)
+	}
+	return msgs, rows.Err()
+}
