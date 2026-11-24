@@ -500,6 +500,10 @@ type CapabilityManager interface {
 	// CheckCapability verifies a presented secret for (kind, target) against
 	// the stored hash and expiry. Returns false for unknown/expired grants.
 	CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error)
+
+	// DeleteExpiredCapabilities removes grants whose expires_at is in the
+	// past. Returns the number of rows deleted (leader sweep).
+	DeleteExpiredCapabilities(ctx context.Context) (int64, error)
 }
 
 // BlobStore is a content-addressed store for large payloads. The key is
@@ -510,6 +514,19 @@ type BlobStore interface {
 
 	// GetBlob returns the data stored under hash, or nil if absent.
 	GetBlob(ctx context.Context, hash string) ([]byte, error)
+
+	// GetBlobInfo returns size/creator metadata for hash, or nil if absent.
+	GetBlobInfo(ctx context.Context, hash string) (*BlobInfo, error)
+}
+
+// BlobInfo describes a stored blob without its payload.
+type BlobInfo struct {
+	Hash      string
+	SizeBytes int64
+	CreatedBy string
+	// CreatedAt is normalized to RFC3339 when the driver returns a time;
+	// string-serialized timestamps are passed through as stored.
+	CreatedAt string
 }
 
 // FSObject is a versioned file in the shared actor filesystem.
@@ -518,6 +535,37 @@ type FSObject struct {
 	Owner   string
 	Data    []byte
 	Version int64
+}
+
+
+// expiryParam serializes an optional expiry for storage: canonical UTC
+// string when set, nil otherwise.
+func expiryParam(exp *time.Time) any {
+	if exp == nil {
+		return nil
+	}
+	return canonicalTS(*exp)
+}
+
+// canonicalTS renders a timestamp as a fixed-width UTC string
+// ("2006-01-02 15:04:05") that is lexically comparable across sqlite TEXT,
+// postgres TIMESTAMP, and mysql DATETIME columns.
+func canonicalTS(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
+// canonicalTSFrom normalizes a driver-returned expires_at value (time.Time,
+// string, or []byte) to the canonical comparable form.
+func canonicalTSFrom(v any) string {
+	switch x := v.(type) {
+	case time.Time:
+		return canonicalTS(x)
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	}
+	return ""
 }
 
 // isUniqueViolation reports whether err is a primary-key/unique constraint

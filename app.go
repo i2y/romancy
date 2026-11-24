@@ -642,6 +642,13 @@ func (a *App) cleanupStaleLocks() error {
 		slog.Error("error requeuing channel waits", "error", err)
 	}
 
+	// Remove expired capability grants.
+	if n, err := a.storage.DeleteExpiredCapabilities(a.ctx); err != nil {
+		slog.Error("error deleting expired capabilities", "error", err)
+	} else if n > 0 {
+		slog.Debug("deleted expired capabilities", "count", n)
+	}
+
 	// Deliver DOWN notifications for terminated actors and free their names.
 	if n, err := a.storage.EmitActorDownForTerminated(a.ctx); err != nil {
 		slog.Error("error emitting actor down notifications", "error", err)

@@ -2208,7 +2208,8 @@ func (s *SQLiteStorage) GrantCapability(ctx context.Context, cap *ActorCapabilit
 	_, err := s.getConn(ctx).ExecContext(ctx, `
 		INSERT INTO actor_capabilities (id, kind, target, secret_hash, granted_by, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy, cap.ExpiresAt)
+	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy,
+		expiryParam(cap.ExpiresAt))
 	return err
 }
 
@@ -2220,10 +2221,10 @@ func (s *SQLiteStorage) RevokeCapability(ctx context.Context, capabilityID strin
 }
 
 func (s *SQLiteStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
-	var expiresAt *time.Time
+	var expiresAt any
 	err := s.getConn(ctx).QueryRowContext(ctx, `
 		SELECT expires_at FROM actor_capabilities
-		WHERE kind = ? AND target = ? AND secret_hash = ?
+		WHERE kind = ?1 AND target = ?2 AND secret_hash = ?3
 	`, kind, target, secretHash).Scan(&expiresAt)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -2231,7 +2232,10 @@ func (s *SQLiteStorage) CheckCapability(ctx context.Context, kind, target, secre
 	if err != nil {
 		return false, err
 	}
-	return expiresAt == nil || expiresAt.After(time.Now()), nil
+	if expiresAt == nil {
+		return true, nil
+	}
+	return canonicalTSFrom(expiresAt) > canonicalTS(time.Now()), nil
 }
 
 func (s *SQLiteStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
@@ -2353,4 +2357,37 @@ func (s *SQLiteStorage) FSDelete(ctx context.Context, path string, expectedVersi
 		}
 		return nil
 	}
+}
+
+func (s *SQLiteStorage) GetBlobInfo(ctx context.Context, hash string) (*BlobInfo, error) {
+	var info BlobInfo
+	var rawCreatedAt any
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT hash, size_bytes, COALESCE(created_by, ''), created_at FROM payload_blobs WHERE hash = ?1`,
+		hash).Scan(&info.Hash, &info.SizeBytes, &info.CreatedBy, &rawCreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch v := rawCreatedAt.(type) {
+	case time.Time:
+		info.CreatedAt = v.UTC().Format(time.RFC3339)
+	case string:
+		info.CreatedAt = v
+	case []byte:
+		info.CreatedAt = string(v)
+	}
+	return &info, nil
+}
+
+func (s *SQLiteStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, error) {
+	res, err := s.getConn(ctx).ExecContext(ctx,
+		`DELETE FROM actor_capabilities WHERE expires_at IS NOT NULL AND expires_at <= ?1`,
+		canonicalTS(time.Now()))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

@@ -2127,7 +2127,8 @@ func (s *PostgresStorage) GrantCapability(ctx context.Context, cap *ActorCapabil
 	_, err := s.getConn(ctx).ExecContext(ctx, `
 		INSERT INTO actor_capabilities (id, kind, target, secret_hash, granted_by, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy, cap.ExpiresAt)
+	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy,
+		expiryParam(cap.ExpiresAt))
 	return err
 }
 
@@ -2139,7 +2140,7 @@ func (s *PostgresStorage) RevokeCapability(ctx context.Context, capabilityID str
 }
 
 func (s *PostgresStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
-	var expiresAt *time.Time
+	var expiresAt any
 	err := s.getConn(ctx).QueryRowContext(ctx, `
 		SELECT expires_at FROM actor_capabilities
 		WHERE kind = $1 AND target = $2 AND secret_hash = $3
@@ -2150,7 +2151,10 @@ func (s *PostgresStorage) CheckCapability(ctx context.Context, kind, target, sec
 	if err != nil {
 		return false, err
 	}
-	return expiresAt == nil || expiresAt.After(time.Now()), nil
+	if expiresAt == nil {
+		return true, nil
+	}
+	return canonicalTSFrom(expiresAt) > canonicalTS(time.Now()), nil
 }
 
 func (s *PostgresStorage) PutBlob(ctx context.Context, hash string, data []byte, createdBy string) error {
@@ -2272,4 +2276,37 @@ func (s *PostgresStorage) FSDelete(ctx context.Context, path string, expectedVer
 		}
 		return nil
 	}
+}
+
+func (s *PostgresStorage) GetBlobInfo(ctx context.Context, hash string) (*BlobInfo, error) {
+	var info BlobInfo
+	var rawCreatedAt any
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT hash, size_bytes, COALESCE(created_by, ''), created_at FROM payload_blobs WHERE hash = $1`,
+		hash).Scan(&info.Hash, &info.SizeBytes, &info.CreatedBy, &rawCreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch v := rawCreatedAt.(type) {
+	case time.Time:
+		info.CreatedAt = v.UTC().Format(time.RFC3339)
+	case string:
+		info.CreatedAt = v
+	case []byte:
+		info.CreatedAt = string(v)
+	}
+	return &info, nil
+}
+
+func (s *PostgresStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, error) {
+	res, err := s.getConn(ctx).ExecContext(ctx,
+		`DELETE FROM actor_capabilities WHERE expires_at IS NOT NULL AND expires_at <= $1`,
+		canonicalTS(time.Now()))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

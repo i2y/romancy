@@ -1,6 +1,7 @@
 package romancy
 
 import (
+	"github.com/i2y/romancy/internal/storage"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -26,8 +27,26 @@ func StorePayload(ctx *WorkflowContext, data []byte) (string, error) {
 	return BlobRefPrefix + hash, nil
 }
 
+// BlobStat returns size/creator metadata for a blob reference (or bare
+// hash). Returns nil, nil when absent.
+func BlobStat(ctx *WorkflowContext, ref string) (*storage.BlobInfo, error) {
+	s := ctx.Storage()
+	if s == nil {
+		return nil, fmt.Errorf("storage not available")
+	}
+	hash := ref
+	if len(hash) > len(BlobRefPrefix) && hash[:len(BlobRefPrefix)] == BlobRefPrefix {
+		hash = hash[len(BlobRefPrefix):]
+	}
+	return s.GetBlobInfo(ctx.Context(), hash)
+}
+
 // LoadPayload resolves a blob reference to its data. Accepts a bare hash or
 // the full "blob:sha256:<hash>" reference. Returns an error if absent.
+//
+// NOTE: blobs are readable by anyone who knows the content hash — the
+// store is content-addressed, not permissioned. Do not store secrets in
+// plaintext; encrypt sensitive payloads before StorePayload.
 func LoadPayload(ctx *WorkflowContext, ref string) ([]byte, error) {
 	s := ctx.Storage()
 	if s == nil {

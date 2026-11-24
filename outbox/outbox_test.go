@@ -314,6 +314,14 @@ func (m *mockStorage) RevokeCapability(ctx context.Context, capabilityID string)
 	return nil
 }
 
+func (m *mockStorage) GetBlobInfo(ctx context.Context, hash string) (*storage.BlobInfo, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
 func (m *mockStorage) FSGet(ctx context.Context, path string) (*storage.FSObject, error) {
 	return nil, nil
 }
