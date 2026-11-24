@@ -2397,7 +2397,41 @@ func (s *SQLiteStorage) PostTask(ctx context.Context, task *ActorTask) error {
 		INSERT INTO actor_tasks (id, channel, data, state)
 		VALUES (?1, ?2, ?3, 'open')`,
 		task.ID, task.Channel, string(task.Data))
+	if err != nil {
+		return err
+	}
+	return s.publishTaskNotice(ctx, task.Channel, fmt.Sprintf(
+		`{"type":"task_posted","task_id":%q,"channel":%q}`, task.ID, task.Channel))
+}
+
+// publishTaskNotice appends an event to the channel's task-event stream
+// ({channel}:tasks). Runs on the caller's conn so it joins an enclosing
+// transaction when present.
+func (s *SQLiteStorage) publishTaskNotice(ctx context.Context, channel, dataJSON string) error {
+	msgID := fmt.Sprintf("task-notice-%d-%d", time.Now().UnixNano(), time.Now().UnixNano()%1000000)
+	_, err := s.getConn(ctx).ExecContext(ctx, `
+		INSERT INTO channel_messages (channel, data, message_id, data_type)
+		VALUES (?1, ?2, ?3, 'json')`,
+		channel+":tasks", dataJSON, msgID)
 	return err
+}
+
+func (s *SQLiteStorage) GetTask(ctx context.Context, taskID string) (*ActorTask, error) {
+	var t ActorTask
+	var result sql.NullString
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT id, channel, COALESCE(data, ''), state,
+			COALESCE(claimed_by, ''), COALESCE(result, '')
+		FROM actor_tasks WHERE id = ?1`, taskID).Scan(
+		&t.ID, &t.Channel, &t.Data, &t.State, &t.ClaimedBy, &result)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	t.Result = []byte(result.String)
+	return &t, nil
 }
 
 func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string) (*ActorTask, error) {
@@ -2432,6 +2466,10 @@ func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string)
 		t.State = "claimed"
 		t.ClaimedBy = claimedBy.String
 		t.Result = []byte(result.String)
+		if err := s.publishTaskNotice(ctx, channel, fmt.Sprintf(
+			`{"type":"task_claimed","task_id":%q,"claimed_by":%q}`, t.ID, claimant)); err != nil {
+			return nil, err
+		}
 		return &t, nil
 	}
 	return nil, nil
@@ -2456,7 +2494,12 @@ func (s *SQLiteStorage) CompleteTask(ctx context.Context, taskID, claimant strin
 	if n == 0 {
 		return ErrTaskConflict
 	}
-	return nil
+	task, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	return s.publishTaskNotice(ctx, task.Channel, fmt.Sprintf(
+		`{"type":"task_state","task_id":%q,"state":%q}`, taskID, state))
 }
 
 func (s *SQLiteStorage) ListTasks(ctx context.Context, channel, state string) ([]*ActorTask, error) {

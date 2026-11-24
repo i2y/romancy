@@ -1,7 +1,10 @@
 package romancy
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/i2y/romancy/internal/storage"
@@ -22,8 +25,15 @@ import (
 //	    romancy.CompleteTask(ctx, task.ID, result, nil)
 //	}
 
-// PostTask creates a task on channel and publishes a wake-up notice.
-// Returns the task ID.
+// TasksChannel returns the task-event stream name for a channel. All
+// task lifecycle notices (posted/claimed/done/failed) are published on
+// this broadcast channel — workers and waiters subscribe here.
+func TasksChannel(channel string) string {
+	return channel + ":tasks"
+}
+
+// PostTask creates a task on channel and publishes a "task_posted"
+// notice on TasksChannel(channel). Returns the task ID.
 func PostTask(ctx *WorkflowContext, channel string, data []byte) (string, error) {
 	s := ctx.Storage()
 	if s == nil {
@@ -38,10 +48,6 @@ func PostTask(ctx *WorkflowContext, channel string, data []byte) (string, error)
 	if err := s.PostTask(ctx.Context(), task); err != nil {
 		return "", err
 	}
-	// Wake workers subscribed on this channel. Notice is best-effort —
-	// the task row is the source of truth.
-	_, _ = s.PublishToChannel(ctx.Context(), channel, []byte(fmt.Sprintf(
-		`{"type":"task_posted","task_id":%q}`, task.ID)), nil)
 	return task.ID, nil
 }
 
@@ -81,6 +87,105 @@ func ListTasks(ctx *WorkflowContext, channel, state string) ([]*storage.ActorTas
 		return nil, fmt.Errorf("storage not available")
 	}
 	return s.ListTasks(ctx.Context(), channel, state)
+}
+
+// WaitTask blocks until the task reaches a terminal state (done or
+// failed) and returns it. Subscribes to the channel's task-event stream
+// (broadcast) and re-checks the task row on every wake — durable: the
+// workflow releases its lock while suspended. timeout <= 0 waits
+// indefinitely; on timeout returns the last known task and the timeout
+// error.
+func WaitTask(ctx *WorkflowContext, taskID string, timeout time.Duration) (*storage.ActorTask, error) {
+	s := ctx.Storage()
+	if s == nil {
+		return nil, fmt.Errorf("storage not available")
+	}
+	task, err := s.GetTask(ctx.Context(), taskID)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		return nil, fmt.Errorf("%w: %s", storage.ErrTaskNotFound, taskID)
+	}
+	return waitForTerminal(ctx, s, TasksChannel(task.Channel), timeout,
+		func() (*storage.ActorTask, error) {
+			t, err := s.GetTask(ctx.Context(), taskID)
+			if err != nil {
+				return nil, err
+			}
+			if t == nil {
+				return nil, fmt.Errorf("%w: %s", storage.ErrTaskNotFound, taskID)
+			}
+			return t, nil
+		}, task)
+}
+
+// WaitAnyTask blocks until any task on channel reaches a terminal state
+// and returns it (earliest done, else earliest failed).
+func WaitAnyTask(ctx *WorkflowContext, channel string, timeout time.Duration) (*storage.ActorTask, error) {
+	s := ctx.Storage()
+	if s == nil {
+		return nil, fmt.Errorf("storage not available")
+	}
+	return waitForTerminal(ctx, s, TasksChannel(channel), timeout,
+		func() (*storage.ActorTask, error) {
+			for _, state := range []string{"done", "failed"} {
+				tasks, err := s.ListTasks(ctx.Context(), channel, state)
+				if err != nil {
+					return nil, err
+				}
+				if len(tasks) > 0 {
+					return tasks[0], nil
+				}
+			}
+			return nil, nil
+		}, nil)
+}
+
+// waitForTerminal subscribes broadcast on notifyCh, then loops:
+// re-check → receive until check returns a terminal task or deadline.
+func waitForTerminal(ctx *WorkflowContext, s storage.Storage, notifyCh string, timeout time.Duration,
+	check func() (*storage.ActorTask, error), last *storage.ActorTask) (*storage.ActorTask, error) {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		task, err := check()
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			last = task
+			if task.State == "done" || task.State == "failed" {
+				return task, nil
+			}
+		}
+		if err := Subscribe(ctx, notifyCh, ModeBroadcast); err != nil {
+			return nil, err
+		}
+		opts := []ReceiveOption{}
+		if timeout > 0 {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				return last, &ChannelMessageTimeoutError{
+					InstanceID:  ctx.InstanceID(),
+					ChannelName: notifyCh,
+				}
+			}
+			opts = append(opts, WithReceiveTimeout(rem))
+		}
+		if _, err := Receive[json.RawMessage](ctx, notifyCh, opts...); err != nil {
+			var timeoutErr *ChannelMessageTimeoutError
+			if errors.As(err, &timeoutErr) {
+				if timeout <= 0 || time.Now().Before(deadline) {
+					continue // spurious wake timeout — keep waiting
+				}
+				return last, err
+			}
+			return nil, err
+		}
+	}
 }
 
 // ReadChannelSince returns messages on channel published after the given

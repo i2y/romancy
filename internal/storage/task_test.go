@@ -81,3 +81,41 @@ func TestSQLiteStorage_ChannelMessagesSince(t *testing.T) {
 		t.Fatalf("unk = %d, %v", len(unk), err)
 	}
 }
+
+func TestSQLiteStorage_TaskNoticesAndGetTask(t *testing.T) {
+	s, ctx := newClaimTestStorage(t)
+
+	if err := s.PostTask(ctx, &ActorTask{ID: "t1", Channel: "tasks:x", Data: []byte(`{"n":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	// task_posted notice on the :tasks event stream
+	msgs, err := s.ChannelMessagesSince(ctx, "tasks:x:tasks", "")
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("posted notice = %d, %v", len(msgs), err)
+	}
+	if string(msgs[0].Data) != `{"type":"task_posted","task_id":"t1","channel":"tasks:x"}` {
+		t.Fatalf("notice data = %s", msgs[0].Data)
+	}
+
+	got, err := s.GetTask(ctx, "t1")
+	if err != nil || got == nil || got.State != "open" {
+		t.Fatalf("GetTask = %+v, %v", got, err)
+	}
+	if none, _ := s.GetTask(ctx, "nope"); none != nil {
+		t.Fatalf("GetTask(nope) = %+v", none)
+	}
+
+	if _, err := s.ClaimTask(ctx, "tasks:x", "wf-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteTask(ctx, "t1", "wf-1", []byte(`{"ok":true}`), false); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = s.ChannelMessagesSince(ctx, "tasks:x:tasks", msgs[0].MessageID)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("notices = %d, %v", len(msgs), err)
+	}
+	if string(msgs[1].Data) != `{"type":"task_state","task_id":"t1","state":"done"}` {
+		t.Fatalf("state notice = %s", msgs[1].Data)
+	}
+}

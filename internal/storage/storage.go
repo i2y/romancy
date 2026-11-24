@@ -539,7 +539,6 @@ type FSObject struct {
 	Version int64
 }
 
-
 // expiryParam serializes an optional expiry for storage: canonical UTC
 // string when set, nil otherwise.
 func expiryParam(exp *time.Time) any {
@@ -603,7 +602,6 @@ type FileStore interface {
 	FSDelete(ctx context.Context, path string, expectedVersion int64) error
 }
 
-
 // ActorTask is a claimable unit of work posted to a channel (Vercel
 // Board-style task primitive over competing channels).
 type ActorTask struct {
@@ -619,10 +617,17 @@ type ActorTask struct {
 // (already claimed / completed by someone else).
 var ErrTaskConflict = errors.New("actor_tasks: state conflict")
 
+// ErrTaskNotFound is returned when a task ID does not exist.
+var ErrTaskNotFound = errors.New("actor_tasks: not found")
+
 // TaskStore manages the durable task queue.
 type TaskStore interface {
-	// PostTask inserts a new open task.
+	// PostTask inserts a new open task and publishes a "task_posted"
+	// notice on the channel's task-event stream (channel + ":tasks").
 	PostTask(ctx context.Context, task *ActorTask) error
+
+	// GetTask returns the task by ID, or nil, nil when absent.
+	GetTask(ctx context.Context, taskID string) (*ActorTask, error)
 
 	// ClaimTask atomically claims the oldest open task on channel for
 	// claimant. Returns nil, nil when no open task exists.

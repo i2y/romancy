@@ -326,6 +326,10 @@ func (m *mockStorage) PostTask(ctx context.Context, task *storage.ActorTask) err
 	return nil
 }
 
+func (m *mockStorage) GetTask(ctx context.Context, taskID string) (*storage.ActorTask, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) ClaimTask(ctx context.Context, channel, claimant string) (*storage.ActorTask, error) {
 	return nil, nil
 }
