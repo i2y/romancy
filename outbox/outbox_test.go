@@ -159,6 +159,9 @@ func (m *mockStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instance
 func (m *mockStorage) UpdateInstanceInputIfLocked(ctx context.Context, instanceID string, inputData []byte, workerID string) error {
 	return nil
 }
+func (m *mockStorage) HasCapabilityGrants(ctx context.Context, kind, target string) (bool, error) {
+	return false, nil
+}
 func (m *mockStorage) CancelInstance(ctx context.Context, instanceID string, reason string) error {
 	return nil
 }

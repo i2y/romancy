@@ -2240,6 +2240,17 @@ func (s *SQLiteStorage) RevokeCapability(ctx context.Context, capabilityID strin
 	return err
 }
 
+func (s *SQLiteStorage) HasCapabilityGrants(ctx context.Context, kind, target string) (bool, error) {
+	conn := s.getConn(ctx)
+	var count int
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM actor_capabilities WHERE kind = ? AND target = ?", kind, target).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (s *SQLiteStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
 	var expiresAt any
 	err := s.getConn(ctx).QueryRowContext(ctx, `

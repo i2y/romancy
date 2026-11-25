@@ -510,6 +510,10 @@ type CapabilityManager interface {
 	// RevokeCapability removes a grant by its capability ID (idempotent).
 	RevokeCapability(ctx context.Context, capabilityID string) error
 
+	// HasCapabilityGrants reports whether ANY grant exists for (kind, target).
+	// Channels with at least one grant are "sealed": the corresponding
+	// operation then requires a valid capability token.
+	HasCapabilityGrants(ctx context.Context, kind, target string) (bool, error)
 	// CheckCapability verifies a presented secret for (kind, target) against
 	// the stored hash and expiry. Returns false for unknown/expired grants.
 	CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error)

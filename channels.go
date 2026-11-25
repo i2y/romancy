@@ -150,11 +150,62 @@ func Unsubscribe(ctx *WorkflowContext, channelName string) error {
 	return nil
 }
 
+// ErrChannelForbidden is returned when a channel operation lacks the
+// required capability. Channels become "sealed" once any capability grant
+// of the matching kind exists for them; sealed channels reject callers
+// without a valid token.
+var ErrChannelForbidden = fmt.Errorf("channel: permission denied")
+
+// enforceChannelCapability implements sealed-channel semantics: while no
+// grants of kind exist for the channel it is open to everyone; once the
+// first grant is issued the operation requires a valid capability token.
+func enforceChannelCapability(ctx *WorkflowContext, kind, channelName, token string) error {
+	s := ctx.Storage()
+	if s == nil {
+		return nil
+	}
+	sealed, err := s.HasCapabilityGrants(ctx.Context(), kind, channelName)
+	if err != nil {
+		return err
+	}
+	if !sealed {
+		return nil
+	}
+	if token == "" {
+		return fmt.Errorf("%w: channel %q is sealed for %s", ErrChannelForbidden, channelName, kind)
+	}
+	ok, err := CheckCapability(ctx, kind, channelName, token)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: invalid capability for channel %q", ErrChannelForbidden, channelName)
+	}
+	return nil
+}
+
+// WithPublishCapability presents a channel_pub capability token for a
+// sealed channel.
+func WithPublishCapability(token string) PublishOption {
+	return func(o *publishOptions) {
+		o.capabilityToken = token
+	}
+}
+
+// WithReceiveCapability presents a channel_sub capability token for a
+// sealed channel.
+func WithReceiveCapability(token string) ReceiveOption {
+	return func(o *receiveOptions) {
+		o.capabilityToken = token
+	}
+}
+
 // ReceiveOption configures channel receive behavior.
 type ReceiveOption func(*receiveOptions)
 
 type receiveOptions struct {
-	timeout *time.Duration
+	timeout         *time.Duration
+	capabilityToken string
 }
 
 // WithReceiveTimeout sets a timeout for waiting for a message.
@@ -285,6 +336,13 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 		return nil, fmt.Errorf("cached result type mismatch for channel receive %s", activityID)
 	}
 
+	// Sealed-channel enforcement comes after the cache lookup: replays of a
+	// completed receive never re-check, keeping replay deterministic even if
+	// the capability is later revoked.
+	if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelSub, channelName, options.capabilityToken); err != nil {
+		return nil, err
+	}
+
 	// Verify subscription exists
 	s := ctx.Storage()
 	if s == nil {
@@ -403,6 +461,10 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 	options := &publishOptions{}
 	for _, opt := range opts {
 		opt(options)
+	}
+
+	if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelPub, channelName, options.capabilityToken); err != nil {
+		return err
 	}
 
 	// Generate activity ID for deterministic replay
@@ -531,7 +593,8 @@ func wakeWaitingSubscribers(
 type PublishOption func(*publishOptions)
 
 type publishOptions struct {
-	metadata map[string]any
+	metadata        map[string]any
+	capabilityToken string
 }
 
 // WithMetadata attaches metadata to the published message.
@@ -549,6 +612,10 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 	options := &publishOptions{}
 	for _, opt := range opts {
 		opt(options)
+	}
+
+	if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelPub, channelName, options.capabilityToken); err != nil {
+		return err
 	}
 
 	// Generate activity ID for deterministic replay

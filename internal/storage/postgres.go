@@ -2159,6 +2159,17 @@ func (s *PostgresStorage) RevokeCapability(ctx context.Context, capabilityID str
 	return err
 }
 
+func (s *PostgresStorage) HasCapabilityGrants(ctx context.Context, kind, target string) (bool, error) {
+	conn := s.getConn(ctx)
+	var count int
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM actor_capabilities WHERE kind = $1 AND target = $2", kind, target).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (s *PostgresStorage) CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error) {
 	var expiresAt any
 	err := s.getConn(ctx).QueryRowContext(ctx, `
