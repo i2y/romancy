@@ -159,3 +159,43 @@ actor_capabilities(
 - タスクの claim には heartbeat がないため、300 秒を超える正規の実行は reclaim され、別ワーカーが**同じ仕事を再実行しうる**。完了書き込みは `claimed_by` の fence で守られる（DB 行の clobber は起きない — `schema/spec/TaskReclaim.tla`）が、副作用の二重実行は防げない。**タスクハンドラは冪等に書くこと**
 - one_for_all の cancel は協調的（子が観察して止まる方式）で race window がある。cancel が間に合わず兄弟が正常終了した場合でも新世代は spawn される（`schema/spec/SupervisorRestart.tla` — 信頼できる cancel がある場合のみ「completed は二度と起動しない」が保証される）。**子アクターの副作用も冪等であること**
 
+---
+
+## Phase B 実装ハンドオフ（2026-11-25 確定設計）
+
+### 前提の重要な発見
+
+**delegation に新機構は不要。** capability トークンは `cap:{kind}:{target}:{secret}` 形式の文字列なので、親は spawn input にトークンを含めるだけで委譲が完了する。実装が必要なのは制限側のみ。
+
+### スキーマ（durax-io/schema、migration 未作成）
+
+```sql
+-- 2026120700000000_add_sandboxed.sql（sqlite/postgres/mysql 3方言すべて）
+ALTER TABLE workflow_instances ADD COLUMN sandboxed INTEGER NOT NULL DEFAULT 0;
+```
+
+注意: schema repo への push はユーザー承認が必須（前例: 確認なく push しない）。push 後に4リポ（romancy/edda/shikibu/kairo）の pin 更新。
+
+### 強制ルール3つ（これが全て）
+
+1. **sandboxed は mint できない** — romancy では `IssueCapability`（actors.go:99）で自インスタンスの sandboxed を確認して拒否。edda/shikibu の対応箇所も同様
+2. **sandboxed 親の子は強制 sandboxed** — spawn/CreateInstance 経路で親が sandboxed なら子も1に固定。脱サンドボックス不可
+3. **`sandboxed: true` は spawn オプション** — 非 sandboxed 親のみ指定可能
+
+### 実装ステップ
+
+1. schema migration 3方言 + push（要承認）+ pin 更新
+2. romancy: ストレージ3ドライバ（sqlite/postgres/mysql）の insert/select にカラム追加、`IssueCapability` チェック、spawn 伝播、テスト（既存の channel_capability_test.go のパターンに倣う）
+3. edda / shikibu へ同様の移植
+
+### 完成形（LLM エージェント用途）
+
+親が `sandboxed: true` でエージェントを spawn し、必要なチャネル/FS のトークンのみ input で渡す。エージェントはそれ以外の権限を構造的に取得できない。in-process 強制の限界（ストレージ直叩きの迂回）は Phase C（PG RLS）の領域であることを README/SEMANTICS に明記すること。
+
+### 関連する既知の未解決事項（優先度順）
+
+- Recur / トランザクショナル publish / saga 補償の TLA+ モデル未作成
+- タスクの heartbeat/renewal なし — 300s 超タスクは二重実行しうる（at-least-once、TaskReclaim.tla で証明済み）
+- one_for_all cancel race は設計固有（SupervisorRestart.tla）— 信頼できる cancel が必要なら別途設計
+- edda の test_cross_language_channel は環境依存 flake
+
