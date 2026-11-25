@@ -137,3 +137,25 @@ actor_capabilities(
 - **マルチテナンシー**: `framework` 列によるフィルタは言語識別用で、
   テナント分離ではない。本格的な OS 化には namespace/tenant 概念を
   追加すべきか（`instances.tenant` 列等）— 未決
+
+---
+
+## 実装状況アップデート（2026-11-25 時点）
+
+本メモの構想に対し、以下が3言語（romancy/edda/shikibu）で実装済み：
+
+| 項目 | 状態 |
+|---|---|
+| supervision tree ライブラリ | ✅ 実装済み — one_for_one / one_for_all / rest_for_one、restart intensity 制限、世代つき決定的 child ID（`{supID}:{name}:{gen}`）。poll authoritative（DOWN/notify は起床信号） |
+| sealed channel の capability 強制 | ✅ 実装済み — `channel_pub`/`channel_sub` の grant が存在するチャネルはトークン必須、なければオープン |
+| orphan task reclaim | ✅ 実装済み — `claimed_at`+`attempts` 列、300s の stale sweep で `open` に復帰 |
+| タスク claim プロトコルの形式検証 | ✅ `schema/spec/TaskClaim.tla` — CAS ありで二重 claim 不可を検証 |
+| 規格の切り出し（§6-5） | ✅ `durax-io/schema` に `SEMANTICS.md` + TLA spec + Go checker + TLC CI を集約 |
+
+### 重要な利用上の注意（形式検証で裏付け）
+
+**タスク実行と one_for_all の兄弟リスタートは at-least-once。**
+
+- タスクの claim には heartbeat がないため、300 秒を超える正規の実行は reclaim され、別ワーカーが**同じ仕事を再実行しうる**。完了書き込みは `claimed_by` の fence で守られる（DB 行の clobber は起きない — `schema/spec/TaskReclaim.tla`）が、副作用の二重実行は防げない。**タスクハンドラは冪等に書くこと**
+- one_for_all の cancel は協調的（子が観察して止まる方式）で race window がある。cancel が間に合わず兄弟が正常終了した場合でも新世代は spawn される（`schema/spec/SupervisorRestart.tla` — 信頼できる cancel がある場合のみ「completed は二度と起動しない」が保証される）。**子アクターの副作用も冪等であること**
+

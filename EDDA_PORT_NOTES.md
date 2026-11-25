@@ -175,3 +175,12 @@ takeover/liveness 検証済み（新プロトコル 36 状態全網羅）。バ�
 per-row claim の集約で新規性が薄いため spec 追加は見送り、実機テストで
 検証（edda `test_claim_resumable_atomic`、shikibu epoch spec、romancy
 `TestClaimResumableWorkflows`）。
+
+---
+
+## 2026-11-25 追記
+
+- **supervisor 移植時の注意**: edda/shikibu は recur で**新インスタンス**を作る（romancy は同一 ID で input 更新）。supervisor ループは recur チェーンをたどる設計にすること。子インスタンスには正しい `source_hash` が必要 — 空だと resumable sweep から見えず永久に進まない
+- **romancy の Recur に潜在バグがあった**: 新 input が履歴にだけ書かれ `workflow_instances.input_data` が更新されず、全イテレーションが元 input で再起動していた。`UpdateInstanceInputIfLocked` で修正済み（commit cda1e53）。shikibu では `archive_history` のカラムリスト抜けを修正（commit 60bd58e）
+- **クロス言語テスト flake**: edda の `test_cross_language_channel` で Ruby→Python 配送がタイムアウトすることがある（環境依存、既存の flake）
+
