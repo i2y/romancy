@@ -407,6 +407,26 @@ func (s *MySQLStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instanc
 	return nil
 }
 
+func (s *MySQLStorage) UpdateInstanceInputIfLocked(ctx context.Context, instanceID string, inputData []byte, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET input_data = ?, updated_at = NOW()
+		WHERE instance_id = ? AND locked_by = ?
+	`, string(inputData), instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
 // CancelInstance cancels a workflow instance.
 // Returns ErrWorkflowNotCancellable if the workflow is already completed, cancelled, failed, or does not exist.
 func (s *MySQLStorage) CancelInstance(ctx context.Context, instanceID, reason string) error {

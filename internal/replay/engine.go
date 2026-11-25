@@ -528,6 +528,14 @@ func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig 
 		return fmt.Errorf("failed to record recur event: %w", err)
 	}
 
+	// 5b. Replace the instance input: the next iteration resumes the same
+	// instance, and the runner reads instance.InputData — without this the
+	// iteration would re-run with the ORIGINAL input, dropping the state
+	// Recur exists to carry.
+	if err := e.storage.UpdateInstanceInputIfLocked(ctx, instanceID, inputData, lockID); err != nil {
+		return fmt.Errorf("failed to update recur input: %w", err)
+	}
+
 	// 6. Update status to recurred (will be picked up and restarted)
 	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusRecurred, "", lockID); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)

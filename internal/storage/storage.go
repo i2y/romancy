@@ -172,6 +172,11 @@ type InstanceManager interface {
 	// check on workerID, as UpdateInstanceStatusIfLocked.
 	UpdateInstanceOutputIfLocked(ctx context.Context, instanceID string, outputData []byte, workerID string) error
 
+	// UpdateInstanceInputIfLocked replaces the instance's input data —
+	// used by Recur, whose next iteration must run with the new input
+	// rather than the original. Fenced on workerID as above.
+	UpdateInstanceInputIfLocked(ctx context.Context, instanceID string, inputData []byte, workerID string) error
+
 	// CancelInstance marks a workflow as cancelled.
 	CancelInstance(ctx context.Context, instanceID string, reason string) error
 

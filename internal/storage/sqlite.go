@@ -408,6 +408,26 @@ func (s *SQLiteStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instan
 	return nil
 }
 
+func (s *SQLiteStorage) UpdateInstanceInputIfLocked(ctx context.Context, instanceID string, inputData []byte, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET input_data = ?, updated_at = datetime('now')
+		WHERE instance_id = ? AND locked_by = ?
+	`, string(inputData), instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
 // CancelInstance cancels a workflow instance.
 // Returns ErrWorkflowNotCancellable if the workflow is already completed, cancelled, failed, or does not exist.
 // Note: reason parameter is kept for interface compatibility but is ignored.

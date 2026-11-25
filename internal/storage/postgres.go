@@ -337,6 +337,26 @@ func (s *PostgresStorage) UpdateInstanceOutputIfLocked(ctx context.Context, inst
 	return nil
 }
 
+func (s *PostgresStorage) UpdateInstanceInputIfLocked(ctx context.Context, instanceID string, inputData []byte, workerID string) error {
+	conn := s.getConn(ctx)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET input_data = $1, updated_at = NOW()
+		WHERE instance_id = $2 AND locked_by = $3
+	`, string(inputData), instanceID, workerID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.lockLost(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
 // CancelInstance cancels a workflow instance.
 // Returns ErrWorkflowNotCancellable if the workflow is already completed, cancelled, failed, or does not exist.
 func (s *PostgresStorage) CancelInstance(ctx context.Context, instanceID, reason string) error {
