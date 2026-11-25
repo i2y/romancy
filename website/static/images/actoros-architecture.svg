@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 660" font-family="'Hiragino Sans','Noto Sans JP','Helvetica Neue',sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+    <linearGradient id="kernel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- application layer -->
+  <rect x="230" y="18" width="460" height="48" rx="10" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="460" y="48" text-anchor="middle" font-size="17" fill="#334155">あなたのアプリケーション</text>
+
+  <!-- arrows app -> languages -->
+  <line x1="390" y1="66" x2="222" y2="106" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="460" y1="66" x2="460" y2="106" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="530" y1="66" x2="698" y2="106" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- language boxes -->
+  <g>
+    <rect x="100" y="110" width="220" height="66" rx="10" fill="#ffffff" stroke="#00add8" stroke-width="2.5"/>
+    <text x="210" y="138" text-anchor="middle" font-size="17" font-weight="bold" fill="#0e7490">romancy</text>
+    <text x="210" y="162" text-anchor="middle" font-size="13" fill="#64748b">Go</text>
+  </g>
+  <g>
+    <rect x="350" y="110" width="220" height="66" rx="10" fill="#ffffff" stroke="#3776ab" stroke-width="2.5"/>
+    <text x="460" y="138" text-anchor="middle" font-size="17" font-weight="bold" fill="#275f8f">edda</text>
+    <text x="460" y="162" text-anchor="middle" font-size="13" fill="#64748b">Python</text>
+  </g>
+  <g>
+    <rect x="600" y="110" width="220" height="66" rx="10" fill="#ffffff" stroke="#cc342d" stroke-width="2.5"/>
+    <text x="710" y="138" text-anchor="middle" font-size="17" font-weight="bold" fill="#a8241f">shikibu</text>
+    <text x="710" y="162" text-anchor="middle" font-size="13" fill="#64748b">Ruby</text>
+  </g>
+
+  <!-- interop annotation -->
+  <text x="460" y="652" text-anchor="middle" font-size="12.5" fill="#64748b">どの言語で書いても、同じカーネル上で相互にメッセージを交換できる</text>
+
+  <!-- arrows languages -> kernel -->
+  <line x1="280" y1="176" x2="380" y2="228" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="460" y1="176" x2="460" y2="228" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="640" y1="176" x2="540" y2="228" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- kernel -->
+  <rect x="100" y="232" width="720" height="306" rx="14" fill="url(#kernel)"/>
+  <text x="460" y="266" text-anchor="middle" font-size="19" font-weight="bold" fill="#f8fafc">ActorOS カーネル</text>
+  <text x="460" y="288" text-anchor="middle" font-size="12" fill="#94a3b8">実体 = 共有DBスキーマ + セマンティクス規約（SEMANTICS.md）</text>
+
+  <!-- primitive chips: 2 cols x 4 rows, chip 322x46, gap 16/10, start x=130 y=302 -->
+  <g font-size="13.5">
+    <!-- row 1 -->
+    <rect x="130" y="302" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="146" y="321" font-weight="bold" fill="#e2e8f0">プロセス</text>
+    <text x="146" y="339" font-size="11" fill="#94a3b8">durable ワークフロー — 落ちてもリプレイで復活</text>
+    <rect x="468" y="302" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="484" y="321" font-weight="bold" fill="#e2e8f0">チャネル</text>
+    <text x="484" y="339" font-size="11" fill="#94a3b8">broadcast / competing / direct メッセージ</text>
+    <!-- row 2 -->
+    <rect x="130" y="358" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="146" y="377" font-weight="bold" fill="#e2e8f0">supervision tree</text>
+    <text x="146" y="395" font-size="11" fill="#94a3b8">世代つき再起動 — one_for_one / one_for_all</text>
+    <rect x="468" y="358" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="484" y="377" font-weight="bold" fill="#e2e8f0">スケジューラ</text>
+    <text x="484" y="395" font-size="11" fill="#94a3b8">lock claim + epoch fencing で安全に多重起動</text>
+    <!-- row 3 -->
+    <rect x="130" y="414" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="146" y="433" font-weight="bold" fill="#e2e8f0">actor FS</text>
+    <text x="146" y="451" font-size="11" fill="#94a3b8">/actor/{id}/ は私的領域、/shared/ は共有</text>
+    <rect x="468" y="414" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="484" y="433" font-weight="bold" fill="#e2e8f0">capability</text>
+    <text x="484" y="451" font-size="11" fill="#94a3b8">権限トークン — sealed チャネルと FS 書き込み</text>
+    <!-- row 4 -->
+    <rect x="130" y="470" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="146" y="489" font-weight="bold" fill="#e2e8f0">タスク配布</text>
+    <text x="146" y="507" font-size="11" fill="#94a3b8">actor_tasks — 言語をまたいだ仕事の受け渡し</text>
+    <rect x="468" y="470" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
+    <text x="484" y="489" font-weight="bold" fill="#e2e8f0">レジストリ</text>
+    <text x="484" y="507" font-size="11" fill="#94a3b8">名前つきアクター — monitor と DOWN 通知</text>
+  </g>
+
+  <!-- TLA+ badge -->
+  <rect x="650" y="246" width="154" height="26" rx="13" fill="#065f46"/>
+  <text x="727" y="264" text-anchor="middle" font-size="12" font-weight="bold" fill="#a7f3d0">TLA+ 形式検証済み</text>
+
+  <!-- arrow kernel -> db -->
+  <line x1="460" y1="538" x2="460" y2="578" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- db layer -->
+  <rect x="220" y="582" width="480" height="56" rx="10" fill="#fefce8" stroke="#d4d4d8" stroke-width="1.5"/>
+  <text x="460" y="606" text-anchor="middle" font-size="15" font-weight="bold" fill="#3f3f46">SQLite / PostgreSQL / MySQL</text>
+  <text x="460" y="626" text-anchor="middle" font-size="12" fill="#71717a">ただのデータベース — 専用サーバー・ブローカーは不要</text>
+
+  <!-- side annotations -->
+</svg>
