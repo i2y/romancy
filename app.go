@@ -906,14 +906,30 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 		sourceHash = a.workflowHashes[workflowName]
 		a.workflowRunnersMu.RUnlock()
 	}
+	parentInstanceID := ""
+	if wfCtx := GetWorkflowContext(ctx); wfCtx != nil {
+		parentInstanceID = wfCtx.InstanceID()
+	}
+	if opts.sandboxed && parentInstanceID != "" && a.storage != nil {
+		parent, err := a.storage.GetInstance(ctx, parentInstanceID)
+		if err != nil {
+			return "", fmt.Errorf("failed to check parent sandbox state: %w", err)
+		}
+		if parent != nil && parent.Sandboxed {
+			return "", fmt.Errorf("cannot use sandboxed spawn option from sandboxed parent: %w", ErrSandboxed)
+		}
+	}
+
 	instance := &storage.WorkflowInstance{
-		InstanceID:   instanceID,
-		WorkflowName: workflowName,
-		Status:       storage.StatusRunning,
-		InputData:    inputData,
-		SourceHash:   sourceHash,
-		StartedAt:    now,
-		UpdatedAt:    now,
+		InstanceID:       instanceID,
+		WorkflowName:     workflowName,
+		Status:           storage.StatusRunning,
+		InputData:        inputData,
+		SourceHash:       sourceHash,
+		Sandboxed:        opts.sandboxed,
+		ParentInstanceID: parentInstanceID,
+		StartedAt:        now,
+		UpdatedAt:        now,
 	}
 
 	if a.storage != nil {

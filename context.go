@@ -86,7 +86,7 @@ func NewWorkflowContext(
 	isReplaying bool,
 ) *WorkflowContext {
 	ctx, cancel := context.WithCancel(ctx)
-	return &WorkflowContext{
+	wfCtx := &WorkflowContext{
 		ctx:            ctx,
 		cancel:         cancel,
 		instanceID:     instanceID,
@@ -97,12 +97,14 @@ func NewWorkflowContext(
 		activityCounts: make(map[string]int),
 		activityDepth:  new(int),
 	}
+	wfCtx.ctx = ContextWithWorkflowContext(ctx, wfCtx)
+	return wfCtx
 }
 
 // NewWorkflowContextFromExecution creates a WorkflowContext from a replay ExecutionContext.
 func NewWorkflowContextFromExecution(execCtx *replay.ExecutionContext) *WorkflowContext {
 	ctx, cancel := context.WithCancel(execCtx.Context())
-	return &WorkflowContext{
+	wfCtx := &WorkflowContext{
 		ctx:            ctx,
 		cancel:         cancel,
 		instanceID:     execCtx.InstanceID(),
@@ -111,6 +113,8 @@ func NewWorkflowContextFromExecution(execCtx *replay.ExecutionContext) *Workflow
 		activityDepth:  new(int),
 		execCtx:        execCtx,
 	}
+	wfCtx.ctx = ContextWithWorkflowContext(ctx, wfCtx)
+	return wfCtx
 }
 
 // Context returns the underlying context.Context.

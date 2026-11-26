@@ -433,6 +433,22 @@ romancy.Publish(ctx, "channel", data, romancy.WithMetadata(map[string]any{
 }))
 ```
 
+### Sandboxed Actors
+
+Workflows can be started as sandboxed actors when they should receive only explicitly delegated capabilities:
+
+```go
+childID, err := romancy.StartWorkflow(ctx, app, untrustedWorkflow, input, romancy.WithSandboxed(true))
+```
+
+Sandboxing enforces three rules:
+
+- A sandboxed workflow cannot mint new capabilities with `IssueCapability`.
+- Children started by a sandboxed workflow inherit the sandbox flag. Nested starts must pass the workflow's `ctx.Context()` to `StartWorkflow` so the parent can be attributed.
+- Only an unsandboxed parent (or an external caller) may use `WithSandboxed(true)` for a child.
+
+Delegation itself uses the existing capability tokens: pass tokens the child needs in its input. Phase B enforcement is application-layer enforcement inside Romancy. Code running in the worker process can still bypass it by using storage directly; database-enforced isolation such as PostgreSQL row-level security is Phase C scope.
+
 ### Recur Pattern
 
 Long-running workflows can use Erlang-style tail recursion to prevent unbounded history growth:

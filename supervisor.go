@@ -206,10 +206,8 @@ func DefineSupervisor(
 			WithReceiveTimeout(time.Duration(cfg.PollSeconds*float64(time.Second))))
 
 		// Tail-recursive loop: archive history, continue with updated state.
-		if _, err := Recur(ctx, state); err != nil {
-			return SupervisorResult{}, err
-		}
-		return SupervisorResult{}, errors.New("supervisor: unreachable after recur")
+		_, err = Recur(ctx, state)
+		return SupervisorResult{}, err
 	})
 }
 
@@ -340,12 +338,13 @@ func superviseSync(
 			input = json.RawMessage("null")
 		}
 		inst := &storage.WorkflowInstance{
-			InstanceID:   newID,
-			WorkflowName: c.Spec.Workflow,
-			Status:       storage.StatusRunning,
-			InputData:    input,
-			StartedAt:    now,
-			UpdatedAt:    now,
+			InstanceID:       newID,
+			WorkflowName:     c.Spec.Workflow,
+			Status:           storage.StatusRunning,
+			InputData:        input,
+			ParentInstanceID: in.SupervisorID,
+			StartedAt:        now,
+			UpdatedAt:        now,
 		}
 		if err := s.CreateInstance(ctx, inst); err != nil {
 			if !errors.Is(err, storage.ErrInstanceAlreadyExists) {

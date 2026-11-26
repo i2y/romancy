@@ -156,7 +156,8 @@ func GetWorkflow[I, O any](name string) Workflow[I, O] {
 }
 
 // StartWorkflow starts a new workflow instance.
-// Returns the instance ID.
+// When called from workflow code, pass ctx.Context() so the parent instance
+// can be attributed for sandbox inheritance. Returns the instance ID.
 func StartWorkflow[I, O any](
 	ctx context.Context,
 	app *App,
@@ -178,6 +179,7 @@ type StartOption func(*startOptions)
 type startOptions struct {
 	instanceID string
 	sourceHash string
+	sandboxed  bool
 }
 
 // WithInstanceID specifies a custom instance ID.
@@ -194,6 +196,15 @@ func WithInstanceID(id string) StartOption {
 func WithSourceHash(hash string) StartOption {
 	return func(o *startOptions) {
 		o.sourceHash = hash
+	}
+}
+
+// WithSandboxed starts the workflow as a sandboxed actor. Sandboxed actors
+// cannot mint capabilities, and their children inherit the sandbox flag.
+// Only an unsandboxed parent (or an external caller) may request this option.
+func WithSandboxed(enabled bool) StartOption {
+	return func(o *startOptions) {
+		o.sandboxed = enabled
 	}
 }
 

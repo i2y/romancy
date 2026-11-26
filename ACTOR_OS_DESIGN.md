@@ -151,6 +151,7 @@ actor_capabilities(
 | orphan task reclaim | ✅ 実装済み — `claimed_at`+`attempts` 列、300s の stale sweep で `open` に復帰 |
 | タスク claim プロトコルの形式検証 | ✅ `schema/spec/TaskClaim.tla` — CAS ありで二重 claim 不可を検証 |
 | 規格の切り出し（§6-5） | ✅ `durax-io/schema` に `SEMANTICS.md` + TLA spec + Go checker + TLC CI を集約 |
+| sandboxed actor（Phase B） | ✅ 3言語で実装済み — `sandboxed` 永続化、mint 拒否、spawn/recur/supervision 伝播。schema repo へ反映済みで、4リポの submodule pin もワーキングツリー上で更新済み |
 
 ### 重要な利用上の注意（形式検証で裏付け）
 
@@ -167,10 +168,10 @@ actor_capabilities(
 
 **delegation に新機構は不要。** capability トークンは `cap:{kind}:{target}:{secret}` 形式の文字列なので、親は spawn input にトークンを含めるだけで委譲が完了する。実装が必要なのは制限側のみ。
 
-### スキーマ（durax-io/schema、migration 未作成）
+### スキーマ（durax-io/schema、migration 作成・schema repo 反映済み）
 
 ```sql
--- 2026120700000000_add_sandboxed.sql（sqlite/postgres/mysql 3方言すべて）
+-- 20261207000000_add_sandboxed.sql（sqlite/postgres/mysql 3方言すべて）
 ALTER TABLE workflow_instances ADD COLUMN sandboxed INTEGER NOT NULL DEFAULT 0;
 ```
 
@@ -184,9 +185,9 @@ ALTER TABLE workflow_instances ADD COLUMN sandboxed INTEGER NOT NULL DEFAULT 0;
 
 ### 実装ステップ
 
-1. schema migration 3方言 + push（要承認）+ pin 更新
-2. romancy: ストレージ3ドライバ（sqlite/postgres/mysql）の insert/select にカラム追加、`IssueCapability` チェック、spawn 伝播、テスト（既存の channel_capability_test.go のパターンに倣う）
-3. edda / shikibu へ同様の移植
+1. schema migration 3方言 + push（要承認）+ pin 更新 — migration/schema repo 反映済み、pin 更新は各リポのワーキングツリーで実施済み
+2. romancy: ストレージ3ドライバ（sqlite/postgres/mysql）の insert/select にカラム追加、`IssueCapability` チェック、spawn 伝播、テスト — 実装済み
+3. edda / shikibu へ同様の移植 — 実装済み
 
 ### 完成形（LLM エージェント用途）
 

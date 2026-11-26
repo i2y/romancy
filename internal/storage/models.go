@@ -32,6 +32,8 @@ type WorkflowInstance struct {
 	SourceHash        string         `json:"source_hash"`         // Source code hash (Edda compatibility)
 	OwnerService      string         `json:"owner_service"`       // Service that owns this workflow (Edda compatibility)
 	ContinuedFrom     string         `json:"continued_from"`      // Previous instance ID (for recur)
+	Sandboxed         bool           `json:"sandboxed"`           // Sandboxed actor (capability minting forbidden)
+	ParentInstanceID  string         `json:"-"`                   // Spawn parent, used only for sandbox inheritance at creation
 	LockedBy          string         `json:"locked_by"`           // Worker ID holding the lock
 	LockedAt          *time.Time     `json:"locked_at"`           // When the lock was acquired
 	LockTimeoutSec    *int           `json:"lock_timeout_seconds"`

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
 	"github.com/i2y/romancy/internal/storage"
 )
 
@@ -83,8 +84,6 @@ func Unmonitor(ctx *WorkflowContext, targetInstanceID string) error {
 
 // Capability token format: "cap:{kind}:{target}:{secret}". The plaintext
 // secret appears only in the issued token; the database stores its SHA-256.
-// Enforcement integration (Phase B: sandboxed spawn) is intentionally not
-// wired into channel operations yet — these are the primitives.
 
 // hashCapabilitySecret returns the SHA-256 hex of a capability secret.
 func hashCapabilitySecret(secret string) string {
@@ -101,6 +100,16 @@ func IssueCapability(ctx *WorkflowContext, kind, target string) (token, capabili
 	if s == nil {
 		return "", "", fmt.Errorf("storage not available")
 	}
+	instance, err := s.GetInstance(ctx.Context(), ctx.InstanceID())
+	if err != nil {
+		return "", "", fmt.Errorf("failed to check sandbox state: %w", err)
+	}
+	if instance == nil {
+		return "", "", fmt.Errorf("workflow instance %s not found", ctx.InstanceID())
+	}
+	if instance.Sandboxed {
+		return "", "", fmt.Errorf("cannot issue capability %q for %q: %w", kind, target, ErrSandboxed)
+	}
 	secretBytes := make([]byte, 24)
 	if _, err := rand.Read(secretBytes); err != nil {
 		return "", "", fmt.Errorf("failed to mint capability secret: %w", err)
@@ -108,14 +117,14 @@ func IssueCapability(ctx *WorkflowContext, kind, target string) (token, capabili
 	secret := hex.EncodeToString(secretBytes)
 
 	capID := fmt.Sprintf("cap-%s", uuid.NewString())
-	cap := &storage.ActorCapability{
+	capability := &storage.ActorCapability{
 		ID:         capID,
 		Kind:       kind,
 		Target:     target,
 		SecretHash: hashCapabilitySecret(secret),
 		GrantedBy:  ctx.InstanceID(),
 	}
-	if err := s.GrantCapability(ctx.Context(), cap); err != nil {
+	if err := s.GrantCapability(ctx.Context(), capability); err != nil {
 		return "", "", fmt.Errorf("failed to grant capability: %w", err)
 	}
 	return fmt.Sprintf("cap:%s:%s:%s", kind, target, secret), capID, nil

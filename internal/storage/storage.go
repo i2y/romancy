@@ -584,19 +584,6 @@ func canonicalTSFrom(v any) string {
 	return ""
 }
 
-// isUniqueViolation reports whether err is a primary-key/unique constraint
-// violation across sqlite/postgres/mysql drivers.
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") || // sqlite
-		strings.Contains(msg, "SQLSTATE 23505") || // postgres (pgx/pq text)
-		strings.Contains(msg, "23505") ||
-		strings.Contains(msg, "Duplicate entry") // mysql
-}
-
 // ErrFSConflict is returned by FS writes when the expected version does
 // not match the stored version (optimistic concurrency).
 var ErrFSConflict = errors.New("actor_fs: version conflict")

@@ -74,7 +74,7 @@ func fsAuthorize(ctx *WorkflowContext, path, capabilityToken string) error {
 // FSRead returns the data and version at path. Private actor paths may
 // only be read by their owner; /shared/ is open. Returns (nil, 0, nil)
 // when absent.
-func FSRead(ctx *WorkflowContext, path string) ([]byte, int64, error) {
+func FSRead(ctx *WorkflowContext, path string) (data []byte, version int64, err error) {
 	if err := fsCheckActivity(ctx); err != nil {
 		return nil, 0, err
 	}

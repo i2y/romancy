@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS actor_names (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (instance_id) REFERENCES workflow_instances(instance_id) ON DELETE CASCADE
 );
-
 CREATE INDEX idx_actor_names_instance ON actor_names(instance_id);
 
 CREATE TABLE IF NOT EXISTS actor_monitors (
@@ -17,7 +16,6 @@ CREATE TABLE IF NOT EXISTS actor_monitors (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT unique_watcher_target UNIQUE (watcher_instance_id, target_instance_id)
 );
-
 CREATE INDEX idx_actor_monitors_target ON actor_monitors(target_instance_id);
 CREATE INDEX idx_actor_monitors_watcher ON actor_monitors(watcher_instance_id);
 

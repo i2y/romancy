@@ -178,13 +178,19 @@ func (s *PostgresStorage) CreateInstance(ctx context.Context, instance *Workflow
 		return fmt.Errorf("failed to ensure workflow definition: %w", err)
 	}
 
+	sandboxed, err := resolveSandboxed(ctx, conn, s.driver, instance)
+	if err != nil {
+		return err
+	}
+	instance.Sandboxed = sandboxed
+
 	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
-			instance_id, workflow_name, status, input_data, source_hash, owner_service, framework, started_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			instance_id, workflow_name, status, input_data, source_hash, owner_service, framework, sandboxed, started_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
 		string(instance.InputData), instance.SourceHash, instance.OwnerService,
-		framework, instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
+		framework, sandboxedInt(sandboxed), instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -199,7 +205,7 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	conn := s.getConn(ctx)
 	row := conn.QueryRowContext(ctx, `
 		SELECT instance_id, workflow_name, status, input_data, output_data,
-			   current_activity_id, source_hash, owner_service, framework,
+			   current_activity_id, source_hash, owner_service, framework, sandboxed,
 			   locked_by, locked_at, lock_timeout_seconds, lock_expires_at,
 			   started_at, updated_at
 		FROM workflow_instances WHERE instance_id = $1
@@ -208,12 +214,13 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	var inst WorkflowInstance
 	var inputData, outputData, activityID, sourceHash, ownerService, framework sql.NullString
 	var lockedBy sql.NullString
+	var sandboxed int
 	var lockedAt, lockExpiresAt sql.NullTime
 	var lockTimeout sql.NullInt64
 
 	err := row.Scan(
 		&inst.InstanceID, &inst.WorkflowName, &inst.Status,
-		&inputData, &outputData, &activityID, &sourceHash, &ownerService, &framework,
+		&inputData, &outputData, &activityID, &sourceHash, &ownerService, &framework, &sandboxed,
 		&lockedBy, &lockedAt, &lockTimeout, &lockExpiresAt,
 		&inst.StartedAt, &inst.UpdatedAt,
 	)
@@ -223,6 +230,7 @@ func (s *PostgresStorage) GetInstance(ctx context.Context, instanceID string) (*
 	if err != nil {
 		return nil, err
 	}
+	inst.Sandboxed = sandboxed != 0
 
 	if inputData.Valid {
 		inst.InputData = []byte(inputData.String)
@@ -273,7 +281,7 @@ func (s *PostgresStorage) UpdateInstanceStatus(ctx context.Context, instanceID s
 
 // UpdateInstanceStatusIfLocked updates the status only while workerID holds
 // the instance's lock; it answers ErrLockNotHeld otherwise.
-func (s *PostgresStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg string, workerID string) error {
+func (s *PostgresStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instanceID string, status WorkflowStatus, errorMsg, workerID string) error {
 	conn := s.getConn(ctx)
 	result, err := conn.ExecContext(ctx, `
 		UPDATE workflow_instances
@@ -2088,7 +2096,7 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT m.id, m.target_instance_id, m.channel, w.status
@@ -2110,13 +2118,13 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 	for rows.Next() {
 		var m monitorRow
 		if err := rows.Scan(&m.id, &m.targetID, &m.channel, &m.status); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, err
 		}
 		monitors = append(monitors, m)
 		targetSet[m.targetID] = true
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	for _, m := range monitors {
 		payload := fmt.Sprintf(`{"type":"DOWN","actor":%q,"status":%q}`, m.targetID, m.status)
@@ -2143,12 +2151,12 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 // Capability Manager
 // ========================================
 
-func (s *PostgresStorage) GrantCapability(ctx context.Context, cap *ActorCapability) error {
+func (s *PostgresStorage) GrantCapability(ctx context.Context, capability *ActorCapability) error {
 	_, err := s.getConn(ctx).ExecContext(ctx, `
 		INSERT INTO actor_capabilities (id, kind, target, secret_hash, granted_by, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, cap.ID, cap.Kind, cap.Target, cap.SecretHash, cap.GrantedBy,
-		expiryParam(cap.ExpiresAt))
+	`, capability.ID, capability.Kind, capability.Target, capability.SecretHash, capability.GrantedBy,
+		expiryParam(capability.ExpiresAt))
 	return err
 }
 
@@ -2209,132 +2217,92 @@ func (s *PostgresStorage) GetBlob(ctx context.Context, hash string) ([]byte, err
 }
 
 func (s *PostgresStorage) FSGet(ctx context.Context, path string) (*FSObject, error) {
-	{
-		var obj FSObject
-		err := s.getConn(ctx).QueryRowContext(ctx,
-			`SELECT path, COALESCE(owner, ''), data, version FROM actor_fs WHERE path = $1`,
-			path).Scan(&obj.Path, &obj.Owner, &obj.Data, &obj.Version)
-		if err == sql.ErrNoRows {
-			{
-				return nil, nil
-			}
-		}
-		if err != nil {
-			{
-				return nil, err
-			}
-		}
-		return &obj, nil
+	var obj FSObject
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT path, COALESCE(owner, ''), data, version FROM actor_fs WHERE path = $1`,
+		path).Scan(&obj.Path, &obj.Owner, &obj.Data, &obj.Version)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	return &obj, nil
 }
 
 func (s *PostgresStorage) FSPut(ctx context.Context, path string, data []byte, owner string, expectedVersion int64) error {
-	{
-		var res sql.Result
-		var err error
-		now := time.Now().UTC()
-		if expectedVersion == 0 {
-			{
-				res, err = s.getConn(ctx).ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	now := time.Now().UTC()
+	if expectedVersion == 0 {
+		res, err = s.getConn(ctx).ExecContext(ctx, `
 			INSERT INTO actor_fs (path, owner, data, version, created_at, updated_at)
 			SELECT $1, $2, $3, 1, $4, $4
 			WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = $5)`,
-					path, owner, data, now, path)
-			}
-		} else {
-			{
-				res, err = s.getConn(ctx).ExecContext(ctx, `
+			path, owner, data, now, path)
+	} else {
+		res, err = s.getConn(ctx).ExecContext(ctx, `
 			UPDATE actor_fs SET data = $1, owner = $2, version = version + 1, updated_at = $3
 			WHERE path = $4 AND version = $5`,
-					data, owner, now, path, expectedVersion)
-			}
-		}
-		if err != nil {
-			{
-				return err
-			}
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			{
-				return err
-			}
-		}
-		if n == 0 {
-			{
-				return ErrFSConflict
-			}
-		}
-		return nil
+			data, owner, now, path, expectedVersion)
 	}
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrFSConflict
+	}
+	return nil
 }
 
 func (s *PostgresStorage) FSDelete(ctx context.Context, path string, expectedVersion int64) error {
-	{
-		var res sql.Result
-		var err error
-		if expectedVersion == 0 {
-			{
-				res, err = s.getConn(ctx).ExecContext(ctx,
-					`DELETE FROM actor_fs WHERE path = $1`, path)
-			}
-		} else {
-			{
-				res, err = s.getConn(ctx).ExecContext(ctx,
-					`DELETE FROM actor_fs WHERE path = $1 AND version = $2`, path, expectedVersion)
-			}
-		}
-		if err != nil {
-			{
-				return err
-			}
-		}
-		if expectedVersion == 0 {
-			{
-				return nil
-			}
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			{
-				return err
-			}
-		}
-		if n == 0 {
-			{
-				return ErrFSConflict
-			}
-		}
+	var res sql.Result
+	var err error
+	if expectedVersion == 0 {
+		res, err = s.getConn(ctx).ExecContext(ctx,
+			`DELETE FROM actor_fs WHERE path = $1`, path)
+	} else {
+		res, err = s.getConn(ctx).ExecContext(ctx,
+			`DELETE FROM actor_fs WHERE path = $1 AND version = $2`, path, expectedVersion)
+	}
+	if err != nil {
+		return err
+	}
+	if expectedVersion == 0 {
 		return nil
 	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrFSConflict
+	}
+	return nil
 }
 
 func (s *PostgresStorage) FSList(ctx context.Context, prefix string) ([]*FSObject, error) {
-	{
-		rows, err := s.getConn(ctx).QueryContext(ctx,
-			`SELECT path, COALESCE(owner, ''), version FROM actor_fs
+	rows, err := s.getConn(ctx).QueryContext(ctx,
+		`SELECT path, COALESCE(owner, ''), version FROM actor_fs
 			WHERE path LIKE $1 ESCAPE '\' ORDER BY path`,
-			likeEscape(prefix)+"%")
-		if err != nil {
-			{
-				return nil, err
-			}
-		}
-		defer rows.Close()
-		var objs []*FSObject
-		for rows.Next() {
-			{
-				var obj FSObject
-				if err := rows.Scan(&obj.Path, &obj.Owner, &obj.Version); err != nil {
-					{
-						return nil, err
-					}
-				}
-				objs = append(objs, &obj)
-			}
-		}
-		return objs, rows.Err()
+		likeEscape(prefix)+"%")
+	if err != nil {
+		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
+	var objs []*FSObject
+	for rows.Next() {
+		var obj FSObject
+		if err := rows.Scan(&obj.Path, &obj.Owner, &obj.Version); err != nil {
+			return nil, err
+		}
+		objs = append(objs, &obj)
+	}
+	return objs, rows.Err()
 }
 
 func (s *PostgresStorage) GetBlobInfo(ctx context.Context, hash string) (*BlobInfo, error) {
@@ -2508,7 +2476,7 @@ func (s *PostgresStorage) ListTasks(ctx context.Context, channel, state string) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var tasks []*ActorTask
 	for rows.Next() {
 		var t ActorTask
@@ -2531,7 +2499,7 @@ func (s *PostgresStorage) ChannelMessagesSince(ctx context.Context, channel, mes
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var msgs []*ChannelMessage
 	for rows.Next() {
 		var m ChannelMessage

@@ -88,7 +88,7 @@ func TestEngine_LockStealAbort(t *testing.T) {
 	assert.JSONEq(t, `"B-output"`, string(got.OutputData))
 }
 
-// TestEngine_LockStealFencedWrites verifies the last line of defence: even
+// TestEngine_LockStealFencedWrites verifies the last line of defense: even
 // when the stale run ignores the cancellation and tries to write a result
 // anyway, the fenced history append answers ErrLockNotHeld and the row B
 // completed is untouched.

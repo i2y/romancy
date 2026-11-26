@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/i2y/romancy/internal/storage"
 )
 
@@ -107,7 +108,7 @@ func WaitTask(ctx *WorkflowContext, taskID string, timeout time.Duration) (*stor
 	if task == nil {
 		return nil, fmt.Errorf("%w: %s", storage.ErrTaskNotFound, taskID)
 	}
-	return waitForTerminal(ctx, s, TasksChannel(task.Channel), timeout,
+	return waitForTerminal(ctx, TasksChannel(task.Channel), timeout,
 		func() (*storage.ActorTask, error) {
 			t, err := s.GetTask(ctx.Context(), taskID)
 			if err != nil {
@@ -127,7 +128,7 @@ func WaitAnyTask(ctx *WorkflowContext, channel string, timeout time.Duration) (*
 	if s == nil {
 		return nil, fmt.Errorf("storage not available")
 	}
-	return waitForTerminal(ctx, s, TasksChannel(channel), timeout,
+	return waitForTerminal(ctx, TasksChannel(channel), timeout,
 		func() (*storage.ActorTask, error) {
 			for _, state := range []string{"done", "failed"} {
 				tasks, err := s.ListTasks(ctx.Context(), channel, state)
@@ -144,7 +145,7 @@ func WaitAnyTask(ctx *WorkflowContext, channel string, timeout time.Duration) (*
 
 // waitForTerminal subscribes broadcast on notifyCh, then loops:
 // re-check → receive until check returns a terminal task or deadline.
-func waitForTerminal(ctx *WorkflowContext, s storage.Storage, notifyCh string, timeout time.Duration,
+func waitForTerminal(ctx *WorkflowContext, notifyCh string, timeout time.Duration,
 	check func() (*storage.ActorTask, error), last *storage.ActorTask) (*storage.ActorTask, error) {
 	var deadline time.Time
 	if timeout > 0 {

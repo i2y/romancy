@@ -1,10 +1,11 @@
 package romancy
 
 import (
-	"github.com/i2y/romancy/internal/storage"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+
+	"github.com/i2y/romancy/internal/storage"
 )
 
 // BlobRefPrefix marks payload references stored in messages/data in place

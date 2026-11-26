@@ -101,6 +101,9 @@ func (e *EventTimeoutError) Error() string {
 		e.EventType, e.InstanceID)
 }
 
+// ErrSandboxed indicates an operation forbidden to a sandboxed workflow.
+var ErrSandboxed = errors.New("operation forbidden for sandboxed workflow")
+
 // ErrWorkflowAlreadyCompleted indicates an operation on a completed workflow.
 var ErrWorkflowAlreadyCompleted = errors.New("workflow already completed")
 
