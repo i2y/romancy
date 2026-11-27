@@ -3,6 +3,7 @@ package romancy
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/i2y/romancy/hooks"
@@ -246,6 +247,10 @@ func (a *workflowContextAdapter) Storage() storage.Storage {
 // This ensures that the event is only sent if the activity/transaction commits,
 // providing exactly-once delivery guarantees when combined with idempotent consumers.
 //
+// Call it from an activity (or a compensation). Nothing records an event sent
+// from workflow code, so each replay of the workflow sends it again; such a
+// call logs a warning.
+//
 // Example:
 //
 //	activity := romancy.DefineActivity("process_order", func(ctx context.Context, input OrderInput) (OrderResult, error) {
@@ -263,11 +268,13 @@ func (a *workflowContextAdapter) Storage() storage.Storage {
 //	    return OrderResult{Status: "created"}, nil
 //	})
 func SendEvent[T any](ctx *WorkflowContext, eventType, source string, data T) error {
+	warnSendOutsideActivity(ctx, eventType)
 	return outbox.SendEventTransactional(&workflowContextAdapter{ctx}, eventType, source, data)
 }
 
 // SendEventTransactional is an alias for outbox.SendEventTransactional.
-// Use this when you need more control over event options.
+// Use this when you need more control over event options. Like SendEvent, call
+// it from an activity.
 //
 // Example:
 //
@@ -276,5 +283,15 @@ func SendEvent[T any](ctx *WorkflowContext, eventType, source string, data T) er
 //	    outbox.WithContentType("application/json"),
 //	)
 func SendEventTransactional[T any](ctx *WorkflowContext, eventType, source string, data T, opts ...outbox.SendEventOption) error {
+	warnSendOutsideActivity(ctx, eventType)
 	return outbox.SendEventTransactional(&workflowContextAdapter{ctx}, eventType, source, data, opts...)
+}
+
+// warnSendOutsideActivity logs a warning for an event sent from workflow code:
+// nothing records it, so every replay of the workflow sends it again.
+func warnSendOutsideActivity(ctx *WorkflowContext, eventType string) {
+	if ctx != nil && !ctx.InActivity() {
+		slog.Warn("event sent outside an activity: it is sent again each time the workflow replays; send it from an activity",
+			"event_type", eventType, "instance_id", ctx.InstanceID())
+	}
 }
