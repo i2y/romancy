@@ -77,7 +77,7 @@ SCHEMA_SRC := schema/db/migrations
 SCHEMA_DST := internal/migrations/sql
 
 sync-schema: ## Refresh internal/migrations/sql/ from the schema/ submodule (run after bumping the submodule pointer)
-	@if [ ! -f $(SCHEMA_SRC)/postgresql/*.sql ] && [ -z "$$(ls -A $(SCHEMA_SRC) 2>/dev/null)" ]; then \
+	@if [ -z "$$(ls -A $(SCHEMA_SRC) 2>/dev/null)" ]; then \
 		echo "schema/ submodule looks empty — run: git submodule update --init schema"; \
 		exit 1; \
 	fi
