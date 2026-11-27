@@ -63,11 +63,18 @@ type WorkflowContext struct {
 
 	// Activity ID management
 	activityCounts map[string]int // function_name → counter
-	mu             sync.Mutex
 
-	// activityDepth is >0 while executing an activity body. Shared across
-	// WithContext copies so FS ops can verify they run inside an activity.
-	activityDepth *int
+	// mu guards the maps of the context. WithContext copies share it, as
+	// they share the maps: a workflow may run activities from several
+	// goroutines.
+	mu *sync.Mutex
+
+	// inActivity is true in the copy of the context an activity body (or a
+	// compensation) runs with, and in the copies made from it. Each body
+	// has its own copy, so activities run from several goroutines of one
+	// workflow mark neither the workflow nor each other as inside an
+	// activity.
+	inActivity bool
 
 	// Reference to the replay execution context (when using replay engine)
 	execCtx *replay.ExecutionContext
@@ -96,7 +103,12 @@ func NewWorkflowContext(
 		isReplaying:    isReplaying,
 		historyCache:   historyCache,
 		activityCounts: make(map[string]int),
-		activityDepth:  new(int),
+		mu:             new(sync.Mutex),
+		// Made here so that every copy of the context shares them
+		directSubscriptions: make(map[string]bool),
+	}
+	if wfCtx.historyCache == nil {
+		wfCtx.historyCache = make(map[string]any)
 	}
 	wfCtx.ctx = ContextWithWorkflowContext(ctx, wfCtx)
 	return wfCtx
@@ -111,8 +123,10 @@ func NewWorkflowContextFromExecution(execCtx *replay.ExecutionContext) *Workflow
 		instanceID:     execCtx.InstanceID(),
 		isReplaying:    execCtx.IsReplaying(),
 		activityCounts: make(map[string]int),
-		activityDepth:  new(int),
+		mu:             new(sync.Mutex),
 		execCtx:        execCtx,
+		// Made here so that every copy of the context shares it
+		directSubscriptions: make(map[string]bool),
 	}
 	wfCtx.ctx = ContextWithWorkflowContext(ctx, wfCtx)
 	return wfCtx
@@ -135,7 +149,8 @@ func (c *WorkflowContext) WithContext(ctx context.Context) *WorkflowContext {
 		isReplaying:         c.isReplaying,
 		historyCache:        c.historyCache,
 		activityCounts:      c.activityCounts,
-		activityDepth:       c.activityDepth,
+		mu:                  c.mu,
+		inActivity:          c.inActivity,
 		execCtx:             c.execCtx,
 		app:                 c.app,
 		directSubscriptions: c.directSubscriptions,
@@ -162,9 +177,12 @@ func (c *WorkflowContext) IsReplaying() bool {
 	return c.isReplaying
 }
 
-// InActivity returns true while executing an activity body (non-replay).
+// InActivity reports whether c is the context of an activity body (or of a
+// compensation), as GetWorkflowContext returns it inside the body. It is
+// false for the workflow's own context, even while activities it started
+// from other goroutines run. A replay does not run activity bodies.
 func (c *WorkflowContext) InActivity() bool {
-	return c.activityDepth != nil && *c.activityDepth > 0
+	return c.inActivity
 }
 
 // GenerateActivityID generates a unique activity ID for the given function name.
@@ -187,6 +205,8 @@ func (c *WorkflowContext) GetCachedResult(activityID string) (any, bool) {
 		return c.execCtx.GetCachedResult(activityID)
 	}
 	// Fallback to local cache
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.historyCache == nil {
 		return nil, false
 	}

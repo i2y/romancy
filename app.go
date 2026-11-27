@@ -300,7 +300,7 @@ func (a *App) initStorage() error {
 func (a *App) compensationContext(ctx context.Context, instanceID string) (compCtx context.Context, done func()) {
 	wfCtx := NewWorkflowContext(ctx, instanceID, a.config.workerID, "", nil, false)
 	wfCtx.SetApp(a)
-	*wfCtx.activityDepth = 1
+	wfCtx.inActivity = true
 	return wfCtx.Context(), wfCtx.cancel
 }
 
@@ -997,23 +997,18 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 		UpdatedAt:        now,
 	}
 
+	lockID := ""
 	if a.storage != nil {
-		if err := a.storage.CreateInstance(ctx, instance); err != nil {
+		var err error
+		if lockID, err = a.createInstance(ctx, instance); err != nil {
 			return "", fmt.Errorf("failed to create instance: %w", err)
 		}
 	}
 
-	// Call hook
-	a.hooks.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{
-		InstanceID:   instanceID,
-		WorkflowName: workflowName,
-		InputData:    input,
-		StartTime:    now,
-	})
-
-	// Start workflow execution asynchronously
+	// Start workflow execution asynchronously. The run calls the
+	// OnWorkflowStart hook, as every later run of the instance does.
 	go func() {
-		if err := a.runWorkflow(context.Background(), instanceID, workflowName); err != nil {
+		if err := a.runWorkflow(context.Background(), instanceID, workflowName, input, lockID); err != nil {
 			slog.Error("workflow failed", "instance_id", instanceID, "error", err)
 		}
 	}()
@@ -1021,8 +1016,48 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 	return instanceID, nil
 }
 
-// runWorkflow executes a workflow instance.
-func (a *App) runWorkflow(ctx context.Context, instanceID, workflowName string) error {
+// createInstance stores a new instance. When this worker runs the workflow
+// and ctx is not in a transaction, the instance is stored holding the lock
+// of its first run, whose identity it answers: no resumption poll (of this
+// worker or another) can claim it before that run. Inside a caller's
+// transaction (an activity that starts a workflow) it is stored unlocked, so
+// that it commits or rolls back with the caller's work; a poll runs it if
+// the first run cannot take it.
+func (a *App) createInstance(ctx context.Context, instance *storage.WorkflowInstance) (string, error) {
+	a.workflowRunnersMu.RLock()
+	_, runsHere := a.workflowRunners[instance.WorkflowName]
+	a.workflowRunnersMu.RUnlock()
+	if !runsHere || a.storage.InTransaction(ctx) {
+		return "", a.storage.CreateInstance(ctx, instance)
+	}
+
+	lockID := storage.NewLockIdentity(a.config.workerID)
+	txCtx, err := a.storage.BeginTransaction(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := a.storage.CreateInstance(txCtx, instance); err != nil {
+		_ = a.storage.RollbackTransaction(txCtx)
+		return "", err
+	}
+	acquired, err := a.storage.TryAcquireLock(txCtx, instance.InstanceID, lockID, replay.LockLeaseSeconds)
+	if err != nil || !acquired {
+		_ = a.storage.RollbackTransaction(txCtx)
+		if err == nil {
+			err = fmt.Errorf("could not lock new instance %s", instance.InstanceID)
+		}
+		return "", err
+	}
+	if err := a.storage.CommitTransaction(txCtx); err != nil {
+		return "", err
+	}
+	return lockID, nil
+}
+
+// runWorkflow executes the first run of a workflow instance; input is reported
+// to the OnWorkflowStart hook. lockID is the lock the instance was created
+// with ("" when it was created unlocked).
+func (a *App) runWorkflow(ctx context.Context, instanceID, workflowName string, input any, lockID string) error {
 	// Get the runner for this workflow
 	a.workflowRunnersMu.RLock()
 	runner, ok := a.workflowRunners[workflowName]
@@ -1032,7 +1067,7 @@ func (a *App) runWorkflow(ctx context.Context, instanceID, workflowName string) 
 		return fmt.Errorf("workflow %s not registered", workflowName)
 	}
 
-	return a.engine.StartWorkflow(ctx, instanceID, workflowName, nil, runner)
+	return a.engine.StartWorkflowWithLockID(ctx, instanceID, workflowName, input, runner, lockID)
 }
 
 // registeredWorkflowNames answers the names of the workflows this worker can run.
@@ -1360,17 +1395,19 @@ func (a *App) recordCompensationResult(ctx context.Context, instanceID, lockID s
 
 // Handler returns an http.Handler for CloudEvents and health endpoints.
 // This allows integration with existing HTTP routers (gin, echo, chi, etc.).
+// It routes on the request path ("/", "/health/live", "/cancel/{id}", ...),
+// so a handler mounted under a prefix needs http.StripPrefix.
 //
 // Example with chi:
 //
 //	r := chi.NewRouter()
-//	r.Mount("/romancy", app.Handler())
+//	r.Mount("/romancy", http.StripPrefix("/romancy", app.Handler()))
 //	http.ListenAndServe(":8080", r)
 //
 // Example with standard http.ServeMux:
 //
 //	mux := http.NewServeMux()
-//	mux.Handle("/api/workflows/", app.Handler())
+//	mux.Handle("/api/workflows/", http.StripPrefix("/api/workflows", app.Handler()))
 //	http.ListenAndServe(":8080", mux)
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()

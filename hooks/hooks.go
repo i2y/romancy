@@ -41,8 +41,13 @@ type WorkflowHooks interface {
 type WorkflowStartInfo struct {
 	InstanceID   string
 	WorkflowName string
-	InputData    any
-	StartTime    time.Time
+	// InputData is the input StartWorkflow was given, in the first run when
+	// the process that called StartWorkflow runs it. It is nil in later runs,
+	// and in a first run that a resumption poll began: on a worker other than
+	// the one that started the workflow (which does not register it), or for
+	// a workflow started inside an activity's transaction.
+	InputData any
+	StartTime time.Time
 }
 
 // WorkflowCompleteInfo contains information about a workflow completion.

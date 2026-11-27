@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,7 +71,9 @@ type ExecutionContext struct {
 	historyIndex int
 	isReplaying  bool
 
-	// Cached results from replay
+	// Cached results from replay. cacheMu guards both maps: a workflow may
+	// run activities from several goroutines.
+	cacheMu       sync.RWMutex
 	cachedResults map[string]*CachedResult
 	cachedErrors  map[string]error
 
@@ -191,17 +194,21 @@ func (ec *ExecutionContext) GenerateActivityID(activityName string) string {
 // Returns (result, true) if found, (nil, false) if not found.
 // The returned value is the unmarshaled any value from CachedResult.Value.
 func (ec *ExecutionContext) GetCachedResult(activityID string) (any, bool) {
-	if cached, ok := ec.cachedResults[activityID]; ok {
+	ec.cacheMu.RLock()
+	cached, okResult := ec.cachedResults[activityID]
+	cachedErr, okErr := ec.cachedErrors[activityID]
+	ec.cacheMu.RUnlock()
+	if okResult {
 		ec.counterMu.Lock()
 		ec.cacheHits++
 		ec.counterMu.Unlock()
 		return cached.Value, true
 	}
-	if err, ok := ec.cachedErrors[activityID]; ok {
+	if okErr {
 		ec.counterMu.Lock()
 		ec.cacheHits++
 		ec.counterMu.Unlock()
-		return err, true
+		return cachedErr, true
 	}
 	return nil, false
 }
@@ -210,6 +217,8 @@ func (ec *ExecutionContext) GetCachedResult(activityID string) (any, bool) {
 // Returns (*CachedResult, true) if found, (nil, false) if not found.
 // Use this to avoid re-serialization when the raw JSON is needed.
 func (ec *ExecutionContext) GetCachedResultRaw(activityID string) (*CachedResult, bool) {
+	ec.cacheMu.RLock()
+	defer ec.cacheMu.RUnlock()
 	if cached, ok := ec.cachedResults[activityID]; ok {
 		return cached, true
 	}
@@ -218,6 +227,8 @@ func (ec *ExecutionContext) GetCachedResultRaw(activityID string) (*CachedResult
 
 // SetCachedResult caches a result for replay.
 func (ec *ExecutionContext) SetCachedResult(activityID string, result any) {
+	ec.cacheMu.Lock()
+	defer ec.cacheMu.Unlock()
 	if err, ok := result.(error); ok {
 		ec.cachedErrors[activityID] = err
 	} else {
@@ -227,6 +238,8 @@ func (ec *ExecutionContext) SetCachedResult(activityID string, result any) {
 
 // SetCachedResultWithRaw caches a result with raw JSON bytes for replay.
 func (ec *ExecutionContext) SetCachedResultWithRaw(activityID string, rawJSON []byte, value any) {
+	ec.cacheMu.Lock()
+	defer ec.cacheMu.Unlock()
 	ec.cachedResults[activityID] = &CachedResult{RawJSON: rawJSON, Value: value}
 }
 
@@ -269,25 +282,49 @@ func (ec *ExecutionContext) Hooks() hooks.WorkflowHooks {
 	return ec.engine.hooks
 }
 
-// StartWorkflow starts a new workflow instance.
+// StartWorkflow starts a new workflow instance. input is the workflow's input,
+// reported to the OnWorkflowStart hook (nil when the caller does not have it).
 func (e *Engine) StartWorkflow(
 	ctx context.Context,
 	instanceID string,
 	workflowName string,
-	inputData []byte,
+	input any,
 	runner WorkflowRunner,
+) error {
+	return e.StartWorkflowWithLockID(ctx, instanceID, workflowName, input, runner, "")
+}
+
+// StartWorkflowWithLockID is StartWorkflow for a caller that created the
+// instance holding its lock under lockID (so no resumption poll could claim
+// it first); an empty lockID takes the lock under a new identity.
+func (e *Engine) StartWorkflowWithLockID(
+	ctx context.Context,
+	instanceID string,
+	workflowName string,
+	input any,
+	runner WorkflowRunner,
+	lockID string,
 ) error {
 	// Try to acquire lock under a fresh per-run lock identity. Every fenced
 	// write for this run passes the same identity, so a write attempted after
 	// the lease was lost and re-claimed (even by this same workerID) is
-	// rejected by the `locked_by = holder` check.
-	lockID := storage.NewLockIdentity(e.workerID)
+	// rejected by the `locked_by = holder` check. Taking a lock the caller
+	// already holds under lockID renews it.
+	if lockID == "" {
+		lockID = storage.NewLockIdentity(e.workerID)
+	}
 	acquired, err := e.storage.TryAcquireLock(ctx, instanceID, lockID, LockLeaseSeconds)
 	if err != nil {
 		return fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	if !acquired {
-		return fmt.Errorf("failed to acquire lock for instance %s", instanceID)
+		// An instance created unlocked (inside a caller's transaction) is
+		// running, so a resumption poll (of this worker or another) may claim
+		// it before this run does, or it is not visible yet (the transaction
+		// has not committed; a poll claims it after the commit). Either way
+		// another run executes it: this one has nothing to do.
+		slog.Debug("instance claimed by another run before its first run", "instance_id", instanceID)
+		return nil
 	}
 	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
 
@@ -301,7 +338,7 @@ func (e *Engine) StartWorkflow(
 	}
 
 	// Execute the workflow
-	return e.executeWorkflow(ctx, instanceID, runner, lockID)
+	return e.executeWorkflow(ctx, instanceID, workflowName, input, runner, lockID)
 }
 
 // ResumeWorkflow resumes a workflow from its history.
@@ -342,12 +379,21 @@ func (e *Engine) ResumeWorkflowWithLockID(
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
+	// The hooks report the workflow name; a resumed run reads it from the
+	// instance.
+	workflowName := ""
+	if instance, err := e.storage.GetInstance(ctx, instanceID); err == nil && instance != nil {
+		workflowName = instance.WorkflowName
+	}
+
 	// Execute the workflow
-	return e.executeWorkflow(ctx, instanceID, runner, lockID)
+	return e.executeWorkflow(ctx, instanceID, workflowName, nil, runner, lockID)
 }
 
-// executeWorkflow executes or replays a workflow.
-func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner WorkflowRunner, lockID string) error {
+// executeWorkflow executes or replays a workflow. Each run calls the
+// OnWorkflowStart hook once, and at most one of OnWorkflowComplete and
+// OnWorkflowFailed.
+func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName string, input any, runner WorkflowRunner, lockID string) error {
 	// Load history using iterator (streams from storage in batches)
 	iter := storage.NewHistoryIterator(ctx, e.storage, instanceID, &storage.HistoryIteratorOptions{
 		BatchSize: 1000,
@@ -437,7 +483,7 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 	if isReplaying {
 		e.hooks.OnReplayStart(ctx, hooks.ReplayStartInfo{
 			InstanceID:     instanceID,
-			WorkflowName:   "",
+			WorkflowName:   workflowName,
 			HistoryEvents:  historyCount,
 			ResumeActivity: "", // Not tracked in current implementation
 		})
@@ -446,7 +492,8 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 	// Call the workflow start hook
 	e.hooks.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{
 		InstanceID:   instanceID,
-		WorkflowName: "",
+		WorkflowName: workflowName,
+		InputData:    input,
 		StartTime:    startTime,
 	})
 
@@ -479,14 +526,11 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 			return e.handleSuspendSignal(ctx, instanceID, sig, lockID)
 		}
 
-		// Regular error - run compensations before marking as failed
+		// Regular error - run compensations before marking as failed. The
+		// failure hook reports a compensation failure along with the error.
+		failure := err
 		if compErr := e.executeCompensations(ctx, instanceID, lockID); compErr != nil {
-			// Log compensation error but continue
-			e.hooks.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{
-				InstanceID: instanceID,
-				Error:      fmt.Errorf("workflow failed: %w; compensation also failed: %v", err, compErr),
-				Duration:   duration,
-			})
+			failure = fmt.Errorf("workflow failed: %w; compensation also failed: %v", err, compErr)
 		}
 
 		// Record workflow failure in history
@@ -502,9 +546,10 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 		_ = e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusFailed, err.Error(), lockID)
 
 		e.hooks.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{
-			InstanceID: instanceID,
-			Error:      err,
-			Duration:   duration,
+			InstanceID:   instanceID,
+			WorkflowName: workflowName,
+			Error:        failure,
+			Duration:     duration,
 		})
 
 		return err
@@ -529,7 +574,7 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 	if isReplaying {
 		e.hooks.OnReplayComplete(ctx, hooks.ReplayCompleteInfo{
 			InstanceID:    instanceID,
-			WorkflowName:  "",
+			WorkflowName:  workflowName,
 			CacheHits:     execCtx.cacheHits,
 			NewActivities: execCtx.newActivities,
 			Duration:      duration,
@@ -537,9 +582,10 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 	}
 
 	e.hooks.OnWorkflowComplete(ctx, hooks.WorkflowCompleteInfo{
-		InstanceID: instanceID,
-		OutputData: result,
-		Duration:   duration,
+		InstanceID:   instanceID,
+		WorkflowName: workflowName,
+		OutputData:   result,
+		Duration:     duration,
 	})
 
 	return nil

@@ -375,12 +375,12 @@ func (a *Activity[I, O]) runBody(ctx *WorkflowContext, input I) (O, error) {
 		execCtx, cancel = context.WithTimeout(execCtx, a.timeout)
 		defer cancel()
 	}
-	execCtx = ContextWithWorkflowContext(execCtx, ctx)
-
-	if ctx.activityDepth != nil {
-		*ctx.activityDepth++
-		defer func() { *ctx.activityDepth-- }()
-	}
+	// The body has its own copy of the context, marked as inside an
+	// activity: activities run from several goroutines of one workflow mark
+	// neither the workflow nor each other.
+	bodyCtx := ctx.WithContext(ctx.Context())
+	bodyCtx.inActivity = true
+	execCtx = ContextWithWorkflowContext(execCtx, bodyCtx)
 	return a.fn(execCtx, input)
 }
 

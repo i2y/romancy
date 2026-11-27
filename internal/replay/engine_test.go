@@ -786,3 +786,101 @@ func TestCachedResult_Structure(t *testing.T) {
 	assert.Equal(t, []byte(`{"key":"value"}`), cached.RawJSON)
 	assert.Equal(t, map[string]any{"key": "value"}, cached.Value)
 }
+
+// nameRecordingHooks records the workflow name each engine hook receives.
+type nameRecordingHooks struct {
+	hooks.NoOpHooks
+	mu    sync.Mutex
+	names map[string][]string
+}
+
+func (h *nameRecordingHooks) record(hook, name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.names == nil {
+		h.names = map[string][]string{}
+	}
+	h.names[hook] = append(h.names[hook], name)
+}
+
+func (h *nameRecordingHooks) OnWorkflowStart(_ context.Context, info hooks.WorkflowStartInfo) {
+	h.record("start", info.WorkflowName)
+}
+
+func (h *nameRecordingHooks) OnWorkflowComplete(_ context.Context, info hooks.WorkflowCompleteInfo) {
+	h.record("complete", info.WorkflowName)
+}
+
+func (h *nameRecordingHooks) OnWorkflowFailed(_ context.Context, info hooks.WorkflowFailedInfo) {
+	h.record("failed", info.WorkflowName)
+}
+
+func (h *nameRecordingHooks) OnReplayStart(_ context.Context, info hooks.ReplayStartInfo) {
+	h.record("replay_start", info.WorkflowName)
+}
+
+func (h *nameRecordingHooks) OnReplayComplete(_ context.Context, info hooks.ReplayCompleteInfo) {
+	h.record("replay_complete", info.WorkflowName)
+}
+
+func TestEngine_HooksReceiveWorkflowName(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStorage(t)
+	recorder := &nameRecordingHooks{}
+	engine := NewEngine(store, recorder, "worker-1")
+
+	for _, id := range []string{"inst-ok", "inst-failed", "inst-resumed"} {
+		require.NoError(t, store.CreateInstance(ctx, &storage.WorkflowInstance{
+			InstanceID:   id,
+			WorkflowName: "named_workflow",
+			Status:       storage.StatusRunning,
+		}))
+	}
+	ok := func(*ExecutionContext) (any, error) { return "done", nil }
+
+	require.NoError(t, engine.StartWorkflow(ctx, "inst-ok", "named_workflow", nil, ok))
+	require.Error(t, engine.StartWorkflow(ctx, "inst-failed", "named_workflow", nil,
+		func(*ExecutionContext) (any, error) { return nil, errors.New("boom") }))
+
+	// A resumed run has history, so it replays; it learns the name from the instance.
+	require.NoError(t, store.AppendHistory(ctx, &storage.HistoryEvent{
+		InstanceID: "inst-resumed",
+		ActivityID: "step:1",
+		EventType:  storage.HistoryActivityCompleted,
+		EventData:  []byte(`"cached"`),
+		DataType:   "json",
+	}))
+	require.NoError(t, engine.ResumeWorkflow(ctx, "inst-resumed", ok))
+
+	assert.Equal(t, map[string][]string{
+		"start":           {"named_workflow", "named_workflow", "named_workflow"},
+		"complete":        {"named_workflow", "named_workflow"},
+		"failed":          {"named_workflow"},
+		"replay_start":    {"named_workflow"},
+		"replay_complete": {"named_workflow"},
+	}, recorder.names)
+}
+
+// A first run that finds its new instance claimed by another run (a
+// resumption poll got there first) does nothing and is not an error.
+func TestEngine_StartWorkflowClaimedByAnotherRun(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStorage(t)
+	recorder := &nameRecordingHooks{}
+	engine := NewEngine(store, recorder, "worker-1")
+
+	require.NoError(t, store.CreateInstance(ctx, &storage.WorkflowInstance{
+		InstanceID:   "inst-claimed",
+		WorkflowName: "named_workflow",
+		Status:       storage.StatusRunning,
+	}))
+	acquired, err := store.TryAcquireLock(ctx, "inst-claimed", storage.NewLockIdentity("worker-2"), LockLeaseSeconds)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	ran := false
+	require.NoError(t, engine.StartWorkflow(ctx, "inst-claimed", "named_workflow", "input",
+		func(*ExecutionContext) (any, error) { ran = true; return "done", nil }))
+	assert.False(t, ran, "the runner ran although another run holds the instance")
+	assert.Empty(t, recorder.names, "hooks were called for a run that did not happen")
+}
