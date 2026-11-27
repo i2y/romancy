@@ -44,7 +44,7 @@ func TestConcurrentActivitiesInOneWorkflow(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				results[i], errs[i] = step.Execute(ctx, input, WithActivityID(fmt.Sprintf("concurrent_step_%d:1", i)))
+				results[i], errs[i] = step.Execute(ctx, input, WithActivityID(fmt.Sprintf("concurrent_step_%d:parallel", i)))
 			}()
 		}
 		// Every body is running: the workflow itself is not in an activity.

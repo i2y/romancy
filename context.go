@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/i2y/romancy/hooks"
@@ -64,6 +65,10 @@ type WorkflowContext struct {
 	// Activity ID management
 	activityCounts map[string]int // function_name → counter
 
+	// usedIDs holds the activity IDs the workflow code has used in this run:
+	// the generated ones and those given with WithActivityID or WithSleepID.
+	usedIDs map[string]struct{}
+
 	// mu guards the maps of the context. WithContext copies share it, as
 	// they share the maps: a workflow may run activities from several
 	// goroutines.
@@ -103,6 +108,7 @@ func NewWorkflowContext(
 		isReplaying:    isReplaying,
 		historyCache:   historyCache,
 		activityCounts: make(map[string]int),
+		usedIDs:        make(map[string]struct{}),
 		mu:             new(sync.Mutex),
 		// Made here so that every copy of the context shares them
 		directSubscriptions: make(map[string]bool),
@@ -123,6 +129,7 @@ func NewWorkflowContextFromExecution(execCtx *replay.ExecutionContext) *Workflow
 		instanceID:     execCtx.InstanceID(),
 		isReplaying:    execCtx.IsReplaying(),
 		activityCounts: make(map[string]int),
+		usedIDs:        make(map[string]struct{}),
 		mu:             new(sync.Mutex),
 		execCtx:        execCtx,
 		// Made here so that every copy of the context shares it
@@ -149,6 +156,7 @@ func (c *WorkflowContext) WithContext(ctx context.Context) *WorkflowContext {
 		isReplaying:         c.isReplaying,
 		historyCache:        c.historyCache,
 		activityCounts:      c.activityCounts,
+		usedIDs:             c.usedIDs,
 		mu:                  c.mu,
 		inActivity:          c.inActivity,
 		execCtx:             c.execCtx,
@@ -194,7 +202,35 @@ func (c *WorkflowContext) GenerateActivityID(functionName string) string {
 	defer c.mu.Unlock()
 
 	c.activityCounts[functionName]++
-	return fmt.Sprintf("%s:%d", functionName, c.activityCounts[functionName])
+	id := fmt.Sprintf("%s:%d", functionName, c.activityCounts[functionName])
+	c.useIDLocked(id)
+	return id
+}
+
+// useExplicitID marks an ID given with WithActivityID or WithSleepID as used
+// by this run.
+func (c *WorkflowContext) useExplicitID(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.useIDLocked(id)
+}
+
+// useIDLocked marks an activity ID as used by this run; c.mu is held. Calls
+// that share an ID share one recorded result: the later call returns the
+// earlier call's result without running. That is a bug in the workflow (an
+// explicit ID that a generated one also takes, such as "fetch:1", or one
+// explicit ID given twice), so it is logged. Calls inside an activity body
+// are not tracked: the activity is the recorded unit.
+func (c *WorkflowContext) useIDLocked(id string) {
+	if c.inActivity || c.usedIDs == nil {
+		return
+	}
+	if _, used := c.usedIDs[id]; used {
+		slog.Warn("activity ID used twice in one run: the later call returns the earlier call's result without running",
+			"activity_id", id, "instance_id", c.instanceID, "workflow", c.workflowName)
+		return
+	}
+	c.usedIDs[id] = struct{}{}
 }
 
 // GetCachedResult retrieves a cached result for the given activity ID.

@@ -125,6 +125,8 @@ func (a *Activity[I, O]) Execute(
 	activityID := options.activityID
 	if activityID == "" {
 		activityID = ctx.GenerateActivityID(a.name)
+	} else {
+		ctx.useExplicitID(activityID)
 	}
 
 	// Call OnActivityStart hook

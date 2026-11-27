@@ -168,6 +168,8 @@ func sleepUntil(ctx *WorkflowContext, deadline func() time.Time, opts []SleepOpt
 	timerID := options.timerID
 	if timerID == "" {
 		timerID = ctx.GenerateActivityID("sleep")
+	} else {
+		ctx.useExplicitID(timerID)
 	}
 
 	// Check if result is cached (replay)
