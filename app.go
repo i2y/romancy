@@ -638,7 +638,7 @@ func (a *App) runStaleLockCleanupWithContext(ctx context.Context) {
 		case <-ticker.C:
 			// Leader runs directly (no singleton runner needed when using leader election)
 			if err := a.cleanupStaleLocks(); err != nil {
-				slog.Error("error cleaning up stale locks", "error", err)
+				a.logLoopError("error cleaning up stale locks", err)
 			}
 		}
 	}
@@ -653,19 +653,19 @@ func (a *App) cleanupStaleLocks() error {
 	// Heal channel waits stranded by the publish/registration race or by
 	// notification loss before looking for expired leases.
 	if _, err := a.storage.RequeueChannelWaitsWithPending(a.ctx); err != nil {
-		slog.Error("error requeuing channel waits", "error", err)
+		a.logLoopError("error requeuing channel waits", err)
 	}
 
 	// Remove expired capability grants.
 	if n, err := a.storage.DeleteExpiredCapabilities(a.ctx); err != nil {
-		slog.Error("error deleting expired capabilities", "error", err)
+		a.logLoopError("error deleting expired capabilities", err)
 	} else if n > 0 {
 		slog.Debug("deleted expired capabilities", "count", n)
 	}
 
 	// Deliver DOWN notifications for terminated actors and free their names.
 	if n, err := a.storage.EmitActorDownForTerminated(a.ctx); err != nil {
-		slog.Error("error emitting actor down notifications", "error", err)
+		a.logLoopError("error emitting actor down notifications", err)
 	} else if n > 0 {
 		slog.Debug("emitted actor down notifications", "count", n)
 	}
@@ -673,7 +673,7 @@ func (a *App) cleanupStaleLocks() error {
 	// Reclaim tasks whose claim is older than the lock lease (orphaned
 	// by a crashed claimant) back to 'open'.
 	if n, err := a.storage.ReclaimStaleTasks(a.ctx, a.config.staleLockTimeout); err != nil {
-		slog.Error("error reclaiming stale tasks", "error", err)
+		a.logLoopError("error reclaiming stale tasks", err)
 	} else if n > 0 {
 		slog.Debug("reclaimed stale tasks", "count", n)
 	}
@@ -733,7 +733,7 @@ func (a *App) runTimerCheckWithContext(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := a.checkExpiredTimers(); err != nil {
-				slog.Error("error checking expired timers", "error", err)
+				a.logLoopError("error checking expired timers", err)
 			}
 		}
 	}
@@ -915,7 +915,7 @@ func (a *App) runEventTimeoutCheckWithContext(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := a.checkEventTimeouts(); err != nil {
-				slog.Error("error checking event timeouts", "error", err)
+				a.logLoopError("error checking event timeouts", err)
 			}
 		}
 	}
@@ -1784,7 +1784,7 @@ func (a *App) runChannelTimeoutCheckWithContext(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := a.checkChannelTimeouts(); err != nil {
-				slog.Error("error checking channel timeouts", "error", err)
+				a.logLoopError("error checking channel timeouts", err)
 			}
 		}
 	}
@@ -1952,7 +1952,7 @@ func (a *App) runRecurCheckWithContext(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := a.checkRecurredWorkflows(); err != nil {
-				slog.Error("error checking recurred workflows", "error", err)
+				a.logLoopError("error checking recurred workflows", err)
 			}
 		}
 	}
@@ -2054,7 +2054,7 @@ func (a *App) runWorkflowResumption() {
 		count, err := a.resumeResumableWorkflows()
 		switch {
 		case err != nil:
-			slog.Error("error resuming workflows", "error", err)
+			a.logLoopError("error resuming workflows", err)
 			consecutiveEmpty = 0
 		case count == 0:
 			consecutiveEmpty++
@@ -2076,6 +2076,17 @@ func (a *App) runWorkflowResumption() {
 			return
 		}
 	}
+}
+
+// logLoopError logs an error of a background loop. Once the app shuts down,
+// its context is cancelled and so are the queries of the loops: such an error
+// is logged at debug level only.
+func (a *App) logLoopError(msg string, err error) {
+	if a.ctx != nil && a.ctx.Err() != nil {
+		slog.Debug(msg, "error", err)
+		return
+	}
+	slog.Error(msg, "error", err)
 }
 
 // resumeResumableWorkflows finds and resumes workflows that are ready.
@@ -2151,7 +2162,7 @@ func (a *App) runChannelCleanupWithContext(ctx context.Context) {
 		case <-ticker.C:
 			// Leader runs directly (no singleton runner needed when using leader election)
 			if err := a.cleanupChannelMessages(); err != nil {
-				slog.Error("error cleaning up channel messages", "error", err)
+				a.logLoopError("error cleaning up channel messages", err)
 			}
 		}
 	}
