@@ -3,6 +3,8 @@ package otel
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -481,4 +483,85 @@ func checkAttributeInt(t *testing.T, attrs []attribute.KeyValue, key string, exp
 		}
 	}
 	t.Errorf("attribute %s not found", key)
+}
+
+// Workflows run concurrently, so their hooks are called from many goroutines
+// at once (run with -race).
+func TestConcurrentWorkflows(t *testing.T) {
+	h, sr := setupTest()
+	ctx := context.Background()
+
+	const workflows = 50
+	var wg sync.WaitGroup
+	for i := 0; i < workflows; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("wf-%d", i)
+			h.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{InstanceID: id, WorkflowName: "order_workflow"})
+			h.OnActivityStart(ctx, hooks.ActivityStartInfo{InstanceID: id, ActivityID: "reserve:1", ActivityName: "reserve"})
+			h.OnActivityRetry(ctx, hooks.ActivityRetryInfo{InstanceID: id, ActivityID: "reserve:1", Attempt: 1, Error: errors.New("busy")})
+			h.OnActivityComplete(ctx, hooks.ActivityCompleteInfo{InstanceID: id, ActivityID: "reserve:1", ActivityName: "reserve"})
+			h.OnEventWaitStart(ctx, hooks.EventWaitStartInfo{InstanceID: id, EventType: "paid"})
+			h.OnEventWaitComplete(ctx, hooks.EventWaitCompleteInfo{InstanceID: id, EventType: "paid"})
+			h.OnTimerStart(ctx, hooks.TimerStartInfo{InstanceID: id, TimerID: "sleep:1"})
+			h.OnTimerFired(ctx, hooks.TimerFiredInfo{InstanceID: id, TimerID: "sleep:1"})
+			h.OnReplayStart(ctx, hooks.ReplayStartInfo{InstanceID: id})
+			h.OnReplayComplete(ctx, hooks.ReplayCompleteInfo{InstanceID: id})
+			h.OnWorkflowComplete(ctx, hooks.WorkflowCompleteInfo{InstanceID: id, WorkflowName: "order_workflow"})
+		}(i)
+	}
+	wg.Wait()
+
+	// Each workflow ends a workflow, activity, event wait, timer and replay span.
+	if got := len(sr.Ended()); got != workflows*5 {
+		t.Fatalf("expected %d ended spans, got %d", workflows*5, got)
+	}
+}
+
+// A run that suspended leaves its workflow span open; the next run of the same
+// instance ends it before starting its own.
+func TestWorkflowStartEndsEarlierRunSpan(t *testing.T) {
+	h, sr := setupTest()
+	ctx := context.Background()
+
+	h.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{InstanceID: "wf-1", WorkflowName: "order_workflow"})
+	h.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{InstanceID: "wf-1", WorkflowName: "order_workflow"})
+	if got := len(sr.Ended()); got != 1 {
+		t.Fatalf("expected the first run's span to end, got %d ended spans", got)
+	}
+
+	h.OnWorkflowComplete(ctx, hooks.WorkflowCompleteInfo{InstanceID: "wf-1", WorkflowName: "order_workflow"})
+	if got := len(sr.Ended()); got != 2 {
+		t.Fatalf("expected 2 ended spans, got %d", got)
+	}
+}
+
+// OnActivityStart fires for every activity call, including one whose result
+// comes from history: the cache hit ends the span it opened.
+func TestActivityCacheHitEndsStartedSpan(t *testing.T) {
+	h, sr := setupTest()
+	ctx := context.Background()
+
+	h.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{InstanceID: "wf-1", WorkflowName: "order_workflow"})
+	h.OnActivityStart(ctx, hooks.ActivityStartInfo{
+		InstanceID: "wf-1", ActivityID: "reserve:1", ActivityName: "reserve", IsReplay: true,
+	})
+	h.OnActivityCacheHit(ctx, hooks.ActivityCacheHitInfo{
+		InstanceID: "wf-1", ActivityID: "reserve:1", ActivityName: "reserve",
+	})
+
+	spans := sr.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 ended span, got %d", len(spans))
+	}
+	if spans[0].Name() != "activity_cache_hit/reserve" {
+		t.Errorf("expected span name 'activity_cache_hit/reserve', got %s", spans[0].Name())
+	}
+	if !spans[0].Parent().IsValid() {
+		t.Error("expected the cache-hit span to be a child of the workflow span")
+	}
+	if n := len(h.activitySpans); n != 0 {
+		t.Errorf("expected no open activity spans, got %d", n)
+	}
 }
