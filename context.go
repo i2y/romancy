@@ -2,6 +2,7 @@ package romancy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -136,6 +137,7 @@ func (c *WorkflowContext) WithContext(ctx context.Context) *WorkflowContext {
 		activityCounts:      c.activityCounts,
 		activityDepth:       c.activityDepth,
 		execCtx:             c.execCtx,
+		app:                 c.app,
 		directSubscriptions: c.directSubscriptions,
 	}
 }
@@ -273,7 +275,69 @@ func (c *WorkflowContext) Storage() storage.Storage {
 	if c.execCtx != nil {
 		return c.execCtx.Storage()
 	}
+	if c.app != nil {
+		return c.app.storage // contexts built outside a run (compensations)
+	}
 	return nil
+}
+
+// fenceRun proves, inside the transaction txCtx, that this run still holds
+// the instance lock. It is a conditional write (the lease heartbeat), so it
+// also orders the transaction after any lease steal: PostgreSQL and MySQL
+// row-lock the instance until commit, SQLite holds the write lock. Contexts
+// built outside a run (no replay engine) have no lock to prove.
+func (c *WorkflowContext) fenceRun(txCtx context.Context) error {
+	if c.execCtx == nil {
+		return nil
+	}
+	return c.Storage().RefreshLock(txCtx, c.instanceID, c.execCtx.LockID(), replay.LockLeaseSeconds)
+}
+
+// inFencedTransaction runs fn in a transaction that first proves the run
+// still holds the instance lock (fenceRun), and commits only if fn succeeds:
+// an effect and the record of it land together, and never for a run that
+// lost its lease. Already inside a transaction, fn joins it.
+// abortRun ends this run without an outcome: the cause (a storage error, the
+// lost lock, shutdown) is not recorded, every later step of the run fails
+// with the returned error, and the engine leaves the instance to a later run
+// (see ErrRunAborted).
+func (c *WorkflowContext) abortRun(cause error) error {
+	if c.execCtx != nil {
+		return c.execCtx.Abort(cause)
+	}
+	var already *RunAbortedError
+	if errors.As(cause, &already) {
+		return already
+	}
+	return &RunAbortedError{Cause: cause}
+}
+
+// abortedErr returns the abort error once the run has been aborted.
+func (c *WorkflowContext) abortedErr() error {
+	if c.execCtx != nil {
+		return c.execCtx.Aborted()
+	}
+	return nil
+}
+
+func (c *WorkflowContext) inFencedTransaction(fn func(*WorkflowContext) error) error {
+	s := c.Storage()
+	if s == nil || s.InTransaction(c.ctx) {
+		return fn(c)
+	}
+	txCtx, err := s.BeginTransaction(c.ctx)
+	if err != nil {
+		return err
+	}
+	if err := c.fenceRun(txCtx); err != nil {
+		_ = s.RollbackTransaction(txCtx)
+		return err
+	}
+	if err := fn(c.WithContext(txCtx)); err != nil {
+		_ = s.RollbackTransaction(txCtx)
+		return err
+	}
+	return s.CommitTransaction(txCtx)
 }
 
 // Session returns the database executor for the current context.

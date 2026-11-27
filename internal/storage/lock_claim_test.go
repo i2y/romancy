@@ -235,7 +235,7 @@ func TestClaimResumableBatch(t *testing.T) {
 	createClaimInstance(t, ctx, s, "b-1", "wf-b")
 
 	// w1 claims the two wf-a rows it can run.
-	got, err := s.ClaimResumableWorkflows(ctx, "w1", []string{"wf-a"}, 300, 10)
+	got, err := s.ClaimResumableWorkflows(ctx, "w1", anyVersion("wf-a"), 300, 10)
 	if err != nil {
 		t.Fatalf("w1 claim: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestClaimResumableBatch(t *testing.T) {
 
 	// The rows are actually locked by w1: w2 cannot claim them, but wf-b is
 	// still claimable for w2.
-	got2, err := s.ClaimResumableWorkflows(ctx, "w2", []string{"wf-a", "wf-b"}, 300, 10)
+	got2, err := s.ClaimResumableWorkflows(ctx, "w2", anyVersion("wf-a", "wf-b"), 300, 10)
 	if err != nil {
 		t.Fatalf("w2 claim: %v", err)
 	}
@@ -255,12 +255,53 @@ func TestClaimResumableBatch(t *testing.T) {
 
 	// A locked-but-expired row is claimed by the sweep as well.
 	expireLock(t, ctx, s, "a-1")
-	got3, err := s.ClaimResumableWorkflows(ctx, "w3", []string{"wf-a"}, 300, 10)
+	got3, err := s.ClaimResumableWorkflows(ctx, "w3", anyVersion("wf-a"), 300, 10)
 	if err != nil {
 		t.Fatalf("w3 claim: %v", err)
 	}
 	if len(got3) != 1 || got3[0].InstanceID != "a-1" {
 		t.Fatalf("w3: want expired a-1, got %+v", got3)
+	}
+}
+
+// anyVersion lists workflows to claim whatever their source hash.
+func anyVersion(names ...string) []WorkflowVersion {
+	versions := make([]WorkflowVersion, len(names))
+	for i, name := range names {
+		versions[i] = WorkflowVersion{Name: name}
+	}
+	return versions
+}
+
+// TestClaimResumableBySourceHash verifies that a claim takes only instances
+// of the code version the worker runs: an instance started under another
+// source hash is left for a worker that has that code, instead of being
+// claimed and handed back.
+func TestClaimResumableBySourceHash(t *testing.T) {
+	s, ctx := newClaimTestStorage(t)
+	for id, hash := range map[string]string{"v1": "hash-1", "v2": "hash-2"} {
+		now := time.Now()
+		if err := s.CreateInstance(ctx, &WorkflowInstance{
+			InstanceID: id, WorkflowName: "wf-v", SourceHash: hash, Status: StatusRunning,
+			InputData: []byte(`{}`), StartedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	createClaimInstance(t, ctx, s, "b-1", "wf-b")
+
+	got, err := s.ClaimResumableWorkflows(ctx, "w1",
+		[]WorkflowVersion{{Name: "wf-v", SourceHash: "hash-1"}, {Name: "wf-b", SourceHash: "hash-b"}}, 300, 10)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, wf := range got {
+		ids[wf.InstanceID] = true
+	}
+	// b-1 has no recorded hash of its own (as instances started without one), so any version runs it.
+	if len(got) != 2 || !ids["v1"] || !ids["b-1"] {
+		t.Fatalf("claimed %+v; want v1 and b-1, not the other version's v2", got)
 	}
 }
 
@@ -283,7 +324,7 @@ func TestClaimResumableConcurrent(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for attempt := 0; attempt < 5; attempt++ {
-				got, err := s.ClaimResumableWorkflows(ctx, fmt.Sprintf("w%d", i), []string{"wf"}, 300, 5)
+				got, err := s.ClaimResumableWorkflows(ctx, fmt.Sprintf("w%d", i), anyVersion("wf"), 300, 5)
 				if err == nil {
 					claimed[i] = got
 					return

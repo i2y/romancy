@@ -2,6 +2,7 @@ package romancy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -239,8 +240,10 @@ func TestReceive_NoStorage(t *testing.T) {
 
 func TestPublish_ReplayCacheHit(t *testing.T) {
 	ctx := context.Background()
+	// A recorded publish step (see runEffect): the replay returns it without
+	// touching storage.
 	historyCache := map[string]any{
-		"publish_test-channel:1": true,
+		"publish_test-channel:1": stepRecord{Value: json.RawMessage(`{}`)},
 	}
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", historyCache, true)
 
@@ -269,7 +272,7 @@ func TestPublish_WithMetadata_NoStorage(t *testing.T) {
 func TestSendTo_ReplayCacheHit(t *testing.T) {
 	ctx := context.Background()
 	historyCache := map[string]any{
-		"send_to_target-inst_test-channel:1": true,
+		"send_to_target-inst_test-channel:1": stepRecord{Value: json.RawMessage(`{}`)},
 	}
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", historyCache, true)
 

@@ -11,7 +11,7 @@ import (
 // to that actor) and "/shared/" (common space).
 //
 // Writes are CAS on version — FSRead returns the version, FSWrite passes
-// it back as expectedVersion; a mismatch returns storage.ErrFSConflict.
+// it back as expectedVersion; a mismatch returns ErrFSConflict.
 //
 // Permission model:
 //   - "/actor/{id}/..." : only the owning instance may read or write
@@ -20,8 +20,9 @@ import (
 //     capability token for the target path or for "/shared/"
 //
 // FS operations are non-deterministic I/O and MUST run inside an
-// activity; calls outside an activity (or during replay) fail with
-// ErrFSOutsideActivity.
+// activity; calls outside an executing activity body fail with
+// ErrFSOutsideActivity. (A replay never runs activity bodies, so inside
+// one the FS is always live.)
 
 // ErrFSOutsideActivity is returned when an FS op runs outside an activity body.
 var ErrFSOutsideActivity = fmt.Errorf("fs operations must run inside an activity")
@@ -30,10 +31,32 @@ var ErrFSOutsideActivity = fmt.Errorf("fs operations must run inside an activity
 var ErrFSForbidden = fmt.Errorf("fs: permission denied")
 
 func fsCheckActivity(ctx *WorkflowContext) error {
-	if ctx.IsReplaying() || !ctx.InActivity() {
+	// An activity body only ever executes for real — a replayed activity
+	// returns its recorded result without running the body — so being inside
+	// one is the whole condition. (IsReplaying is per run: it stays true for
+	// fresh activities that run after the replayed prefix of a resumed run.)
+	if !ctx.InActivity() {
 		return ErrFSOutsideActivity
 	}
 	return nil
+}
+
+// fsReadScope checks that the caller may read path (or list it, as a
+// prefix): /actor/{id}/... only for its owner, /shared/... for everyone.
+// The prefixes are matched exactly — storage collations may compare paths
+// case-insensitively, so anything outside the two namespaces is rejected
+// rather than treated as open.
+func fsReadScope(ctx *WorkflowContext, path string) error {
+	if rest, ok := strings.CutPrefix(path, "/actor/"); ok {
+		if owner, _, _ := strings.Cut(rest, "/"); owner != ctx.InstanceID() {
+			return fmt.Errorf("%w: /actor/%s is private to its owner", ErrFSForbidden, owner)
+		}
+		return nil
+	}
+	if strings.HasPrefix(path, "/shared/") {
+		return nil
+	}
+	return fmt.Errorf("%w: path must be under /actor/{id}/ or /shared/", ErrFSForbidden)
 }
 
 // fsAuthorize returns nil when ctx may write path, evaluating the path
@@ -52,13 +75,13 @@ func fsAuthorize(ctx *WorkflowContext, path, capabilityToken string) error {
 		if capabilityToken == "" {
 			return fmt.Errorf("%w: /shared/ writes require an fs_write capability", ErrFSForbidden)
 		}
-		ok, err := CheckCapability(ctx, storage.CapabilityKindFSWrite, path, capabilityToken)
+		ok, err := checkCapabilityToken(ctx, storage.CapabilityKindFSWrite, path, capabilityToken)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			// a grant scoped to the whole shared space also suffices
-			ok, err = CheckCapability(ctx, storage.CapabilityKindFSWrite, "/shared/", capabilityToken)
+			ok, err = checkCapabilityToken(ctx, storage.CapabilityKindFSWrite, "/shared/", capabilityToken)
 			if err != nil {
 				return err
 			}
@@ -82,11 +105,8 @@ func FSRead(ctx *WorkflowContext, path string) (data []byte, version int64, err 
 	if s == nil {
 		return nil, 0, fmt.Errorf("storage not available")
 	}
-	if rest, ok := strings.CutPrefix(path, "/actor/"); ok {
-		owner := strings.SplitN(rest, "/", 2)[0]
-		if owner != ctx.InstanceID() {
-			return nil, 0, fmt.Errorf("%w: cannot read another actor's private path", ErrFSForbidden)
-		}
+	if err := fsReadScope(ctx, path); err != nil {
+		return nil, 0, err
 	}
 	obj, err := s.FSGet(ctx.Context(), path)
 	if err != nil || obj == nil {
@@ -97,7 +117,7 @@ func FSRead(ctx *WorkflowContext, path string) (data []byte, version int64, err 
 
 // FSWrite stores data at path with optimistic concurrency:
 // expectedVersion 0 creates the file (fails if it exists), >0 updates
-// only if the stored version matches. Returns storage.ErrFSConflict on
+// only if the stored version matches. Returns ErrFSConflict on
 // mismatch.
 func FSWrite(ctx *WorkflowContext, path string, data []byte, expectedVersion int64, capabilityToken string) error {
 	if err := fsCheckActivity(ctx); err != nil {
@@ -125,13 +145,14 @@ func FSList(ctx *WorkflowContext, prefix string) ([]*storage.FSObject, error) {
 	if s == nil {
 		return nil, fmt.Errorf("storage not available")
 	}
-	if rest, ok := strings.CutPrefix(prefix, "/actor/"); ok {
-		owner := strings.SplitN(rest, "/", 2)[0]
-		if owner != ctx.InstanceID() {
-			return nil, fmt.Errorf("%w: cannot list another actor's private space", ErrFSForbidden)
-		}
-	} else if !strings.HasPrefix(prefix, "/shared") {
-		return nil, fmt.Errorf("%w: prefix must be under /actor/{id}/ or /shared/", ErrFSForbidden)
+	// A prefix that ends exactly at a namespace root lists that root: without
+	// the slash, "/actor/{id}" would also match "/actor/{id}x/..." — another
+	// actor whose id merely starts with ours (sup:w:g1 vs sup:w:g10).
+	if prefix == "/actor/"+ctx.InstanceID() || prefix == "/shared" {
+		prefix += "/"
+	}
+	if err := fsReadScope(ctx, prefix); err != nil {
+		return nil, err
 	}
 	return s.FSList(ctx.Context(), prefix)
 }

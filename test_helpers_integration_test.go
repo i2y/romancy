@@ -8,11 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/i2y/romancy/internal/storage"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/i2y/romancy/internal/storage"
 )
 
 // createTestAppWithPostgres creates a new App with a PostgreSQL testcontainer backend.

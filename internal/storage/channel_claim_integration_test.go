@@ -111,8 +111,10 @@ func testCompetingClaims(t *testing.T, s Storage, db *sql.DB, ph func(int) strin
 	if err != nil {
 		t.Fatalf("backdate claim failed: %v", err)
 	}
-	if pending("inst-a")[msgID2] {
-		// inst-a is terminal but pending query has no owner-status gate on itself.
+	// A stale claim is visible to every subscriber (the pending query does
+	// not gate on the reader's own status, so terminal inst-a sees it too).
+	if !pending("inst-a")[msgID2] {
+		t.Fatal("a stale claim must not hide the message")
 	}
 	if claimed, err := s.ClaimChannelMessage(ctx, msgID2, "inst-a"); err != nil || !claimed {
 		t.Fatalf("stale takeover failed: claimed=%v err=%v", claimed, err)

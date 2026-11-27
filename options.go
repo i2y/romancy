@@ -63,7 +63,14 @@ type appConfig struct {
 	// Migration settings
 	autoMigrate  bool  // Whether to run migrations on startup (default: true)
 	migrationsFS fs.FS // Optional custom migrations filesystem
+
+	// capabilityKey derives capability secrets (see WithCapabilityKey).
+	capabilityKey []byte
 }
+
+// capabilityKeyEnv names the environment variable a capability key is read
+// from when WithCapabilityKey is not given (shared with edda and shikibu).
+const capabilityKeyEnv = "DURAX_CAPABILITY_KEY"
 
 // defaultConfig returns the default configuration.
 func defaultConfig() *appConfig {
@@ -95,6 +102,21 @@ func defaultConfig() *appConfig {
 		shutdownTimeout:            30 * time.Second,
 		hooks:                      &hooks.NoOpHooks{},
 		autoMigrate:                true,
+	}
+}
+
+// WithCapabilityKey sets the key capability secrets are derived from: the
+// secret of a capability issued by IssueCapability is
+// hex(HMAC-SHA256(key, capability ID)). With a key, workflow history records
+// a capability's ID, kind and target but never its token, and a replay
+// derives the token again, so the key must stay the same while instances
+// that issued capabilities are alive (a run that needs a token and finds no
+// key stops and is retried). Without this option the value of the
+// DURAX_CAPABILITY_KEY environment variable is the key; without either,
+// secrets are random and the issued token is part of workflow history.
+func WithCapabilityKey(key []byte) Option {
+	return func(c *appConfig) {
+		c.capabilityKey = append([]byte(nil), key...)
 	}
 }
 

@@ -33,61 +33,76 @@ func TasksChannel(channel string) string {
 	return channel + ":tasks"
 }
 
+// Every primitive below is a recorded step when called from workflow code
+// (see runStep): a replay observes the recorded outcome — the same posted
+// id, the same claimed task, the same poll result — instead of touching the
+// queue again.
+
 // PostTask creates a task on channel and publishes a "task_posted"
 // notice on TasksChannel(channel). Returns the task ID.
 func PostTask(ctx *WorkflowContext, channel string, data []byte) (string, error) {
-	s := ctx.Storage()
-	if s == nil {
-		return "", fmt.Errorf("storage not available")
-	}
-	task := &storage.ActorTask{
-		ID:      fmt.Sprintf("task-%s", uuid.NewString()),
-		Channel: channel,
-		Data:    data,
-		State:   "open",
-	}
-	if err := s.PostTask(ctx.Context(), task); err != nil {
-		return "", err
-	}
-	return task.ID, nil
+	return runEffect(ctx, "romancy.post_task", func(ctx *WorkflowContext) (string, error) {
+		s := ctx.Storage()
+		if s == nil {
+			return "", fmt.Errorf("storage not available")
+		}
+		task := &storage.ActorTask{
+			ID:      fmt.Sprintf("task-%s", uuid.NewString()),
+			Channel: channel,
+			Data:    data,
+			State:   "open",
+		}
+		if err := s.PostTask(ctx.Context(), task); err != nil {
+			return "", err
+		}
+		return task.ID, nil
+	})
 }
 
 // ClaimTask atomically claims the oldest open task on channel for this
 // instance. Returns nil, nil when no open task exists.
 func ClaimTask(ctx *WorkflowContext, channel string) (*storage.ActorTask, error) {
-	s := ctx.Storage()
-	if s == nil {
-		return nil, fmt.Errorf("storage not available")
-	}
-	return s.ClaimTask(ctx.Context(), channel, ctx.InstanceID())
+	return runEffect(ctx, "romancy.claim_task", func(ctx *WorkflowContext) (*storage.ActorTask, error) {
+		s := ctx.Storage()
+		if s == nil {
+			return nil, fmt.Errorf("storage not available")
+		}
+		return s.ClaimTask(ctx.Context(), channel, ctx.InstanceID())
+	})
 }
 
 // CompleteTask marks a claimed task done (result JSON). Only the claimant
 // may complete; otherwise ErrTaskConflict.
 func CompleteTask(ctx *WorkflowContext, taskID string, result []byte) error {
-	s := ctx.Storage()
-	if s == nil {
-		return fmt.Errorf("storage not available")
-	}
-	return s.CompleteTask(ctx.Context(), taskID, ctx.InstanceID(), result, false)
+	return runEffectErr(ctx, "romancy.complete_task", func(ctx *WorkflowContext) error {
+		s := ctx.Storage()
+		if s == nil {
+			return fmt.Errorf("storage not available")
+		}
+		return s.CompleteTask(ctx.Context(), taskID, ctx.InstanceID(), result, false)
+	})
 }
 
 // FailTask marks a claimed task failed. Only the claimant may fail it.
 func FailTask(ctx *WorkflowContext, taskID string, result []byte) error {
-	s := ctx.Storage()
-	if s == nil {
-		return fmt.Errorf("storage not available")
-	}
-	return s.CompleteTask(ctx.Context(), taskID, ctx.InstanceID(), result, true)
+	return runEffectErr(ctx, "romancy.fail_task", func(ctx *WorkflowContext) error {
+		s := ctx.Storage()
+		if s == nil {
+			return fmt.Errorf("storage not available")
+		}
+		return s.CompleteTask(ctx.Context(), taskID, ctx.InstanceID(), result, true)
+	})
 }
 
 // ListTasks returns tasks on channel filtered by state ("" = all).
 func ListTasks(ctx *WorkflowContext, channel, state string) ([]*storage.ActorTask, error) {
-	s := ctx.Storage()
-	if s == nil {
-		return nil, fmt.Errorf("storage not available")
-	}
-	return s.ListTasks(ctx.Context(), channel, state)
+	return runStep(ctx, "romancy.list_tasks", func(ctx *WorkflowContext) ([]*storage.ActorTask, error) {
+		s := ctx.Storage()
+		if s == nil {
+			return nil, fmt.Errorf("storage not available")
+		}
+		return s.ListTasks(ctx.Context(), channel, state)
+	})
 }
 
 // WaitTask blocks until the task reaches a terminal state (done or
@@ -97,19 +112,12 @@ func ListTasks(ctx *WorkflowContext, channel, state string) ([]*storage.ActorTas
 // indefinitely; on timeout returns the last known task and the timeout
 // error.
 func WaitTask(ctx *WorkflowContext, taskID string, timeout time.Duration) (*storage.ActorTask, error) {
-	s := ctx.Storage()
-	if s == nil {
-		return nil, fmt.Errorf("storage not available")
-	}
-	task, err := s.GetTask(ctx.Context(), taskID)
-	if err != nil {
-		return nil, err
-	}
-	if task == nil {
-		return nil, fmt.Errorf("%w: %s", storage.ErrTaskNotFound, taskID)
-	}
-	return waitForTerminal(ctx, TasksChannel(task.Channel), timeout,
-		func() (*storage.ActorTask, error) {
+	poll := func() (*storage.ActorTask, error) {
+		return runStep(ctx, "romancy.get_task", func(ctx *WorkflowContext) (*storage.ActorTask, error) {
+			s := ctx.Storage()
+			if s == nil {
+				return nil, fmt.Errorf("storage not available")
+			}
 			t, err := s.GetTask(ctx.Context(), taskID)
 			if err != nil {
 				return nil, err
@@ -118,18 +126,24 @@ func WaitTask(ctx *WorkflowContext, taskID string, timeout time.Duration) (*stor
 				return nil, fmt.Errorf("%w: %s", storage.ErrTaskNotFound, taskID)
 			}
 			return t, nil
-		}, task)
+		})
+	}
+	task, err := poll() // learns the channel to watch
+	if err != nil {
+		return nil, err
+	}
+	return waitForTerminal(ctx, TasksChannel(task.Channel), timeout, poll)
 }
 
 // WaitAnyTask blocks until any task on channel reaches a terminal state
 // and returns it (earliest done, else earliest failed).
 func WaitAnyTask(ctx *WorkflowContext, channel string, timeout time.Duration) (*storage.ActorTask, error) {
-	s := ctx.Storage()
-	if s == nil {
-		return nil, fmt.Errorf("storage not available")
-	}
-	return waitForTerminal(ctx, TasksChannel(channel), timeout,
-		func() (*storage.ActorTask, error) {
+	return waitForTerminal(ctx, TasksChannel(channel), timeout, func() (*storage.ActorTask, error) {
+		return runStep(ctx, "romancy.find_settled_task", func(ctx *WorkflowContext) (*storage.ActorTask, error) {
+			s := ctx.Storage()
+			if s == nil {
+				return nil, fmt.Errorf("storage not available")
+			}
 			for _, state := range []string{"done", "failed"} {
 				tasks, err := s.ListTasks(ctx.Context(), channel, state)
 				if err != nil {
@@ -140,19 +154,37 @@ func WaitAnyTask(ctx *WorkflowContext, channel string, timeout time.Duration) (*
 				}
 			}
 			return nil, nil
-		}, nil)
+		})
+	})
 }
 
-// waitForTerminal subscribes broadcast on notifyCh, then loops:
-// re-check → receive until check returns a terminal task or deadline.
+// waitForTerminal subscribes broadcast on notifyCh, then loops: poll →
+// receive until the poll answers a terminal task or the deadline passes.
+//
+// Everything a decision depends on is recorded, so a replay takes exactly
+// the recorded path: polls are steps, and the deadline is fixed once as a
+// step — every run waits toward the same instant, and a receive that times
+// out has reached it.
 func waitForTerminal(ctx *WorkflowContext, notifyCh string, timeout time.Duration,
-	check func() (*storage.ActorTask, error), last *storage.ActorTask) (*storage.ActorTask, error) {
+	poll func() (*storage.ActorTask, error)) (*storage.ActorTask, error) {
 	var deadline time.Time
 	if timeout > 0 {
-		deadline = time.Now().Add(timeout)
+		var err error
+		deadline, err = runStep(ctx, "romancy.wait_deadline", func(*WorkflowContext) (time.Time, error) {
+			return time.Now().UTC().Add(timeout), nil
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
+	// Subscribe before the first poll: a notice published after the poll is
+	// then behind the subscription's cursor and wakes the receive.
+	if err := Subscribe(ctx, notifyCh, ModeBroadcast); err != nil {
+		return nil, err
+	}
+	var last *storage.ActorTask
 	for {
-		task, err := check()
+		task, err := poll()
 		if err != nil {
 			return nil, err
 		}
@@ -162,26 +194,15 @@ func waitForTerminal(ctx *WorkflowContext, notifyCh string, timeout time.Duratio
 				return task, nil
 			}
 		}
-		if err := Subscribe(ctx, notifyCh, ModeBroadcast); err != nil {
-			return nil, err
-		}
-		opts := []ReceiveOption{}
+		var opts []ReceiveOption
 		if timeout > 0 {
-			rem := time.Until(deadline)
-			if rem <= 0 {
-				return last, &ChannelMessageTimeoutError{
-					InstanceID:  ctx.InstanceID(),
-					ChannelName: notifyCh,
-				}
-			}
-			opts = append(opts, WithReceiveTimeout(rem))
+			// A deadline already behind us still goes through a (minimal)
+			// timed receive, so the timeout is a recorded outcome too.
+			opts = append(opts, WithReceiveTimeout(max(time.Until(deadline), time.Millisecond)))
 		}
 		if _, err := Receive[json.RawMessage](ctx, notifyCh, opts...); err != nil {
 			var timeoutErr *ChannelMessageTimeoutError
 			if errors.As(err, &timeoutErr) {
-				if timeout <= 0 || time.Now().Before(deadline) {
-					continue // spurious wake timeout — keep waiting
-				}
 				return last, err
 			}
 			return nil, err
@@ -191,11 +212,55 @@ func waitForTerminal(ctx *WorkflowContext, notifyCh string, timeout time.Duratio
 
 // ReadChannelSince returns messages on channel published after the given
 // message_id cursor ("" reads all, oldest first). Use the last message's
-// MessageID as the next cursor.
-func ReadChannelSince(ctx *WorkflowContext, channel, messageID string) ([]*storage.ChannelMessage, error) {
-	s := ctx.Storage()
-	if s == nil {
-		return nil, fmt.Errorf("storage not available")
+// MessageID as the next cursor. A cursor that names no message on the
+// channel any more (consumed or cleaned up) fails with ErrCursorNotFound
+// instead of reading from the beginning again; ReadChannelAfter, which
+// takes the numeric ID, keeps working then. A channel sealed for
+// channel_sub requires WithReceiveCapability, as Receive does.
+func ReadChannelSince(ctx *WorkflowContext, channel, messageID string, opts ...ReceiveOption) ([]*storage.ChannelMessage, error) {
+	options := &receiveOptions{}
+	for _, opt := range opts {
+		opt(options)
 	}
-	return s.ChannelMessagesSince(ctx.Context(), channel, messageID)
+	return runStep(ctx, "romancy.read_channel_since", func(ctx *WorkflowContext) ([]*storage.ChannelMessage, error) {
+		s := ctx.Storage()
+		if s == nil {
+			return nil, fmt.Errorf("storage not available")
+		}
+		if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelSub, channel, options.capabilityToken); err != nil {
+			return nil, err
+		}
+		if err := enforceDirectPrivacy(ctx, channel); err != nil {
+			return nil, err
+		}
+		return s.ChannelMessagesSince(ctx.Context(), channel, messageID)
+	})
+}
+
+// ReadChannelAfter returns the messages on channel whose ID (the numeric
+// ChannelMessage.ID, the row sequence) is larger than afterID, in ID order;
+// 0 reads from the beginning. Unlike ReadChannelSince it keeps working after
+// the cursor message was consumed or cleaned up: pass the ID of the last
+// message read. Sealing and recording are those of ReadChannelSince.
+func ReadChannelAfter(ctx *WorkflowContext, channel string, afterID int64, opts ...ReceiveOption) ([]*storage.ChannelMessage, error) {
+	options := &receiveOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+	return runStep(ctx, "romancy.read_channel_after", func(ctx *WorkflowContext) ([]*storage.ChannelMessage, error) {
+		s := ctx.Storage()
+		if s == nil {
+			return nil, fmt.Errorf("storage not available")
+		}
+		if afterID < 0 {
+			return nil, fmt.Errorf("%w: negative cursor %d", ErrInvalidArgument, afterID)
+		}
+		if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelSub, channel, options.capabilityToken); err != nil {
+			return nil, err
+		}
+		if err := enforceDirectPrivacy(ctx, channel); err != nil {
+			return nil, err
+		}
+		return s.ChannelMessagesAfter(ctx.Context(), channel, afterID)
+	})
 }

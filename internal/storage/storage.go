@@ -31,6 +31,12 @@ var ErrInstanceAlreadyExists = errors.New("workflow instance already exists")
 // checks: they are refused instead of being applied over a lost lock.
 var ErrLockNotHeld = errors.New("workflow instance lock is not held by this worker")
 
+// ErrInstanceTerminated is returned by UpdateInstanceStatusIfLocked when the
+// instance already reached a terminal status (completed, failed, cancelled).
+// Terminal statuses are absorbing: a cancel that landed while a run held the
+// lock, or a timer that fires after the cancel, must not bring it back.
+var ErrInstanceTerminated = errors.New("workflow instance already terminated")
+
 // ChannelClaimStaleSeconds bounds how long a competing-mode message claim may
 // stay unconsumed before another instance may take it over. A claim normally
 // lives only for the window between claiming and the workflow recording the
@@ -236,11 +242,13 @@ type LockManager interface {
 
 	// ClaimResumableWorkflows atomically claims up to limit resumable
 	// instances for workerID: one statement both selects claimable rows
-	// (running, this worker's workflow names, unlocked or lease-expired) and
-	// installs the lease, so concurrent workers take disjoint sets instead of
-	// all racing to claim the same head rows that FindResumableWorkflows
-	// returns. workflowNames must be non-empty.
-	ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*ResumableWorkflow, error)
+	// (running, of a workflow version this worker runs, unlocked or
+	// lease-expired) and installs the lease, so concurrent workers take
+	// disjoint sets instead of all racing to claim the same head rows that
+	// FindResumableWorkflows returns. Instances of another source hash are
+	// left for the workers that run that code. An empty versions claims
+	// nothing.
+	ClaimResumableWorkflows(ctx context.Context, workerID string, versions []WorkflowVersion, leaseSec, limit int) ([]*ResumableWorkflow, error)
 }
 
 // HistoryManager handles workflow execution history.
@@ -319,6 +327,11 @@ type CompensationManager interface {
 	// GetCompensations retrieves compensation entries in LIFO order (by created_at DESC).
 	// Status tracking is done via history events (CompensationExecuted, CompensationFailed).
 	GetCompensations(ctx context.Context, instanceID string) ([]*CompensationEntry, error)
+
+	// ClearCompensations removes every compensation registered for the
+	// instance. A recur ends the iteration they belong to: a failure in a
+	// later iteration must not undo an earlier, finished one.
+	ClearCompensations(ctx context.Context, instanceID string) error
 }
 
 // ========================================
@@ -459,6 +472,11 @@ type ActorRegistryManager interface {
 	// UnregisterActorName removes a name binding (idempotent).
 	UnregisterActorName(ctx context.Context, name string) error
 
+	// UnregisterOwnActorName removes the binding of name only when owner
+	// holds it: a name bound to another instance is ErrNotOwner, an unbound
+	// name a no-op. Workflow code unregisters through this form.
+	UnregisterOwnActorName(ctx context.Context, name, owner string) error
+
 	// WhereisActor resolves a name to an instance ID. Returns "" if unbound.
 	WhereisActor(ctx context.Context, name string) (string, error)
 
@@ -510,6 +528,11 @@ type CapabilityManager interface {
 	// RevokeCapability removes a grant by its capability ID (idempotent).
 	RevokeCapability(ctx context.Context, capabilityID string) error
 
+	// RevokeOwnCapability removes a grant only when owner issued it
+	// (granted_by): another instance's grant is ErrNotOwner, an unknown ID a
+	// no-op. Workflow code revokes through this form.
+	RevokeOwnCapability(ctx context.Context, capabilityID, owner string) error
+
 	// HasCapabilityGrants reports whether ANY grant exists for (kind, target).
 	// Channels with at least one grant are "sealed": the corresponding
 	// operation then requires a valid capability token.
@@ -518,8 +541,11 @@ type CapabilityManager interface {
 	// the stored hash and expiry. Returns false for unknown/expired grants.
 	CheckCapability(ctx context.Context, kind, target, secretHash string) (bool, error)
 
-	// DeleteExpiredCapabilities removes grants whose expires_at is in the
-	// past. Returns the number of rows deleted (leader sweep).
+	// DeleteExpiredCapabilities removes expired grants, keeping the newest
+	// grant of each (kind, target) unless an unexpired one remains: a
+	// channel stays sealed while any grant row exists, so expiry must never
+	// delete the last one and unseal it (SEMANTICS §3a). "Newest" orders by
+	// created_at, then id. Returns the number of rows deleted (leader sweep).
 	DeleteExpiredCapabilities(ctx context.Context) (int64, error)
 }
 
@@ -563,9 +589,32 @@ func expiryParam(exp *time.Time) any {
 	return canonicalTS(*exp)
 }
 
+// utcTimePtr returns t in UTC (nil stays nil). PostgreSQL TIMESTAMP and
+// MySQL DATETIME columns keep a wall clock, so times are written in UTC.
+func utcTimePtr(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC()
+}
+
 // canonicalTS renders a timestamp as a fixed-width UTC string
 // ("2006-01-02 15:04:05") that is lexically comparable across sqlite TEXT,
 // postgres TIMESTAMP, and mysql DATETIME columns.
+// RoundUpDeadline rounds a timer deadline up to a whole second before it is
+// stored. SQLite keeps timestamps as text to the second and MySQL in
+// TIMESTAMP(0) columns, and an expired timer is one whose deadline is <=
+// now, so a deadline with a fraction would fire up to a second early there
+// (truncated, or rounded to the nearest second); rounded up, it fires at
+// the earliest at the requested instant. Receive timeouts need no rounding:
+// they expire only once the stored deadline is < now.
+func RoundUpDeadline(t time.Time) time.Time {
+	if whole := t.Truncate(time.Second); !whole.Equal(t) {
+		return whole.Add(time.Second)
+	}
+	return t
+}
+
 func canonicalTS(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05")
 }
@@ -648,7 +697,15 @@ type TaskStore interface {
 
 	// ChannelMessagesSince returns messages on channel published after
 	// the given message_id cursor (empty = all, ordered by insertion id).
+	// A cursor that names no message on channel (consumed, cleaned up, or
+	// never published there) is ErrCursorNotFound: reading on from it would
+	// silently start over at the beginning.
 	ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*ChannelMessage, error)
+
+	// ChannelMessagesAfter returns messages on channel whose row id is
+	// larger than afterID, ordered by id (0 = all). Unlike a message_id
+	// cursor it keeps working after the cursor message is deleted.
+	ChannelMessagesAfter(ctx context.Context, channel string, afterID int64) ([]*ChannelMessage, error)
 
 	// ReclaimStaleTasks returns claimed tasks whose claim is older than
 	// maxAge back to 'open' (orphan recovery — a crashed claimant's task

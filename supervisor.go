@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/i2y/romancy/internal/storage"
@@ -29,13 +30,17 @@ import (
 //   - 'recurred' counts as ALIVE: a child using Recur on itself is
 //     mid-flight, not dead.
 //   - Restarting a live child (one_for_all / rest_for_one) cancels the
-//     running instance and immediately spawns the replacement. Cancellation
-//     is a best-effort kill — the replacement has a distinct generation ID
-//     either way.
+//     running instance and immediately spawns the replacement. The cancel is
+//     conditional: a child that ended on its own before the cancel landed is
+//     judged by its actual status (a transient child that completed is not
+//     restarted). Terminal statuses are absorbing, so a cancelled child
+//     cannot come back, and the replacement has a distinct generation ID.
 //   - History stays bounded because each loop iteration ends in Recur.
 //
-// Supervised children should not themselves use Recur with direct-channel
-// subscriptions they cannot re-establish; treat children as plain workers.
+// A child that recurs keeps its instance ID, so it stays the same child.
+// Its subscriptions end with each Recur: it subscribes again at the start of
+// every iteration (a broadcast channel continues after the last message it
+// received).
 
 // RestartMode controls when a child is restarted after termination.
 type RestartMode int
@@ -122,7 +127,7 @@ const supervisorMonitorChannel = "supervisor"
 // Register and start it like any other workflow:
 //
 //	sup := romancy.DefineSupervisor("pipeline-sup", cfg, specs)
-//	app.RegisterWorkflow(sup)
+//	romancy.RegisterWorkflow(app, sup)
 //	id, _ := romancy.StartWorkflow(ctx, app, sup, romancy.SupervisorState{})
 //
 // Children's workflows must be registered on workers sharing the database —
@@ -202,8 +207,16 @@ func DefineSupervisor(
 		if err := Subscribe(ctx, supervisorMonitorChannel, ModeDirect); err != nil {
 			return SupervisorResult{}, err
 		}
-		_, _ = Receive[json.RawMessage](ctx, supervisorMonitorChannel,
-			WithReceiveTimeout(time.Duration(cfg.PollSeconds*float64(time.Second))))
+		// A DOWN or the poll timeout both lead to the next sync. Any other
+		// outcome — above all the suspend signal that parks this run until
+		// one of them happens — must propagate, or the loop would spin.
+		if _, err := Receive[json.RawMessage](ctx, supervisorMonitorChannel,
+			WithReceiveTimeout(time.Duration(cfg.PollSeconds*float64(time.Second)))); err != nil {
+			var timeoutErr *ChannelMessageTimeoutError
+			if !errors.As(err, &timeoutErr) {
+				return SupervisorResult{}, err
+			}
+		}
 
 		// Tail-recursive loop: archive history, continue with updated state.
 		_, err = Recur(ctx, state)
@@ -259,6 +272,9 @@ func superviseSync(
 	s := wfCtx.Storage()
 	now := time.Now()
 	out := superviseSyncOutput{Now: now.UnixNano()}
+	// Work on a copy: a retried attempt must start from the input state, not
+	// from what a failed attempt already rewrote.
+	in.Children = slices.Clone(in.Children)
 
 	// 1. Classify children by their actual instance rows. Never-spawned
 	// children (initial iteration) are spawn-pending: they are not dead,
@@ -298,21 +314,45 @@ func superviseSync(
 		}
 	}
 
-	// 2. Expand the restart set per strategy.
+	// 2. Expand the restart set per strategy. A temporary sibling caught in
+	// the cascade is stopped but never restarted (SEMANTICS §7; OTP does the
+	// same).
+	stop := make([]bool, len(in.Children))
+	cascade := func(i int) {
+		c := &in.Children[i]
+		if c.Terminal || restart[i] {
+			return
+		}
+		if c.Spec.Restart == RestartTemporary {
+			stop[i] = c.InstanceID != ""
+			return
+		}
+		restart[i] = true
+	}
 	if deadIdx >= 0 {
 		switch cfg.Strategy {
 		case OneForAll:
 			for i := range in.Children {
-				if !in.Children[i].Terminal {
-					restart[i] = true
-				}
+				cascade(i)
 			}
 		case RestForOne:
 			for i := deadIdx; i < len(in.Children); i++ {
-				if !in.Children[i].Terminal {
-					restart[i] = true
-				}
+				cascade(i)
 			}
+		}
+	}
+	for i := range in.Children {
+		if !stop[i] {
+			continue
+		}
+		c := &in.Children[i]
+		status, stopped, err := stopChild(ctx, s, c.InstanceID)
+		if err != nil {
+			return out, err
+		}
+		if stopped {
+			c.Terminal = true
+			c.FinalStatus = string(status)
 		}
 	}
 
@@ -325,9 +365,20 @@ func superviseSync(
 		}
 		c := &in.Children[i]
 		if c.InstanceID != "" && !deadStatus(statuses[i]) {
-			// Best-effort kill of the live child we are replacing.
-			if err := s.CancelInstance(ctx, c.InstanceID, "supervisor restart"); err != nil {
-				return out, fmt.Errorf("cancel %s: %w", c.InstanceID, err)
+			status, stopped, err := stopChild(ctx, s, c.InstanceID)
+			if err != nil {
+				return out, err
+			}
+			if !stopped {
+				continue // still compensating: the next sync sees how it ends
+			}
+			if !needsRestart(c.Spec.Restart, status) {
+				// It ended on its own before the cancel landed (a transient
+				// child completing normally): its restart mode decides, as if
+				// the sync had read it terminal.
+				c.Terminal = true
+				c.FinalStatus = string(status)
+				continue
 			}
 		}
 
@@ -343,6 +394,7 @@ func superviseSync(
 			Status:           storage.StatusRunning,
 			InputData:        input,
 			ParentInstanceID: in.SupervisorID,
+			SourceHash:       wfCtx.App().workflowSourceHash(c.Spec.Workflow),
 			StartedAt:        now,
 			UpdatedAt:        now,
 		}
@@ -370,4 +422,31 @@ func superviseSync(
 	}
 	out.Children = in.Children
 	return out, nil
+}
+
+// stopChild cancels a live child the supervisor is replacing or stopping,
+// and answers the status the child is in afterwards and whether it is
+// stopped. The cancel is conditional (SEMANTICS §7): a child that is no
+// longer cancellable ended on its own between the sync's read and the
+// cancel, and its actual status — not an assumed cancellation — is what the
+// restart mode applies to. A child still compensating cannot be cancelled
+// and is not stopped; the next sync sees how it ends. Any other failure
+// aborts the sync, whose transaction rolls back and whose retry reads the
+// children again.
+func stopChild(ctx context.Context, s storage.Storage, instanceID string) (status storage.WorkflowStatus, stopped bool, err error) {
+	err = s.CancelInstance(ctx, instanceID, "supervisor restart")
+	if err == nil {
+		return storage.StatusCancelled, true, nil
+	}
+	if !errors.Is(err, storage.ErrWorkflowNotCancellable) {
+		return "", false, fmt.Errorf("cancel %s: %w", instanceID, err)
+	}
+	inst, err := s.GetInstance(ctx, instanceID)
+	if err != nil {
+		return "", false, fmt.Errorf("get instance %s: %w", instanceID, err)
+	}
+	if inst == nil {
+		return storage.StatusFailed, true, nil // row missing: treat as crashed
+	}
+	return inst.Status, deadStatus(inst.Status), nil
 }

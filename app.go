@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,6 +93,11 @@ func NewApp(opts ...Option) *App {
 	// Generate worker ID if not set
 	if config.workerID == "" {
 		config.workerID = uuid.New().String()
+	}
+	if config.capabilityKey == nil {
+		if key := os.Getenv(capabilityKeyEnv); key != "" {
+			config.capabilityKey = []byte(key)
+		}
 	}
 
 	return &App{
@@ -274,20 +280,28 @@ func (a *App) initStorage() error {
 	a.engine = replay.NewEngine(a.storage, a.hooks, a.config.workerID)
 
 	// Set up compensation runner to execute compensations via the global registry
-	a.engine.SetCompensationRunner(func(ctx context.Context, funcName string, arg []byte) error {
+	a.engine.SetCompensationRunner(func(ctx context.Context, instanceID, funcName string, arg []byte) error {
 		executor, ok := GetCompensationExecutor(funcName)
 		if !ok {
 			return fmt.Errorf("compensation executor not found for %s", funcName)
 		}
-		// Treat compensation as in-activity so FS ops are allowed.
-		if wfCtx := GetWorkflowContext(ctx); wfCtx != nil && wfCtx.activityDepth != nil {
-			*wfCtx.activityDepth++
-			defer func() { *wfCtx.activityDepth-- }()
-		}
-		return executor(ctx, arg)
+		compCtx, done := a.compensationContext(ctx, instanceID)
+		defer done()
+		return executor(compCtx, arg)
 	})
 
 	return nil
+}
+
+// compensationContext gives a compensation body the context an activity body
+// of the instance has: GetWorkflowContext works, and FS and kernel
+// primitives run directly (a compensation runs once, like an activity body,
+// and its outcome is recorded in history).
+func (a *App) compensationContext(ctx context.Context, instanceID string) (compCtx context.Context, done func()) {
+	wfCtx := NewWorkflowContext(ctx, instanceID, a.config.workerID, "", nil, false)
+	wfCtx.SetApp(a)
+	*wfCtx.activityDepth = 1
+	return wfCtx.Context(), wfCtx.cancel
 }
 
 // shouldEnableListenNotify determines if LISTEN/NOTIFY should be enabled.
@@ -773,15 +787,23 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 		return nil
 	}
 
-	// Check if we have this workflow registered
-	// If not, skip and let another worker handle it
+	// A timer that outlived its instance (cancelled or finished while it
+	// slept) is dropped: firing it would resume a terminated instance.
+	if storage.IsTerminalStatus(instance.Status) {
+		return a.storage.RemoveTimerSubscription(a.ctx, timer.InstanceID, timer.TimerID)
+	}
+
+	// Check if we have this workflow registered — in the instance's code
+	// version. If not, skip and let another worker handle it: consuming the
+	// timer here and then refusing the resume would strand the instance in
+	// waiting_for_timer with no timer left to fire.
 	a.workflowRunnersMu.RLock()
 	_, registered := a.workflowRunners[instance.WorkflowName]
+	wantHash := a.workflowHashes[instance.WorkflowName]
 	a.workflowRunnersMu.RUnlock()
 
-	if !registered {
-		// This worker doesn't have the workflow registered, skip
-		slog.Debug("skipping timer for unregistered workflow",
+	if !registered || !sourceHashMatches(wantHash, instance.SourceHash) {
+		slog.Debug("skipping timer for a workflow this worker does not run",
 			"instance_id", timer.InstanceID,
 			"workflow_name", instance.WorkflowName,
 			"timer_id", timer.TimerID)
@@ -804,21 +826,19 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 		return nil
 	}
 
-	// Remove the timer subscription
-	if err := a.storage.RemoveTimerSubscription(a.ctx, timer.InstanceID, timer.TimerID); err != nil {
+	// Consume the timer atomically: remove it, record its completion so the
+	// replay skips it, and mark the instance runnable. If the resume below
+	// does not run it here, the resumption loop picks it up instead of the
+	// instance waiting for a timer that no longer exists.
+	if err := a.fireTimer(timer, lockID); err != nil {
 		_ = a.storage.ReleaseLock(a.ctx, timer.InstanceID, lockID)
+		if errors.Is(err, errTimerNotAwaited) {
+			return nil
+		}
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return a.storage.RemoveTimerSubscription(a.ctx, timer.InstanceID, timer.TimerID)
+		}
 		return err
-	}
-
-	// Record the timer completion in history so replay can skip it
-	timerResult := map[string]any{
-		"timer_id":   timer.TimerID,
-		"expires_at": timer.ExpiresAt.Format(time.RFC3339),
-		"completed":  true,
-	}
-	if err := a.engine.RecordActivityResult(a.ctx, timer.InstanceID, lockID, timer.TimerID, timerResult, nil); err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, timer.InstanceID, lockID)
-		return fmt.Errorf("failed to record timer result: %w", err)
 	}
 
 	// Call OnTimerFired hook
@@ -829,10 +849,57 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 		FiredAt:      time.Now(),
 	})
 
-	// Release this epoch's lock, then resume — the engine claims its own
-	// fresh identity for the resumed run.
-	_ = a.storage.ReleaseLock(a.ctx, timer.InstanceID, lockID)
-	return a.resumeWorkflow(a.ctx, timer.InstanceID)
+	// Resume under this epoch: the engine re-acquires the lock as the same
+	// holder, so no other run can slip in between.
+	return a.resumeWorkflowWithLockID(a.ctx, timer.InstanceID, lockID)
+}
+
+// errTimerNotAwaited reports a timer fireTimer removed without firing it,
+// because its instance was not waiting for a timer.
+var errTimerNotAwaited = errors.New("timer not awaited")
+
+// fireTimer removes the timer, records its completion and flips the instance
+// to running, in one transaction under the caller's lock.
+func (a *App) fireTimer(timer *storage.TimerSubscription, lockID string) (err error) {
+	txCtx, err := a.storage.BeginTransaction(a.ctx)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if err != nil && !committed {
+			_ = a.storage.RollbackTransaction(txCtx)
+		}
+	}()
+	if err := a.storage.RemoveTimerSubscription(txCtx, timer.InstanceID, timer.TimerID); err != nil {
+		return err
+	}
+	// Only an instance waiting for a timer is woken by one. A timer left
+	// behind by an earlier run is just removed: firing it would record a
+	// completion into, and wake, an instance that waits for something else.
+	instance, err := a.storage.GetInstance(txCtx, timer.InstanceID)
+	if err != nil {
+		return err
+	}
+	if instance == nil || instance.Status != storage.StatusWaitingForTimer {
+		if err := a.storage.CommitTransaction(txCtx); err != nil {
+			return err
+		}
+		committed = true
+		return errTimerNotAwaited
+	}
+	timerResult := map[string]any{
+		"timer_id":   timer.TimerID,
+		"expires_at": timer.ExpiresAt.Format(time.RFC3339),
+		"completed":  true,
+	}
+	if err := a.engine.RecordActivityResult(txCtx, timer.InstanceID, lockID, timer.TimerID, timerResult, nil); err != nil {
+		return fmt.Errorf("failed to record timer result: %w", err)
+	}
+	if err := a.storage.UpdateInstanceStatusIfLocked(txCtx, timer.InstanceID, storage.StatusRunning, "", lockID); err != nil {
+		return err
+	}
+	return a.storage.CommitTransaction(txCtx)
 }
 
 // runEventTimeoutCheckWithContext periodically checks for event timeouts with a cancellable context.
@@ -902,9 +969,7 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 	now := time.Now()
 	sourceHash := opts.sourceHash
 	if sourceHash == "" {
-		a.workflowRunnersMu.RLock()
-		sourceHash = a.workflowHashes[workflowName]
-		a.workflowRunnersMu.RUnlock()
+		sourceHash = a.workflowSourceHash(workflowName)
 	}
 	parentInstanceID := ""
 	if wfCtx := GetWorkflowContext(ctx); wfCtx != nil {
@@ -981,6 +1046,19 @@ func (a *App) registeredWorkflowNames() []string {
 	return names
 }
 
+// registeredWorkflowVersions lists the workflows this worker runs with the
+// source hash of its code for each, so a claim takes only instances this
+// worker will run (see sourceHashMatches).
+func (a *App) registeredWorkflowVersions() []storage.WorkflowVersion {
+	a.workflowRunnersMu.RLock()
+	defer a.workflowRunnersMu.RUnlock()
+	versions := make([]storage.WorkflowVersion, 0, len(a.workflowRunners))
+	for name := range a.workflowRunners {
+		versions = append(versions, storage.WorkflowVersion{Name: name, SourceHash: a.workflowHashes[name]})
+	}
+	return versions
+}
+
 // resumeWorkflow resumes a workflow (for stale lock recovery).
 func (a *App) resumeWorkflow(ctx context.Context, instanceID string) error {
 	return a.resumeWorkflowWithLockID(ctx, instanceID, storage.NewLockIdentity(a.config.workerID))
@@ -989,9 +1067,15 @@ func (a *App) resumeWorkflow(ctx context.Context, instanceID string) error {
 // resumeWorkflowWithLockID resumes under an existing claim epoch. Callers
 // that batch-claimed instances pass the identity they claimed with.
 func (a *App) resumeWorkflowWithLockID(ctx context.Context, instanceID, lockID string) error {
+	// A caller may already hold the lock under lockID (a batch claim, a fired
+	// timer); every path that does not reach the engine frees it, so the
+	// instance is not left leased to a run that never happens.
+	release := func() { _ = a.storage.ReleaseLock(ctx, instanceID, lockID) }
+
 	// Get the instance to find the workflow name
 	instance, err := a.storage.GetInstance(ctx, instanceID)
 	if err != nil {
+		release()
 		return fmt.Errorf("failed to get instance: %w", err)
 	}
 	if instance == nil {
@@ -1005,17 +1089,26 @@ func (a *App) resumeWorkflowWithLockID(ctx context.Context, instanceID, lockID s
 	a.workflowRunnersMu.RUnlock()
 
 	if !ok {
+		release()
 		return fmt.Errorf("workflow %s not registered", instance.WorkflowName)
 	}
 
 	// An instance written by another version of the code replays differently:
 	// it is left for a worker that has its version (when both sides carry a
 	// hash; a missing hash matches, as before).
-	if wantHash != "" && instance.SourceHash != "" && wantHash != instance.SourceHash {
+	if !sourceHashMatches(wantHash, instance.SourceHash) {
+		release()
 		return fmt.Errorf("%w: instance %s has %q, this worker has %q", ErrSourceHashMismatch, instanceID, instance.SourceHash, wantHash)
 	}
 
 	return a.engine.ResumeWorkflowWithLockID(ctx, instanceID, lockID, runner)
+}
+
+// sourceHashMatches reports whether an instance written with code version
+// have may run on a worker registered with version want; a missing hash on
+// either side matches.
+func sourceHashMatches(want, have string) bool {
+	return want == "" || have == "" || want == have
 }
 
 // GetInstance retrieves a workflow instance by ID.
@@ -1099,6 +1192,10 @@ func (a *App) cancelWorkflow(ctx context.Context, instanceID, reason string) err
 		return fmt.Errorf("cannot cancel failed workflow")
 	case storage.StatusCancelled:
 		return nil // Already cancelled, idempotent
+	case storage.StatusCompensating:
+		// Already winding down: a cancel would stop its compensations
+		// half-way (SEMANTICS §1).
+		return ErrWorkflowNotCancellable
 	}
 
 	// Try to acquire lock
@@ -1180,7 +1277,10 @@ func (a *App) executeCompensations(ctx context.Context, instanceID, lockID strin
 		}
 
 		// Execute the compensation
-		if err := executor(ctx, comp.Args); err != nil {
+		compCtx, done := a.compensationContext(ctx, instanceID)
+		err := executor(compCtx, comp.Args)
+		done()
+		if err != nil {
 			slog.Error("compensation failed", "activity", comp.ActivityName, "error", err)
 			_ = a.recordCompensationResult(ctx, instanceID, lockID, comp, false, err.Error())
 			lastErr = err
@@ -1385,6 +1485,31 @@ func (a *App) handleCloudEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An event published to a sealed channel must carry a channel_pub token
+	// in the capabilitytoken extension (binary mode: the ce-capabilitytoken
+	// header), checked before the event is accepted. The token is not kept
+	// with the event.
+	token, _ := event.Extensions[cloudEventTokenExtension].(string)
+	if token == "" {
+		token = r.Header.Get("Ce-" + cloudEventTokenExtension)
+	}
+	delete(event.Extensions, cloudEventTokenExtension)
+	if a.storage != nil {
+		if err := checkChannelSeal(r.Context(), a.storage, storage.CapabilityKindChannelPub, cloudEventChannel(&event), token); err != nil {
+			status, errType, retryable := http.StatusInternalServerError, "InternalError", "true"
+			if errors.Is(err, ErrChannelForbidden) {
+				status, errType, retryable = http.StatusForbidden, "Forbidden", "false"
+			}
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":      err.Error(),
+				"error_type": errType,
+				"retryable":  retryable,
+			})
+			return
+		}
+	}
+
 	// Process the event asynchronously
 	// Use background context since HTTP request context is canceled after response
 	go a.processCloudEvent(context.Background(), &event)
@@ -1428,6 +1553,20 @@ func (a *App) processCloudEvent(ctx context.Context, event *CloudEvent) {
 	}
 }
 
+// cloudEventTokenExtension is the CloudEvents extension attribute that
+// carries a channel_pub capability token for a sealed channel.
+const cloudEventTokenExtension = "capabilitytoken"
+
+// cloudEventChannel is the channel an incoming event is published to: its
+// type, or "{type}:{instance}" for an event targeted at one instance with
+// the romancyinstanceid extension (Edda approach).
+func cloudEventChannel(event *CloudEvent) string {
+	if id, ok := event.Extensions["romancyinstanceid"].(string); ok && id != "" {
+		return fmt.Sprintf("%s:%s", event.Type, id)
+	}
+	return event.Type
+}
+
 // deliverEventToWaitingWorkflows delivers an event to workflows waiting for it.
 // Uses the unified channel system: event_type is used as the channel name.
 // Workflows waiting via WaitEvent (which internally uses Receive) are subscribed to the event_type channel.
@@ -1461,17 +1600,7 @@ func (a *App) deliverEventToWaitingWorkflows(ctx context.Context, event *CloudEv
 		return fmt.Errorf("failed to serialize event data: %w", err)
 	}
 
-	// Check if a specific instance is targeted via romancyinstanceid extension
-	targetInstanceID := ""
-	if id, ok := event.Extensions["romancyinstanceid"].(string); ok && id != "" {
-		targetInstanceID = id
-	}
-
-	// Determine channel name: use dynamic channel name for targeted messages (Edda approach)
-	channelName := event.Type
-	if targetInstanceID != "" {
-		channelName = fmt.Sprintf("%s:%s", event.Type, targetInstanceID)
-	}
+	channelName := cloudEventChannel(event)
 
 	// Publish to channel using event.Type as channel name
 	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, nil)
@@ -1680,12 +1809,36 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 		return nil
 	}
 
-	// Call OnEventTimeout hook
-	instance, _ := a.storage.GetInstance(a.ctx, sub.InstanceID)
-	workflowName := ""
-	if instance != nil {
-		workflowName = instance.WorkflowName
+	// The timeout belongs to one wait: it fires only while that wait is still
+	// the instance's current one. A delivery, a requeue or a cancel may have
+	// ended it between the scan and this lock; a stale timeout must neither
+	// record into the instance's history nor bring it back to running.
+	instance, err := a.storage.GetInstance(a.ctx, sub.InstanceID)
+	if err != nil {
+		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		return err
 	}
+	current, err := a.storage.GetChannelSubscription(a.ctx, sub.InstanceID, sub.Channel)
+	if err != nil {
+		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		return err
+	}
+	// Same wait = same activity id and same deadline as the scan saw (a
+	// replayed Receive re-registers the same activity id with a new deadline);
+	// the scan already compared that deadline with the database clock.
+	if instance == nil || current == nil || current.ActivityID != sub.ActivityID ||
+		current.TimeoutAt == nil || sub.TimeoutAt == nil || !current.TimeoutAt.Equal(*sub.TimeoutAt) {
+		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		return nil
+	}
+	if instance.Status != storage.StatusWaitingForMessage {
+		// The wait outlived its instance's suspension (the instance resumed
+		// or terminated without clearing it): drop it.
+		err := a.storage.ClearChannelWaitingState(a.ctx, sub.InstanceID, sub.Channel)
+		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		return err
+	}
+	workflowName := instance.WorkflowName
 	a.hooks.OnEventTimeout(a.ctx, hooks.EventTimeoutInfo{
 		InstanceID:   sub.InstanceID,
 		WorkflowName: workflowName,
@@ -1712,29 +1865,37 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 		EventData:  errJSON,
 		DataType:   "json",
 	}
-	if err := a.storage.AppendHistoryIfLocked(a.ctx, historyEvent, lockID); err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
-		return fmt.Errorf("failed to record timeout error: %w", err)
+	// Record the timeout, end the wait and mark the instance runnable in one
+	// transaction: a crash in between must not leave it waiting_for_message
+	// with no wait left for a delivery, a timeout or the requeue to find.
+	err = a.fireReceiveTimeout(historyEvent, sub.Channel, lockID)
+	_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+	if errors.Is(err, storage.ErrInstanceTerminated) {
+		return nil // cancelled meanwhile
 	}
+	return err
+}
 
-	// Clear waiting state
-	if err := a.storage.ClearChannelWaitingState(a.ctx, sub.InstanceID, sub.Channel); err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+func (a *App) fireReceiveTimeout(ev *storage.HistoryEvent, channel, lockID string) (err error) {
+	txCtx, err := a.storage.BeginTransaction(a.ctx)
+	if err != nil {
 		return err
 	}
-
-	// Update workflow status to running (so it will be resumed)
-	err = a.storage.UpdateInstanceStatusIfLocked(
-		a.ctx,
-		sub.InstanceID,
-		storage.StatusRunning,
-		"",
-		lockID,
-	)
-
-	_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
-
-	return err
+	defer func() {
+		if err != nil {
+			_ = a.storage.RollbackTransaction(txCtx)
+		}
+	}()
+	if err := a.storage.AppendHistoryIfLocked(txCtx, ev, lockID); err != nil {
+		return fmt.Errorf("failed to record timeout error: %w", err)
+	}
+	if err := a.storage.ClearChannelWaitingState(txCtx, ev.InstanceID, channel); err != nil {
+		return err
+	}
+	if err := a.storage.UpdateInstanceStatusIfLocked(txCtx, ev.InstanceID, storage.StatusRunning, "", lockID); err != nil {
+		return err
+	}
+	return a.storage.CommitTransaction(txCtx)
 }
 
 // ========================================
@@ -1891,12 +2052,12 @@ func (a *App) resumeResumableWorkflows() (int, error) {
 	// batch: concurrent workers take disjoint sets instead of all racing to
 	// claim the same head rows. Kinds this worker does not run are left for
 	// the workers that run them.
-	names := a.registeredWorkflowNames()
-	if len(names) == 0 {
+	versions := a.registeredWorkflowVersions()
+	if len(versions) == 0 {
 		return 0, nil
 	}
 	claimEpoch := storage.NewLockIdentity(a.config.workerID)
-	workflows, err := a.storage.ClaimResumableWorkflows(a.ctx, claimEpoch, names, replay.LockLeaseSeconds, a.config.maxWorkflowsPerBatch)
+	workflows, err := a.storage.ClaimResumableWorkflows(a.ctx, claimEpoch, versions, replay.LockLeaseSeconds, a.config.maxWorkflowsPerBatch)
 	if err != nil {
 		return 0, fmt.Errorf("failed to claim resumable workflows: %w", err)
 	}
@@ -1906,15 +2067,13 @@ func (a *App) resumeResumableWorkflows() (int, error) {
 	}
 
 	var wg sync.WaitGroup
-	for _, wf := range workflows {
-		// Check context before acquiring semaphore
-		if a.ctx.Err() != nil {
-			break
-		}
-
-		// Acquire semaphore (blocks if at capacity)
-		if err := a.resumptionSem.Acquire(a.ctx, 1); err != nil {
-			// Context cancelled
+	for i, wf := range workflows {
+		// Check context before acquiring semaphore; on shutdown the claims not
+		// started are handed back instead of waiting out their lease.
+		if a.ctx.Err() != nil || a.resumptionSem.Acquire(a.ctx, 1) != nil {
+			for _, rest := range workflows[i:] {
+				_ = a.storage.ReleaseLock(context.WithoutCancel(a.ctx), rest.InstanceID, claimEpoch)
+			}
 			break
 		}
 
@@ -1923,11 +2082,12 @@ func (a *App) resumeResumableWorkflows() (int, error) {
 			defer wg.Done()
 			defer a.resumptionSem.Release(1)
 
-			// The claim is already ours; a source-hash mismatch means this
-			// instance belongs to another code version, so free the lease and
-			// let a worker with its version take it.
-			if err := a.resumeWorkflowWithLockID(a.ctx, wf.InstanceID, claimEpoch); errors.Is(err, ErrSourceHashMismatch) {
-				_ = a.storage.ReleaseLock(a.ctx, wf.InstanceID, claimEpoch)
+			// The claim is already ours. When this worker cannot run the
+			// instance (another code version, say), resumeWorkflowWithLockID
+			// frees the lease for a worker that can.
+			if err := a.resumeWorkflowWithLockID(a.ctx, wf.InstanceID, claimEpoch); err != nil &&
+				!errors.Is(err, ErrSourceHashMismatch) {
+				slog.Debug("resume failed", "instance_id", wf.InstanceID, "error", err)
 			}
 		}(wf)
 	}
@@ -1971,4 +2131,15 @@ func (a *App) cleanupChannelMessages() error {
 	}
 
 	return nil
+}
+
+// workflowSourceHash answers the source hash this app registered for a
+// workflow ("" when none). Nil-safe for contexts without an app.
+func (a *App) workflowSourceHash(name string) string {
+	if a == nil {
+		return ""
+	}
+	a.workflowRunnersMu.RLock()
+	defer a.workflowRunnersMu.RUnlock()
+	return a.workflowHashes[name]
 }

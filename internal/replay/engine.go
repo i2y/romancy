@@ -77,6 +77,90 @@ type ExecutionContext struct {
 	// Replay statistics
 	cacheHits     int
 	newActivities int
+
+	// abortErr is set when the run stops without an outcome (a storage
+	// failure, a lost lock, shutdown): every later step of the run fails
+	// with it, and the engine ends the run leaving the instance as it was,
+	// so a later run executes the step again.
+	abortMu  sync.Mutex
+	abortErr error
+}
+
+// ErrRunAborted marks a run that stopped without an outcome. The instance is
+// left as it was (running, its lock released) and a later run replays it.
+var ErrRunAborted = errors.New("run aborted")
+
+// AbortError is the error every step of an aborted run returns. It matches
+// ErrRunAborted and the cause with errors.Is.
+type AbortError struct {
+	Cause error
+}
+
+func (e *AbortError) Error() string { return "run aborted: " + e.Cause.Error() }
+
+// Unwrap exposes both ErrRunAborted and the cause.
+func (e *AbortError) Unwrap() []error { return []error{ErrRunAborted, e.Cause} }
+
+// Abort ends the run without an outcome. The first cause is kept; the error
+// returned is the one every later step of the run gets.
+func (ec *ExecutionContext) Abort(cause error) error {
+	ec.abortMu.Lock()
+	defer ec.abortMu.Unlock()
+	if ec.abortErr == nil {
+		var already *AbortError
+		if errors.As(cause, &already) {
+			ec.abortErr = already
+		} else {
+			ec.abortErr = &AbortError{Cause: cause}
+		}
+	}
+	return ec.abortErr
+}
+
+// Aborted returns the abort error of the run, or nil while it may go on.
+func (ec *ExecutionContext) Aborted() error {
+	ec.abortMu.Lock()
+	defer ec.abortMu.Unlock()
+	return ec.abortErr
+}
+
+// RecordedFailure is an activity failure as history stores it. The engine
+// hands it back on replay; the romancy package turns it into the error
+// types it describes. History written before this format holds the message
+// only (a JSON string), which reads back as a RecordedFailure with just
+// Message set.
+type RecordedFailure struct {
+	ActivityName string `json:"activity_name,omitempty"`
+	ErrorType    string `json:"error_type,omitempty"`
+	Message      string `json:"error_message"`
+	// Code names a kernel sentinel the error matched (see romancy's step
+	// error codes).
+	Code string `json:"code,omitempty"`
+	// Terminal and Inner describe a TerminalError (Inner is its cause).
+	Terminal bool   `json:"terminal,omitempty"`
+	Inner    string `json:"inner,omitempty"`
+	// Attempts and Inner describe a RetryExhaustedError.
+	Attempts int `json:"attempts,omitempty"`
+}
+
+func (f *RecordedFailure) Error() string { return f.Message }
+
+// FailureRecorder is implemented by errors that choose how they are written
+// to history as an activity failure.
+type FailureRecorder interface {
+	FailureRecord() *RecordedFailure
+}
+
+func decodeRecordedFailure(data []byte) *RecordedFailure {
+	var msg string
+	if err := json.Unmarshal(data, &msg); err == nil {
+		return &RecordedFailure{Message: msg}
+	}
+	var f RecordedFailure
+	if err := json.Unmarshal(data, &f); err == nil {
+		return &f
+	}
+	return &RecordedFailure{Message: string(data)}
 }
 
 // Context returns the underlying context.Context.
@@ -169,6 +253,12 @@ func (ec *ExecutionContext) RecordActivityResultWithContext(ctx context.Context,
 	return ec.engine.RecordActivityResult(ctx, ec.instanceID, ec.lockID, activityID, result, activityErr)
 }
 
+// LockID returns the lock identity this run holds; every fenced write of the
+// run passes it.
+func (ec *ExecutionContext) LockID() string {
+	return ec.lockID
+}
+
 // Storage returns the storage interface for advanced use cases.
 func (ec *ExecutionContext) Storage() storage.Storage {
 	return ec.engine.storage
@@ -201,8 +291,12 @@ func (e *Engine) StartWorkflow(
 	}
 	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
 
-	// Update status to running
+	// Update status to running. A terminated instance (cancelled while it
+	// waited) is not run again.
 	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusRunning, "", lockID); err != nil {
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return nil
+		}
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -239,8 +333,12 @@ func (e *Engine) ResumeWorkflowWithLockID(
 	}
 	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
 
-	// Update status to running
+	// Update status to running. A terminated instance (cancelled while it
+	// waited) is not run again.
 	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusRunning, "", lockID); err != nil {
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return nil
+		}
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -283,11 +381,7 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 			}
 		case storage.HistoryActivityFailed, storage.HistoryMessageTimeout:
 			// Both activity failures and message timeouts are cached as errors
-			errMsg := ""
-			if len(event.EventData) > 0 {
-				_ = json.Unmarshal(event.EventData, &errMsg)
-			}
-			cachedErrors[event.ActivityID] = fmt.Errorf("%s", errMsg)
+			cachedErrors[event.ActivityID] = decodeRecordedFailure(event.EventData)
 		}
 	}
 	if err := iter.Err(); err != nil {
@@ -365,6 +459,18 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID string, runner 
 	// belongs to the run the new owner is making, or will make.
 	if lockLost.Load() {
 		return storage.ErrLockNotHeld
+	}
+
+	// A run that stopped without an outcome (a step hit a storage error or
+	// the lost lock, or the worker is shutting down) leaves the instance as
+	// it was: no compensation, no failure, no completion. This holds even
+	// when workflow code swallowed the step's error and returned something
+	// else. The lock is released by the caller and a later run replays it.
+	if abortErr := execCtx.Aborted(); abortErr != nil {
+		return abortErr
+	}
+	if err != nil && (errors.Is(err, ErrRunAborted) || errors.Is(err, storage.ErrLockNotHeld) || ctx.Err() != nil) {
+		return execCtx.Abort(err)
 	}
 
 	if err != nil {
@@ -455,23 +561,55 @@ func (e *Engine) handleSuspendSignal(ctx context.Context, instanceID string, sig
 
 // handleTimerSuspend handles the timer suspension case.
 func (e *Engine) handleTimerSuspend(ctx context.Context, instanceID string, sig *SuspendSignal, lockID string) error {
-	// Register timer subscription
-	timer := &storage.TimerSubscription{
-		InstanceID: instanceID,
-		TimerID:    sig.TimerID,
-		ExpiresAt:  sig.ExpiresAt,
-		ActivityID: sig.ActivityID,
-	}
+	// The timer and the waiting status commit together, after a lock proof:
+	// a run that lost its lock leaves no timer behind to fire into the new
+	// owner's run, and an instance cancelled during this run gets none.
+	return e.fenced(ctx, instanceID, lockID, "timer suspend", func(txCtx context.Context) error {
+		timer := &storage.TimerSubscription{
+			InstanceID: instanceID,
+			TimerID:    sig.TimerID,
+			ExpiresAt:  sig.ExpiresAt,
+			ActivityID: sig.ActivityID,
+		}
+		if err := e.storage.RegisterTimerSubscription(txCtx, timer); err != nil {
+			return fmt.Errorf("failed to register timer subscription: %w", err)
+		}
+		if err := e.storage.UpdateInstanceStatusIfLocked(txCtx, instanceID, storage.StatusWaitingForTimer, "", lockID); err != nil {
+			return fmt.Errorf("failed to update status: %w", err)
+		}
+		return nil
+	})
+}
 
-	if err := e.storage.RegisterTimerSubscription(ctx, timer); err != nil {
-		return fmt.Errorf("failed to register timer subscription: %w", err)
+// fenced runs fn in one transaction that first proves this run still holds
+// the instance lock (which also row-locks the instance first on PostgreSQL
+// and MySQL, as a cancel does). A run that lost its lock changes nothing;
+// when the instance was cancelled during the run (fn hit
+// ErrInstanceTerminated), nothing of fn is kept and the run ends quietly.
+func (e *Engine) fenced(ctx context.Context, instanceID, lockID, what string, fn func(context.Context) error) error {
+	run := func(txCtx context.Context) error {
+		if err := e.storage.RefreshLock(txCtx, instanceID, lockID, LockLeaseSeconds); err != nil {
+			return fmt.Errorf("failed to prove lock for %s: %w", what, err)
+		}
+		return fn(txCtx)
 	}
-
-	// Update status to waiting
-	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusWaitingForTimer, "", lockID); err != nil {
-		return fmt.Errorf("failed to update status: %w", err)
+	if e.storage.InTransaction(ctx) {
+		return run(ctx)
 	}
-
+	txCtx, err := e.storage.BeginTransaction(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin %s: %w", what, err)
+	}
+	if err := run(txCtx); err != nil {
+		_ = e.storage.RollbackTransaction(txCtx)
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return nil
+		}
+		return err
+	}
+	if err := e.storage.CommitTransaction(txCtx); err != nil {
+		return fmt.Errorf("failed to commit %s: %w", what, err)
+	}
 	return nil
 }
 
@@ -480,13 +618,16 @@ func (e *Engine) handleChannelMessageSuspend(ctx context.Context, instanceID str
 	// Register channel receive and set waiting=TRUE
 	var timeoutAt *time.Time
 	if sig.Timeout != nil {
-		t := time.Now().Add(*sig.Timeout)
+		t := time.Now().UTC().Add(*sig.Timeout)
 		timeoutAt = &t
 	}
 	// registered=false means a message was already pending at registration
 	// time: the instance is left 'running' and unlocked so a resumption
 	// replays it and Receive drains the pending message.
 	if _, err := e.storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, sig.Channel, lockID, sig.ActivityID, timeoutAt); err != nil {
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return nil // cancelled during this run: no wait is registered
+		}
 		return fmt.Errorf("failed to register channel receive: %w", err)
 	}
 
@@ -494,7 +635,23 @@ func (e *Engine) handleChannelMessageSuspend(ctx context.Context, instanceID str
 }
 
 // handleRecurSuspend handles the Recur case (Erlang-style tail recursion).
+// The archive, the cleanups and the restart record commit together, in a
+// transaction that first proves the run still holds the lock: a run that
+// lost its lease leaves the new owner's history, subscriptions and groups
+// alone, and a failure part-way leaves the iteration as it was instead of
+// an instance with no history that would re-run with its old input.
 func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig *SuspendSignal, lockID string) error {
+	inputData, err := json.Marshal(sig.NewInput)
+	if err != nil {
+		return fmt.Errorf("failed to serialize recur input: %w", err)
+	}
+	// A run cancelled during this iteration does not continue.
+	return e.fenced(ctx, instanceID, lockID, "recur", func(txCtx context.Context) error {
+		return e.recur(txCtx, instanceID, inputData, lockID)
+	})
+}
+
+func (e *Engine) recur(ctx context.Context, instanceID string, inputData []byte, lockID string) error {
 	// 1. Archive current history
 	if err := e.storage.ArchiveHistory(ctx, instanceID); err != nil {
 		return fmt.Errorf("failed to archive history: %w", err)
@@ -510,13 +667,13 @@ func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig 
 		return fmt.Errorf("failed to leave groups: %w", err)
 	}
 
-	// 4. Serialize new input
-	inputData, err := json.Marshal(sig.NewInput)
-	if err != nil {
-		return fmt.Errorf("failed to serialize recur input: %w", err)
+	// 3b. Drop the iteration's compensations: the iteration finished, and a
+	// failure in a later one must not undo it (as edda and shikibu do)
+	if err := e.storage.ClearCompensations(ctx, instanceID); err != nil {
+		return fmt.Errorf("failed to clear compensations: %w", err)
 	}
 
-	// 5. Record the recur event in history (for the new iteration)
+	// 4. Record the recur event in history (for the new iteration)
 	recurEvent := &storage.HistoryEvent{
 		InstanceID: instanceID,
 		ActivityID: "recur",
@@ -528,7 +685,7 @@ func (e *Engine) handleRecurSuspend(ctx context.Context, instanceID string, sig 
 		return fmt.Errorf("failed to record recur event: %w", err)
 	}
 
-	// 5b. Replace the instance input: the next iteration resumes the same
+	// 5. Replace the instance input: the next iteration resumes the same
 	// instance, and the runner reads instance.InputData — without this the
 	// iteration would re-run with the ORIGINAL input, dropping the state
 	// Recur exists to carry.
@@ -561,7 +718,15 @@ func (e *Engine) RecordActivityResult(
 
 	if activityErr != nil {
 		event.EventType = storage.HistoryActivityFailed
-		errData, _ := json.Marshal(activityErr.Error())
+		failure := &RecordedFailure{Message: activityErr.Error()}
+		var recorder FailureRecorder
+		if errors.As(activityErr, &recorder) {
+			failure = recorder.FailureRecord()
+		}
+		errData, err := json.Marshal(failure)
+		if err != nil {
+			return fmt.Errorf("failed to serialize failure: %w", err)
+		}
 		event.EventData = errData
 	} else {
 		event.EventType = storage.HistoryActivityCompleted
@@ -576,8 +741,9 @@ func (e *Engine) RecordActivityResult(
 }
 
 // CompensationRunner is a function that executes a compensation.
-// It receives the function name and JSON-encoded argument.
-type CompensationRunner func(ctx context.Context, funcName string, arg []byte) error
+// It receives the compensated instance, the function name and the
+// JSON-encoded argument.
+type CompensationRunner func(ctx context.Context, instanceID, funcName string, arg []byte) error
 
 // SetCompensationRunner sets the compensation runner for the engine.
 func (e *Engine) SetCompensationRunner(runner CompensationRunner) {
@@ -614,7 +780,7 @@ func (e *Engine) executeCompensations(ctx context.Context, instanceID, lockID st
 			continue
 		}
 
-		execErr := e.compensationRunner(ctx, entry.ActivityName, entry.Args)
+		execErr := e.compensationRunner(ctx, instanceID, entry.ActivityName, entry.Args)
 		if execErr != nil {
 			// Record failure in history
 			_ = e.recordCompensationResult(ctx, instanceID, lockID, entry, false, execErr.Error())

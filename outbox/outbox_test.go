@@ -183,7 +183,7 @@ func (m *mockStorage) RefreshLock(ctx context.Context, instanceID, workerID stri
 func (m *mockStorage) CleanupStaleLocks(ctx context.Context, timeoutSec int) ([]storage.StaleWorkflowInfo, error) {
 	return nil, nil
 }
-func (m *mockStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*storage.ResumableWorkflow, error) {
+func (m *mockStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, versions []storage.WorkflowVersion, leaseSec, limit int) ([]*storage.ResumableWorkflow, error) {
 	return nil, nil
 }
 
@@ -217,6 +217,12 @@ func (m *mockStorage) AddCompensation(ctx context.Context, entry *storage.Compen
 	return nil
 }
 func (m *mockStorage) GetCompensations(ctx context.Context, instanceID string) ([]*storage.CompensationEntry, error) {
+	return nil, nil
+}
+func (m *mockStorage) ClearCompensations(ctx context.Context, instanceID string) error {
+	return nil
+}
+func (m *mockStorage) ChannelMessagesAfter(ctx context.Context, channel string, afterID int64) ([]*storage.ChannelMessage, error) {
 	return nil, nil
 }
 
@@ -292,6 +298,12 @@ func (m *mockStorage) RegisterActorName(ctx context.Context, name, instanceID, f
 	return nil
 }
 
+func (m *mockStorage) UnregisterOwnActorName(ctx context.Context, name, owner string) error {
+	return nil
+}
+func (m *mockStorage) RevokeOwnCapability(ctx context.Context, capabilityID, owner string) error {
+	return nil
+}
 func (m *mockStorage) UnregisterActorName(ctx context.Context, name string) error {
 	return nil
 }

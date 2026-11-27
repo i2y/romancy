@@ -3,11 +3,17 @@ package romancy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/i2y/romancy/hooks"
 	"github.com/i2y/romancy/internal/replay"
 	"github.com/i2y/romancy/internal/storage"
+	"github.com/i2y/romancy/retry"
 )
 
 func TestActivityTransactionDefault(t *testing.T) {
@@ -196,24 +202,27 @@ func TestActivityTransactionRollbackOnError(t *testing.T) {
 		t.Fatal("Expected workflow to fail")
 	}
 
-	// Verify no activity-related history was recorded (transaction was rolled back)
-	// WorkflowFailed event is recorded outside the transaction, so it's expected
+	// The failed attempts were rolled back, so nothing of them is in
+	// history; the activity's failure is recorded on its own after the
+	// rollback (SEMANTICS §2), so a replay returns it instead of running the
+	// body again.
 	history, _, err := store.GetHistoryPaginated(context.Background(), "test-instance-rollback-1", 0, 100)
 	if err != nil {
 		t.Fatalf("Failed to get history: %v", err)
 	}
 
-	// Count activity-related events (ActivityCompleted, ActivityFailed)
-	activityEvents := 0
+	completed, failed := 0, 0
 	for _, h := range history {
-		if h.EventType == storage.HistoryActivityCompleted ||
-			h.EventType == storage.HistoryActivityFailed {
-			activityEvents++
+		switch h.EventType {
+		case storage.HistoryActivityCompleted:
+			completed++
+		case storage.HistoryActivityFailed:
+			failed++
 		}
 	}
 
-	if activityEvents != 0 {
-		t.Errorf("Expected no activity history events after rollback, got %d", activityEvents)
+	if completed != 0 || failed != 1 {
+		t.Errorf("Expected exactly one ActivityFailed and no ActivityCompleted, got %d failed, %d completed", failed, completed)
 	}
 }
 
@@ -354,5 +363,156 @@ func TestWorkflowContextSession(t *testing.T) {
 
 	if !customQueryWorked {
 		t.Error("Expected custom query to work with session")
+	}
+}
+
+// On SQLite (WAL), a transaction whose first statement is a read cannot
+// write once another connection has committed after that read. An activity
+// in that position is rolled back and run again in a new transaction
+// instead of failing the workflow, whether the failed write is the result
+// record or a write in the body.
+func TestActivityRunsAgainAfterSQLiteWriteConflict(t *testing.T) {
+	for _, writeInBody := range []bool{false, true} {
+		t.Run(fmt.Sprintf("writeInBody=%v", writeInBody), func(t *testing.T) {
+			app, cleanup := replayTestApp(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			var runs atomic.Int32
+			act := DefineActivity(fmt.Sprintf("write_conflict_%v", writeInBody),
+				func(actx context.Context, _ struct{}) (int32, error) {
+					wctx := GetWorkflowContext(actx)
+					path := "/actor/" + wctx.InstanceID() + "/state"
+					// The transaction's first statement is this read.
+					if _, _, err := FSRead(wctx, path); err != nil {
+						return 0, err
+					}
+					n := runs.Add(1)
+					if n == 1 {
+						// Another connection commits after the read.
+						if err := app.Storage().FSPut(ctx, "/shared/bump", []byte("x"), "test", 0); err != nil {
+							return 0, err
+						}
+					}
+					if writeInBody {
+						if err := FSWrite(wctx, path, []byte("v"), 0, ""); err != nil {
+							return 0, err
+						}
+					}
+					return n, nil
+				})
+			wf := DefineWorkflow(fmt.Sprintf("write_conflict_wf_%v", writeInBody),
+				func(wctx *WorkflowContext, _ struct{}) (int32, error) {
+					return act.Execute(wctx, struct{}{})
+				})
+			RegisterWorkflow(app, wf)
+
+			id, err := StartWorkflow(ctx, app, wf, struct{}{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inst := waitForTerminalInstance(t, app, id); inst.Status != storage.StatusCompleted {
+				t.Fatalf("instance = %s", inst.Status)
+			}
+			result, err := GetWorkflowResult[int32](ctx, app, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Output != 2 || runs.Load() != 2 {
+				t.Fatalf("output %d after %d runs; want the second run's result", result.Output, runs.Load())
+			}
+			if writeInBody {
+				if obj, err := app.Storage().FSGet(ctx, "/actor/"+id+"/state"); err != nil || obj == nil {
+					t.Fatalf("body write not committed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// runRetryScenario runs, through the replay engine on s, an activity whose
+// first attempt inserts a row and then fails on a SQL error (which, on
+// PostgreSQL, also aborts the transaction), and whose second attempt inserts
+// a row and succeeds. It returns the attempts whose rows were committed and
+// the number of attempts made.
+func runRetryScenario(t *testing.T, s storage.Storage, name string) ([]int, int32) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx, "CREATE TABLE retry_rows (attempt INTEGER)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	instanceID := "retry-tx-" + name
+	now := time.Now().UTC()
+	if err := s.CreateInstance(ctx, &storage.WorkflowInstance{
+		InstanceID:   instanceID,
+		WorkflowName: "retry_tx",
+		Status:       storage.StatusRunning,
+		InputData:    []byte(`{}`),
+		StartedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("create instance: %v", err)
+	}
+
+	var attempts atomic.Int32
+	act := DefineActivity("retry_tx_step_"+name,
+		func(actx context.Context, _ struct{}) (int32, error) {
+			db := GetWorkflowContext(actx).Session()
+			n := attempts.Add(1)
+			if _, err := db.ExecContext(actx, fmt.Sprintf("INSERT INTO retry_rows (attempt) VALUES (%d)", n)); err != nil {
+				return 0, err
+			}
+			if n == 1 {
+				if _, err := db.ExecContext(actx, "SELECT * FROM retry_no_such_table"); err != nil {
+					return 0, err
+				}
+				return 0, errors.New("the statement was expected to fail")
+			}
+			return n, nil
+		},
+		WithRetryPolicy[struct{}, int32](retry.Fixed(3, time.Millisecond)),
+	)
+
+	engine := replay.NewEngine(s, &hooks.NoOpHooks{}, "worker-1")
+	if err := engine.StartWorkflow(ctx, instanceID, "retry_tx", nil, func(execCtx *replay.ExecutionContext) (any, error) {
+		return act.Execute(NewWorkflowContextFromExecution(execCtx), struct{}{})
+	}); err != nil {
+		t.Fatalf("workflow failed after %d attempts: %v", attempts.Load(), err)
+	}
+
+	rows, err := s.DB().QueryContext(ctx, "SELECT attempt FROM retry_rows ORDER BY attempt")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var committed []int
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		committed = append(committed, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return committed, attempts.Load()
+}
+
+// Each attempt runs in its own transaction: a retry starts from a clean
+// state, and only the successful attempt's writes are committed.
+func TestActivityRetryRunsInNewTransaction(t *testing.T) {
+	store, err := storage.NewSQLiteStorage(filepath.Join(t.TempDir(), "retry.db"))
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	if err := storage.InitializeTestSchema(context.Background(), store); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+
+	committed, attempts := runRetryScenario(t, store, "sqlite")
+	if attempts != 2 || !reflect.DeepEqual(committed, []int{2}) {
+		t.Fatalf("committed rows %v after %d attempts; want [2] after 2", committed, attempts)
 	}
 }

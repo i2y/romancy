@@ -459,7 +459,7 @@ func TestEngine_SetCompensationRunner(t *testing.T) {
 
 	assert.Nil(t, engine.compensationRunner)
 
-	runner := func(ctx context.Context, funcName string, arg []byte) error {
+	runner := func(ctx context.Context, instanceID, funcName string, arg []byte) error {
 		return nil
 	}
 
@@ -568,6 +568,55 @@ func TestEngine_StartWorkflow_RecurSuspend(t *testing.T) {
 	gotInstance, err := store.GetInstance(context.Background(), instance.InstanceID)
 	require.NoError(t, err)
 	assert.Equal(t, storage.StatusRecurred, gotInstance.Status)
+}
+
+// A run that lost its lease and then recurs changes nothing: the instance
+// now belongs to its new owner, whose history, subscriptions and input must
+// survive the stale run's archive and cleanup.
+func TestEngine_RecurAfterLostLeaseChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStorage(t)
+	engine := NewEngine(store, &hooks.NoOpHooks{}, "worker-1")
+
+	instance := &storage.WorkflowInstance{
+		InstanceID:   "inst-recur-stale",
+		WorkflowName: "test_workflow",
+		Status:       storage.StatusRunning,
+		InputData:    []byte(`{"count":1}`),
+	}
+	require.NoError(t, store.CreateInstance(ctx, instance))
+
+	const newOwner = "worker-2#1"
+	runner := func(execCtx *ExecutionContext) (any, error) {
+		id := execCtx.InstanceID()
+		require.NoError(t, engine.RecordActivityResult(ctx, id, execCtx.LockID(), "step:1", "ok", nil))
+		require.NoError(t, store.SubscribeToChannel(ctx, id, "inbox", storage.ChannelModeBroadcast))
+		require.NoError(t, store.ReleaseLock(ctx, id, execCtx.LockID()))
+		acquired, err := store.TryAcquireLock(ctx, id, newOwner, LockLeaseSeconds)
+		require.NoError(t, err)
+		require.True(t, acquired)
+		return nil, NewRecurSuspend(id, map[string]int{"count": 2})
+	}
+
+	err := engine.StartWorkflow(ctx, instance.InstanceID, "test_workflow", nil, runner)
+	require.ErrorIs(t, err, storage.ErrLockNotHeld)
+
+	history, _, err := store.GetHistoryPaginated(ctx, instance.InstanceID, 0, 10)
+	require.NoError(t, err)
+	if assert.Len(t, history, 1, "the new owner's history was archived") {
+		assert.Equal(t, "step:1", history[0].ActivityID)
+	}
+	archived, err := store.GetArchivedHistory(ctx, instance.InstanceID)
+	require.NoError(t, err)
+	assert.Empty(t, archived)
+	sub, err := store.GetChannelSubscription(ctx, instance.InstanceID, "inbox")
+	require.NoError(t, err)
+	assert.NotNil(t, sub, "the new owner's subscription was removed")
+	got, err := store.GetInstance(ctx, instance.InstanceID)
+	require.NoError(t, err)
+	assert.Equal(t, storage.StatusRunning, got.Status)
+	assert.JSONEq(t, `{"count":1}`, string(got.InputData))
+	assert.Equal(t, newOwner, got.LockedBy)
 }
 
 func TestEngine_RecordActivityResult(t *testing.T) {
@@ -687,7 +736,7 @@ func TestEngine_executeCompensations(t *testing.T) {
 			}
 
 			var executedCount int
-			engine.SetCompensationRunner(func(ctx context.Context, funcName string, arg []byte) error {
+			engine.SetCompensationRunner(func(ctx context.Context, instanceID, funcName string, arg []byte) error {
 				executedCount++
 				return tt.runnerError
 			})

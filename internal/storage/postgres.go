@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/i2y/romancy/internal/notify"
 )
@@ -28,10 +30,20 @@ type PostgresStorage struct {
 // The connStr should be a PostgreSQL connection string:
 // "postgres://user:password@localhost:5432/dbname?sslmode=disable"
 func NewPostgresStorage(connStr string) (*PostgresStorage, error) {
-	db, err := sql.Open("pgx", connStr)
+	config, err := pgx.ParseConfig(connStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to parse connection string: %w", err)
 	}
+	// The schema's timestamps are TIMESTAMP (without time zone): NOW() is
+	// converted to the session time zone, and pgx stores a time.Time's wall
+	// clock as is. Both sides agree only on UTC — writes from Go are UTC —
+	// so the session is pinned to it unless the connection string says
+	// otherwise. On a server whose default zone is not UTC, deadlines and
+	// lease expiries would otherwise be off by the zone offset.
+	if _, set := config.RuntimeParams["timezone"]; !set {
+		config.RuntimeParams["timezone"] = "UTC"
+	}
+	db := stdlib.OpenDB(*config)
 
 	// Configure connection pool
 	db.SetMaxOpenConns(25)
@@ -184,10 +196,13 @@ func (s *PostgresStorage) CreateInstance(ctx context.Context, instance *Workflow
 	}
 	instance.Sandboxed = sandboxed
 
-	_, err = conn.ExecContext(ctx, `
+	// ON CONFLICT keeps a duplicate id from raising: inside a transaction
+	// (the supervisor's sync activity) an error would abort it (25P02).
+	res, err := conn.ExecContext(ctx, `
 		INSERT INTO workflow_instances (
 			instance_id, workflow_name, status, input_data, source_hash, owner_service, framework, sandboxed, started_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (instance_id) DO NOTHING
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
 		string(instance.InputData), instance.SourceHash, instance.OwnerService,
 		framework, sandboxedInt(sandboxed), instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
@@ -196,8 +211,14 @@ func (s *PostgresStorage) CreateInstance(ctx context.Context, instance *Workflow
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return fmt.Errorf("%w: %w", ErrInstanceAlreadyExists, err)
 		}
+		return err
 	}
-	return err
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("%w: %s", ErrInstanceAlreadyExists, instance.InstanceID)
+	}
+	return nil
 }
 
 // GetInstance retrieves a workflow instance by ID.
@@ -287,6 +308,7 @@ func (s *PostgresStorage) UpdateInstanceStatusIfLocked(ctx context.Context, inst
 		UPDATE workflow_instances
 		SET status = $1, updated_at = NOW()
 		WHERE instance_id = $2 AND locked_by = $3
+		AND (status = $1 OR status NOT IN `+terminalStatusList+`)
 	`, status, instanceID, workerID)
 	if err != nil {
 		return err
@@ -296,7 +318,31 @@ func (s *PostgresStorage) UpdateInstanceStatusIfLocked(ctx context.Context, inst
 		return err
 	}
 	if affected == 0 {
-		return s.lockLost(ctx, instanceID, workerID)
+		return s.statusWriteRefused(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
+// statusWriteRefused explains a fenced status write that matched no row:
+// ErrLockNotHeld when the caller lost the lock, ErrInstanceTerminated when
+// the instance already terminated, nil when the write was a no-op.
+func (s *PostgresStorage) statusWriteRefused(ctx context.Context, instanceID, workerID string) error {
+	var lockedBy sql.NullString
+	var status WorkflowStatus
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT locked_by, status FROM workflow_instances WHERE instance_id = $1
+	`, instanceID).Scan(&lockedBy, &status)
+	if err == sql.ErrNoRows {
+		return ErrLockNotHeld
+	}
+	if err != nil {
+		return err
+	}
+	if lockedBy.String != workerID {
+		return ErrLockNotHeld
+	}
+	if IsTerminalStatus(status) {
+		return ErrInstanceTerminated
 	}
 	return nil
 }
@@ -383,6 +429,17 @@ func (s *PostgresStorage) CancelInstance(ctx context.Context, instanceID, reason
 	}
 	if rows == 0 {
 		return ErrWorkflowNotCancellable
+	}
+	// A cancelled instance never waits again: drop its timers and channel
+	// waits so nothing fires for it later.
+	if _, err := conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = $1`, instanceID); err != nil {
+		return fmt.Errorf("failed to delete timer subscriptions: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `
+		UPDATE channel_subscriptions SET activity_id = NULL, timeout_at = NULL
+		WHERE instance_id = $1
+	`, instanceID); err != nil {
+		return fmt.Errorf("failed to clear channel waits: %w", err)
 	}
 	return nil
 }
@@ -554,34 +611,37 @@ func (s *PostgresStorage) FindResumableWorkflows(ctx context.Context, workflowNa
 // the lease in one statement. The inner SELECT FOR UPDATE SKIP LOCKED makes
 // concurrent workers take disjoint sets: rows another transaction is claiming
 // are skipped instead of raced for.
-func (s *PostgresStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*ResumableWorkflow, error) {
+func (s *PostgresStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, versions []WorkflowVersion, leaseSec, limit int) ([]*ResumableWorkflow, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	if len(workflowNames) == 0 {
+	if len(versions) == 0 {
 		return nil, nil
 	}
 	conn := s.getConn(ctx)
 	now := time.Now().UTC()
 	expiresAt := now.Add(time.Duration(leaseSec) * time.Second)
 
-	rows, err := conn.QueryContext(ctx, `
+	n := 5
+	filter, filterArgs := versionFilter(versions, func() string { n++; return fmt.Sprintf("$%d", n) })
+	args := append([]any{StatusRunning, now, limit, workerID, expiresAt}, filterArgs...)
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
 		WITH c AS (
 			SELECT instance_id FROM workflow_instances
 			WHERE status = $1
 			AND framework = 'go'
-			AND workflow_name = ANY($2)
-			AND (locked_by IS NULL OR locked_by = '' OR lock_expires_at < $3)
+			AND %s
+			AND (locked_by IS NULL OR locked_by = '' OR lock_expires_at < $2)
 			ORDER BY updated_at ASC
-			LIMIT $4
+			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE workflow_instances w
-		SET locked_by = $5, locked_at = $3, lock_expires_at = $6, updated_at = $3
+		SET locked_by = $4, locked_at = $2, lock_expires_at = $5, updated_at = $2
 		FROM c
 		WHERE w.instance_id = c.instance_id
 		RETURNING w.instance_id, w.workflow_name
-	`, StatusRunning, workflowNames, now, limit, workerID, expiresAt)
+	`, filter), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -751,6 +811,13 @@ func (s *PostgresStorage) AppendHistory(ctx context.Context, event *HistoryEvent
 // AppendHistoryIfLocked appends the event only while workerID holds the
 // instance's lock; it answers ErrLockNotHeld otherwise. A duplicate event is
 // a no-op, as for AppendHistory.
+// The lock check locks the instance row as an update of it would
+// (FOR NO KEY UPDATE), so the append is atomic with a lease steal: a steal waits
+// for the append to commit, and an append that waited for a steal re-checks
+// the new holder and is refused. A plain check reads a snapshot, and a stale
+// run's record could land after the new holder loaded its history. (A share
+// lock would deadlock a transaction that goes on to update the instance row,
+// such as a timer firing, against a writer already waiting for it.)
 func (s *PostgresStorage) AppendHistoryIfLocked(ctx context.Context, event *HistoryEvent, workerID string) error {
 	conn := s.getConn(ctx)
 	result, err := conn.ExecContext(ctx, `
@@ -759,6 +826,7 @@ func (s *PostgresStorage) AppendHistoryIfLocked(ctx context.Context, event *Hist
 		WHERE EXISTS (
 			SELECT 1 FROM workflow_instances
 			WHERE instance_id = $1 AND locked_by = $7
+			FOR NO KEY UPDATE
 		)
 		ON CONFLICT (instance_id, activity_id) DO NOTHING
 	`, event.InstanceID, event.ActivityID, event.EventType, string(event.EventData), event.EventDataBinary, event.DataType, workerID)
@@ -1067,6 +1135,13 @@ func (s *PostgresStorage) AddCompensation(ctx context.Context, entry *Compensati
 	return err
 }
 
+// ClearCompensations removes every compensation registered for the instance.
+func (s *PostgresStorage) ClearCompensations(ctx context.Context, instanceID string) error {
+	conn := s.getConn(ctx)
+	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_compensations WHERE instance_id = $1`, instanceID)
+	return err
+}
+
 // GetCompensations retrieves compensations for a workflow in LIFO order.
 func (s *PostgresStorage) GetCompensations(ctx context.Context, instanceID string) ([]*CompensationEntry, error) {
 	conn := s.getConn(ctx)
@@ -1247,12 +1322,15 @@ func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Conte
 		return false, err
 	}
 	if pending {
-		_, err = conn.ExecContext(ctx, `
+		res, err := conn.ExecContext(ctx, `
 			UPDATE workflow_instances
 			SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
 			WHERE instance_id = $1 AND locked_by = $2
 		`, instanceID, workerID)
 		if err != nil {
+			return false, err
+		}
+		if err := heldByCaller(res); err != nil {
 			return false, err
 		}
 		if needTx {
@@ -1264,22 +1342,30 @@ func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Conte
 		return false, nil
 	}
 
+	// Suspend and release first, fenced on the caller's lock: a run that lost
+	// its lease must not overwrite the live run's wait registration.
+	res, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET status = $1, locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
+		WHERE instance_id = $2 AND locked_by = $3
+		AND status NOT IN `+terminalStatusList+`
+	`, StatusWaitingForMessage, instanceID, workerID)
+	if err != nil {
+		return false, err
+	}
+	if err := heldByCaller(res); err != nil {
+		if refused := s.statusWriteRefused(ctx, instanceID, workerID); refused != nil {
+			return false, refused
+		}
+		return false, err
+	}
+
 	// Update subscription to set timeout and activity ID (non-null = waiting)
 	_, err = conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
 		SET timeout_at = $1, activity_id = $2
 		WHERE instance_id = $3 AND channel = $4
-	`, timeoutAt, activityID, instanceID, channelName)
-	if err != nil {
-		return false, err
-	}
-
-	// Update instance status and release the lock
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET status = $1, locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = NOW()
-		WHERE instance_id = $2 AND locked_by = $3
-	`, StatusWaitingForMessage, instanceID, workerID)
+	`, utcTimePtr(timeoutAt), activityID, instanceID, channelName)
 	if err != nil {
 		return false, err
 	}
@@ -1344,42 +1430,100 @@ func (s *PostgresStorage) hasPendingChannelMessage(ctx context.Context, instance
 }
 
 func (s *PostgresStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int, error) {
+	var needTx bool
+	if !s.InTransaction(ctx) {
+		var err error
+		ctx, err = s.BeginTransaction(ctx)
+		if err != nil {
+			return 0, err
+		}
+		needTx = true
+		defer func() {
+			if needTx {
+				_ = s.RollbackTransaction(ctx)
+			}
+		}()
+	}
 	conn := s.getConn(ctx)
-	res, err := conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET status = $1, updated_at = NOW()
-		WHERE status = $2 AND locked_by IS NULL
-		AND instance_id IN (
-			SELECT s.instance_id FROM channel_subscriptions s
-			WHERE s.activity_id IS NOT NULL AND s.activity_id != ''
-			AND (
-				(s.mode = $3 AND EXISTS (
-					SELECT 1 FROM channel_messages m
-					LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
-					LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
-					WHERE m.channel = s.channel AND (
-						c.message_id IS NULL
-						OR c.instance_id = s.instance_id
-						OR c.claimed_at < $4
-						OR ci.status IN ('completed', 'failed', 'cancelled')
-					)
-				))
-				OR
-				(s.mode != $3 AND EXISTS (
-					SELECT 1 FROM channel_messages m
-					LEFT JOIN channel_delivery_cursors dc
-						ON dc.instance_id = s.instance_id AND dc.channel = s.channel
-					WHERE m.channel = s.channel AND m.id > COALESCE(dc.last_delivered_id, 0)
-				))
-			)
+
+	// Candidates first, then a conditional flip per instance: an UPDATE of
+	// workflow_instances cannot read workflow_instances in its own subquery
+	// on MySQL (error 1093), and the flipped instance's wait is cleared with
+	// it so its stale activity id and deadline cannot fire later.
+	stale := time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second)
+	rows, err := conn.QueryContext(ctx, `
+		SELECT DISTINCT w.instance_id
+		FROM workflow_instances w
+		JOIN channel_subscriptions s ON s.instance_id = w.instance_id
+		WHERE w.status = $1 AND w.locked_by IS NULL
+		AND s.activity_id IS NOT NULL AND s.activity_id != ''
+		AND (
+			(s.mode = $2 AND EXISTS (
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
+				LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+				WHERE m.channel = s.channel AND (
+					c.message_id IS NULL
+					OR c.instance_id = s.instance_id
+					OR c.claimed_at < $3
+					OR ci.status IN `+terminalStatusList+`
+				)
+			))
+			OR
+			(s.mode != $2 AND EXISTS (
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_delivery_cursors dc
+					ON dc.instance_id = s.instance_id AND dc.channel = s.channel
+				WHERE m.channel = s.channel AND m.id > COALESCE(dc.last_delivered_id, 0)
+			))
 		)
-	`, StatusRunning, StatusWaitingForMessage, string(ChannelModeCompeting),
-		time.Now().UTC().Add(-ChannelClaimStaleSeconds*time.Second))
+	`, StatusWaitingForMessage, string(ChannelModeCompeting), stale)
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	return int(n), err
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	requeued := 0
+	for _, id := range ids {
+		res, err := conn.ExecContext(ctx, `
+			UPDATE workflow_instances SET status = $1, updated_at = NOW()
+			WHERE instance_id = $2 AND status = $3 AND locked_by IS NULL
+		`, StatusRunning, id, StatusWaitingForMessage)
+		if err != nil {
+			return 0, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return 0, err
+		} else if n == 0 {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE channel_subscriptions SET activity_id = NULL, timeout_at = NULL
+			WHERE instance_id = $1
+		`, id); err != nil {
+			return 0, err
+		}
+		requeued++
+	}
+
+	if needTx {
+		if err := s.CommitTransaction(ctx); err != nil {
+			return 0, err
+		}
+		needTx = false
+	}
+	return requeued, nil
 }
 
 // GetPendingChannelMessages retrieves pending messages for a channel after a given ID.
@@ -1511,13 +1655,27 @@ func (s *PostgresStorage) GetPendingChannelMessagesForInstance(ctx context.Conte
 func (s *PostgresStorage) ClaimChannelMessage(ctx context.Context, messageID int64, instanceID string) (bool, error) {
 	conn := s.getConn(ctx)
 
-	// Insert resolves the numeric row id to the message_id UUID the claims
-	// table references; a missing message simply inserts nothing.
+	// Lock the message row first and resolve its message_id UUID, which the
+	// claims table references. Every claimer does this, so competing claims
+	// of one message queue up here: inside a transaction the loser waits for
+	// the winner to commit and then finds the message consumed, instead of
+	// inserting a claim that references a message deleted under it (a
+	// foreign key error that would abort its transaction).
+	var messageUUID string
+	err := conn.QueryRowContext(ctx, `
+		SELECT message_id FROM channel_messages WHERE id = $1 FOR UPDATE
+	`, messageID).Scan(&messageUUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
 	result, err := conn.ExecContext(ctx, `
 		INSERT INTO channel_message_claims (message_id, instance_id)
-		SELECT m.message_id, $1 FROM channel_messages m WHERE m.id = $2
+		VALUES ($2, $1)
 		ON CONFLICT (message_id) DO NOTHING
-	`, instanceID, messageID)
+	`, instanceID, messageUUID)
 	if err != nil {
 		return false, err
 	}
@@ -1533,14 +1691,14 @@ func (s *PostgresStorage) ClaimChannelMessage(ctx context.Context, messageID int
 	result, err = conn.ExecContext(ctx, `
 		UPDATE channel_message_claims
 		SET instance_id = $1, claimed_at = $4
-		WHERE message_id = (SELECT message_id FROM channel_messages WHERE id = $2)
+		WHERE message_id = $2
 			AND (instance_id = $1
 				OR claimed_at < $3
 				OR instance_id IN (
 					SELECT instance_id FROM workflow_instances
 					WHERE status IN ('completed', 'failed', 'cancelled')
 				))
-	`, instanceID, messageID, now.Add(-ChannelClaimStaleSeconds*time.Second), now)
+	`, instanceID, messageUUID, now.Add(-ChannelClaimStaleSeconds*time.Second), now)
 	if err != nil {
 		return false, err
 	}
@@ -1660,6 +1818,25 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	workerID string,
 	lockTimeoutSec int,
 ) (*ChannelDeliveryResult, error) {
+	// One transaction: the claim, the receive record, the consume-delete, the
+	// cursor and the status flip land together or not at all. A crash in
+	// between must not leave a consumed message without its receive, or a
+	// recorded receive whose wait is still open to a second message.
+	if !s.InTransaction(ctx) {
+		txCtx, err := s.BeginTransaction(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := s.DeliverChannelMessageWithLock(txCtx, instanceID, channelName, message, workerID, lockTimeoutSec)
+		if err != nil || res == nil {
+			_ = s.RollbackTransaction(txCtx)
+			return res, err
+		}
+		if err := s.CommitTransaction(txCtx); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 	conn := s.getConn(ctx)
 
 	// Step 1: Try to acquire lock (Lock-First pattern)
@@ -1674,9 +1851,10 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 
 	// Step 2: Get workflow info and subscription activity ID
 	var workflowName string
+	var status WorkflowStatus
 	err = conn.QueryRowContext(ctx, `
-		SELECT workflow_name FROM workflow_instances WHERE instance_id = $1
-	`, instanceID).Scan(&workflowName)
+		SELECT workflow_name, status FROM workflow_instances WHERE instance_id = $1
+	`, instanceID).Scan(&workflowName, &status)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to get workflow info: %w", err)
@@ -1688,13 +1866,18 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 		SELECT COALESCE(activity_id, ''), mode FROM channel_subscriptions
 		WHERE instance_id = $1 AND channel = $2
 	`, instanceID, channelName).Scan(&historyActivityID, &subscriptionMode)
-	if err != nil {
+	if err != nil && err != sql.ErrNoRows {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to get subscription info: %w", err)
 	}
-	// Fallback to legacy format if no activity ID stored
-	if historyActivityID == "" {
-		historyActivityID = fmt.Sprintf("channel:%s:%d", channelName, message.ID)
+	// Only a subscriber that is waiting on this channel takes the message:
+	// the history slot it fills is that wait's activity id. Anyone else —
+	// resumed in the meantime, terminated, never waiting — leaves the message
+	// pending for its next Receive instead of having it recorded where no
+	// Receive will ever read it (and, in competing mode, deleted).
+	if status != StatusWaitingForMessage || historyActivityID == "" {
+		_ = s.ReleaseLock(ctx, instanceID, workerID)
+		return nil, nil
 	}
 
 	// For competing mode, claim the message for this instance first so other
@@ -1777,8 +1960,8 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	// Step 5: Update status to 'running'
 	_, err = conn.ExecContext(ctx, `
 		UPDATE workflow_instances SET status = $1, updated_at = NOW()
-		WHERE instance_id = $2
-	`, StatusRunning, instanceID)
+		WHERE instance_id = $2 AND status = $3
+	`, StatusRunning, instanceID, StatusWaitingForMessage)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to update status: %w", err)
@@ -1967,10 +2150,11 @@ func (s *PostgresStorage) ArchiveHistory(ctx context.Context, instanceID string)
 
 	// Copy to archive
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_history_archive (original_id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, original_created_at)
-		SELECT id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at
+		INSERT INTO workflow_history_archive (instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at)
+		SELECT instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at
 		FROM workflow_history
 		WHERE instance_id = $1
+		ORDER BY id
 	`, instanceID)
 	if err != nil {
 		return err
@@ -1987,10 +2171,10 @@ func (s *PostgresStorage) ArchiveHistory(ctx context.Context, instanceID string)
 func (s *PostgresStorage) GetArchivedHistory(ctx context.Context, instanceID string) ([]*ArchivedHistoryEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, original_id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, original_created_at, archived_at
+		SELECT id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at, archived_at
 		FROM workflow_history_archive
 		WHERE instance_id = $1
-		ORDER BY original_id ASC
+		ORDER BY id ASC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -2001,14 +2185,10 @@ func (s *PostgresStorage) GetArchivedHistory(ctx context.Context, instanceID str
 	for rows.Next() {
 		var e ArchivedHistoryEvent
 		var eventData sql.NullString
-		var originalID sql.NullInt64
 		var originalCreatedAt sql.NullTime
-		err := rows.Scan(&e.ID, &originalID, &e.InstanceID, &e.ActivityID, &e.EventType, &eventData, &e.EventDataBinary, &e.DataType, &originalCreatedAt, &e.ArchivedAt)
+		err := rows.Scan(&e.ID, &e.InstanceID, &e.ActivityID, &e.EventType, &eventData, &e.EventDataBinary, &e.DataType, &originalCreatedAt, &e.ArchivedAt)
 		if err != nil {
 			return nil, err
-		}
-		if originalID.Valid {
-			e.OriginalID = originalID.Int64
 		}
 		if eventData.Valid {
 			e.EventData = []byte(eventData.String)
@@ -2052,16 +2232,39 @@ func (s *PostgresStorage) CleanupInstanceSubscriptions(ctx context.Context, inst
 // Actor Registry
 // ========================================
 
+// RegisterActorName binds name to instanceID. Registering a name the
+// instance already holds succeeds (SEMANTICS §6: registration is
+// idempotent); a name bound to another instance answers ErrActorNameTaken.
 func (s *PostgresStorage) RegisterActorName(ctx context.Context, name, instanceID, framework string) error {
-	_, err := s.getConn(ctx).ExecContext(ctx, `
+	conn := s.getConn(ctx)
+	if _, err := conn.ExecContext(ctx, `
 		INSERT INTO actor_names (name, instance_id, framework) VALUES ($1, $2, $3)
-	`, name, instanceID, framework)
-	return err
+		ON CONFLICT (name) DO NOTHING
+	`, name, instanceID, framework); err != nil {
+		return err
+	}
+	var holder string
+	err := conn.QueryRowContext(ctx, `SELECT instance_id FROM actor_names WHERE name = $1`, name).Scan(&holder)
+	if err != nil {
+		return err
+	}
+	if holder != instanceID {
+		return fmt.Errorf("%w: %q is bound to %s", ErrActorNameTaken, name, holder)
+	}
+	return nil
 }
 
 func (s *PostgresStorage) UnregisterActorName(ctx context.Context, name string) error {
 	_, err := s.getConn(ctx).ExecContext(ctx, `DELETE FROM actor_names WHERE name = $1`, name)
 	return err
+}
+
+func (s *PostgresStorage) UnregisterOwnActorName(ctx context.Context, name, owner string) error {
+	return deleteOwned(ctx, s.getConn(ctx), s.driver.Placeholder, "actor_names", "name", "instance_id", name, owner)
+}
+
+func (s *PostgresStorage) RevokeOwnCapability(ctx context.Context, capabilityID, owner string) error {
+	return deleteOwned(ctx, s.getConn(ctx), s.driver.Placeholder, "actor_capabilities", "id", "granted_by", capabilityID, owner)
 }
 
 func (s *PostgresStorage) WhereisActor(ctx context.Context, name string) (string, error) {
@@ -2102,8 +2305,7 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 		SELECT m.id, m.target_instance_id, m.channel, w.status
 		FROM actor_monitors m
 		JOIN workflow_instances w ON w.instance_id = m.target_instance_id
-		WHERE w.status IN ('completed', 'failed', 'cancelled', 'recurred')
-	`)
+		WHERE w.status IN `+terminalStatusList)
 	if err != nil {
 		return 0, err
 	}
@@ -2114,7 +2316,6 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 		status   string
 	}
 	var monitors []monitorRow
-	targetSet := map[string]bool{}
 	for rows.Next() {
 		var m monitorRow
 		if err := rows.Scan(&m.id, &m.targetID, &m.channel, &m.status); err != nil {
@@ -2122,29 +2323,37 @@ func (s *PostgresStorage) EmitActorDownForTerminated(ctx context.Context) (int, 
 			return 0, err
 		}
 		monitors = append(monitors, m)
-		targetSet[m.targetID] = true
 	}
 	_ = rows.Close()
 
+	emitted := 0
 	for _, m := range monitors {
-		payload := fmt.Sprintf(`{"type":"DOWN","actor":%q,"status":%q}`, m.targetID, m.status)
-		msgID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), m.id)
+		// Consume the monitor first: of two overlapping sweeps only the one
+		// whose delete takes the row emits the DOWN.
+		res, err := tx.ExecContext(ctx, `DELETE FROM actor_monitors WHERE id = $1`, m.id)
+		if err != nil {
+			return 0, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return 0, err
+		} else if n == 0 {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO channel_messages (channel, data, message_id, data_type)
 			VALUES ($1, $2, $3, 'json')
-		`, m.channel, payload, msgID); err != nil {
+		`, m.channel, downPayload(m.targetID, m.status), "down-"+uuid.New().String()); err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM actor_monitors WHERE id = $1`, m.id); err != nil {
-			return 0, err
-		}
+		emitted++
 	}
-	for targetID := range targetSet {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM actor_names WHERE instance_id = $1`, targetID); err != nil {
-			return 0, err
-		}
+	// A terminated actor's names are freed whether or not anyone monitored it.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM actor_names WHERE instance_id IN (
+			SELECT instance_id FROM workflow_instances WHERE status IN `+terminalStatusList+`)`); err != nil {
+		return 0, err
 	}
-	return len(monitors), tx.Commit()
+	return emitted, tx.Commit()
 }
 
 // ========================================
@@ -2235,11 +2444,14 @@ func (s *PostgresStorage) FSPut(ctx context.Context, path string, data []byte, o
 	var err error
 	now := time.Now().UTC()
 	if expectedVersion == 0 {
+		// ON CONFLICT instead of catching 23505: a unique violation would
+		// abort the caller's transaction (FS calls run inside activities),
+		// while a skipped insert leaves it usable after ErrFSConflict.
 		res, err = s.getConn(ctx).ExecContext(ctx, `
 			INSERT INTO actor_fs (path, owner, data, version, created_at, updated_at)
-			SELECT $1, $2, $3, 1, $4, $4
-			WHERE NOT EXISTS (SELECT 1 FROM actor_fs WHERE path = $5)`,
-			path, owner, data, now, path)
+			VALUES ($1, $2, $3, 1, $4, $4)
+			ON CONFLICT (path) DO NOTHING`,
+			path, owner, data, now)
 	} else {
 		res, err = s.getConn(ctx).ExecContext(ctx, `
 			UPDATE actor_fs SET data = $1, owner = $2, version = version + 1, updated_at = $3
@@ -2317,20 +2529,20 @@ func (s *PostgresStorage) GetBlobInfo(ctx context.Context, hash string) (*BlobIn
 	if err != nil {
 		return nil, err
 	}
-	switch v := rawCreatedAt.(type) {
-	case time.Time:
-		info.CreatedAt = v.UTC().Format(time.RFC3339)
-	case string:
-		info.CreatedAt = v
-	case []byte:
-		info.CreatedAt = string(v)
-	}
+	info.CreatedAt = canonicalTSFrom(rawCreatedAt)
 	return &info, nil
 }
 
 func (s *PostgresStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, error) {
-	res, err := s.getConn(ctx).ExecContext(ctx,
-		`DELETE FROM actor_capabilities WHERE expires_at IS NOT NULL AND expires_at <= $1`,
+	res, err := s.getConn(ctx).ExecContext(ctx, `
+		DELETE FROM actor_capabilities c
+		WHERE c.expires_at IS NOT NULL AND c.expires_at <= $1
+		  AND EXISTS (
+			SELECT 1 FROM actor_capabilities o
+			WHERE o.kind = c.kind AND o.target = c.target AND o.id <> c.id
+			  AND (o.expires_at IS NULL OR o.expires_at > $1
+			       OR o.created_at > c.created_at
+			       OR (o.created_at = c.created_at AND o.id > c.id)))`,
 		canonicalTS(time.Now()))
 	if err != nil {
 		return 0, err
@@ -2346,15 +2558,14 @@ func (s *PostgresStorage) PostTask(ctx context.Context, task *ActorTask) error {
 	if err != nil {
 		return err
 	}
-	return s.publishTaskNotice(ctx, task.Channel, fmt.Sprintf(
-		`{"type":"task_posted","task_id":%q,"channel":%q}`, task.ID, task.Channel))
+	return s.publishTaskNotice(ctx, task.Channel, taskPostedNotice(task.ID, task.Channel))
 }
 
 // publishTaskNotice appends an event to the channel's task-event stream
 // ({channel}:tasks). Runs on the caller's conn so it joins an enclosing
 // transaction when present.
 func (s *PostgresStorage) publishTaskNotice(ctx context.Context, channel, dataJSON string) error {
-	msgID := fmt.Sprintf("task-notice-%d-%d", time.Now().UnixNano(), time.Now().UnixNano()%1000000)
+	msgID := "task-notice-" + uuid.New().String()
 	_, err := s.getConn(ctx).ExecContext(ctx, `
 		INSERT INTO channel_messages (channel, data, message_id, data_type)
 		VALUES ($1, $2, $3, 'json')`,
@@ -2381,15 +2592,29 @@ func (s *PostgresStorage) GetTask(ctx context.Context, taskID string) (*ActorTas
 }
 
 func (s *PostgresStorage) ClaimTask(ctx context.Context, channel, claimant string) (*ActorTask, error) {
+	conn := s.getConn(ctx)
+	// Optimistic claim: pick the oldest open task, then take it with a
+	// conditional UPDATE — exactly one claimant wins (spec/TaskClaim.tla) and
+	// the winner knows which row it took. A claimant that lost the race
+	// retries against the next oldest task.
 	for range 3 {
-		res, err := s.getConn(ctx).ExecContext(ctx, `
-			UPDATE actor_tasks SET state = 'claimed', claimed_by = $1, updated_at = $2,
-				claimed_at = $2, attempts = attempts + 1
-			WHERE id = (
-				SELECT id FROM (SELECT id FROM actor_tasks
-					WHERE channel = $3 AND state = 'open' ORDER BY created_at LIMIT 1) _t
-			) AND state = 'open'`,
-			claimant, time.Now().UTC(), channel)
+		var id string
+		err := conn.QueryRowContext(ctx, `
+			SELECT id FROM actor_tasks
+			WHERE channel = $1 AND state = 'open'
+			ORDER BY created_at, id LIMIT 1`, channel).Scan(&id)
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		now := time.Now().UTC()
+		res, err := conn.ExecContext(ctx, `
+			UPDATE actor_tasks SET state = 'claimed', claimed_by = $1, claimed_at = $2,
+				attempts = attempts + 1, updated_at = $3
+			WHERE id = $4 AND state = 'open'`,
+			claimant, now, now, id)
 		if err != nil {
 			return nil, err
 		}
@@ -2398,26 +2623,19 @@ func (s *PostgresStorage) ClaimTask(ctx context.Context, channel, claimant strin
 			return nil, err
 		}
 		if n == 0 {
-			continue
+			continue // another claimant took it first
 		}
-		var t ActorTask
-		var claimedBy, result sql.NullString
-		err = s.getConn(ctx).QueryRowContext(ctx, `
-			SELECT id, channel, COALESCE(data, ''), claimed_by, COALESCE(result, ''), attempts
-			FROM actor_tasks WHERE channel = $3 AND claimed_by = $1 AND state = 'claimed'
-			ORDER BY updated_at DESC LIMIT 1`, claimant, claimant, channel).Scan(
-			&t.ID, &t.Channel, &t.Data, &claimedBy, &result, &t.Attempts)
+		t, err := s.GetTask(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		t.State = "claimed"
-		t.ClaimedBy = claimedBy.String
-		t.Result = []byte(result.String)
-		if err := s.publishTaskNotice(ctx, channel, fmt.Sprintf(
-			`{"type":"task_claimed","task_id":%q,"claimed_by":%q}`, t.ID, claimant)); err != nil {
+		if t == nil {
+			return nil, fmt.Errorf("claimed task %s vanished", id)
+		}
+		if err := s.publishTaskNotice(ctx, channel, taskClaimedNotice(id, claimant)); err != nil {
 			return nil, err
 		}
-		return &t, nil
+		return t, nil
 	}
 	return nil, nil
 }
@@ -2438,15 +2656,20 @@ func (s *PostgresStorage) CompleteTask(ctx context.Context, taskID, claimant str
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return ErrTaskConflict
-	}
 	task, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return err
 	}
-	return s.publishTaskNotice(ctx, task.Channel, fmt.Sprintf(
-		`{"type":"task_state","task_id":%q,"state":%q}`, taskID, state))
+	if n == 0 {
+		if task == nil {
+			return ErrTaskNotFound
+		}
+		if task.ClaimedBy == claimant && task.State == state {
+			return nil // already settled by this claimant: a re-executed step
+		}
+		return ErrTaskConflict
+	}
+	return s.publishTaskNotice(ctx, task.Channel, taskStateNotice(taskID, state))
 }
 
 func (s *PostgresStorage) ReclaimStaleTasks(ctx context.Context, maxAge time.Duration) (int64, error) {
@@ -2471,7 +2694,7 @@ func (s *PostgresStorage) ListTasks(ctx context.Context, channel, state string) 
 		query += ` AND state = $2`
 		args = append(args, state)
 	}
-	query += ` ORDER BY created_at`
+	query += ` ORDER BY created_at, id`
 	rows, err := s.getConn(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -2489,13 +2712,28 @@ func (s *PostgresStorage) ListTasks(ctx context.Context, channel, state string) 
 }
 
 func (s *PostgresStorage) ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*ChannelMessage, error) {
+	if messageID == "" {
+		return s.ChannelMessagesAfter(ctx, channel, 0)
+	}
+	var cursor int64
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT id FROM channel_messages WHERE channel = $1 AND message_id = $2`, channel, messageID).Scan(&cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s on %s", ErrCursorNotFound, messageID, channel)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.ChannelMessagesAfter(ctx, channel, cursor)
+}
+
+func (s *PostgresStorage) ChannelMessagesAfter(ctx context.Context, channel string, afterID int64) ([]*ChannelMessage, error) {
 	rows, err := s.getConn(ctx).QueryContext(ctx, `
 		SELECT id, channel, message_id, data_type, COALESCE(data, ''), data_binary, metadata, published_at
 		FROM channel_messages
-		WHERE channel = $1
-		  AND id > COALESCE((SELECT id FROM channel_messages WHERE message_id = $2), 0)
+		WHERE channel = $1 AND id > $2
 		ORDER BY id`,
-		channel, messageID)
+		channel, afterID)
 	if err != nil {
 		return nil, err
 	}

@@ -147,9 +147,20 @@ func WithEventTimeout(d time.Duration) WaitEventOption {
 //
 // When the timer expires, the workflow will be resumed.
 func Sleep(ctx *WorkflowContext, duration time.Duration, opts ...SleepOption) error {
+	return sleepUntil(ctx, func() time.Time { return time.Now().UTC().Add(duration) }, opts)
+}
+
+// sleepUntil suspends the workflow until the time deadline returns. The
+// timer ID is taken before anything else, also when the deadline has
+// already passed, so a replay generates the same IDs whatever the clock says
+// by then; deadline is called on the first execution only.
+func sleepUntil(ctx *WorkflowContext, deadline func() time.Time, opts []SleepOption) error {
 	options := &sleepOptions{}
 	for _, opt := range opts {
 		opt(options)
+	}
+	if err := ctx.abortedErr(); err != nil {
+		return err
 	}
 
 	// Generate timer ID
@@ -163,8 +174,14 @@ func Sleep(ctx *WorkflowContext, duration time.Duration, opts ...SleepOption) er
 		return nil
 	}
 
-	// Calculate expiry time (must be calculated on first execution only)
-	expiresAt := time.Now().Add(duration)
+	// Calculate expiry time (must be calculated on first execution only).
+	// A deadline that has passed returns at once; a future one is rounded up
+	// to the second the storage can hold, so the timer never fires early.
+	expiresAt := deadline().UTC()
+	if !expiresAt.After(time.Now()) {
+		return nil
+	}
+	expiresAt = storage.RoundUpDeadline(expiresAt)
 
 	// Call OnTimerStart hook
 	if h := ctx.Hooks(); h != nil {
@@ -200,12 +217,7 @@ func WithSleepID(id string) SleepOption {
 
 // SleepUntil suspends the workflow until a specific time.
 func SleepUntil(ctx *WorkflowContext, t time.Time, opts ...SleepOption) error {
-	duration := time.Until(t)
-	if duration <= 0 {
-		// Already past the target time
-		return nil
-	}
-	return Sleep(ctx, duration, opts...)
+	return sleepUntil(ctx, func() time.Time { return t }, opts)
 }
 
 // workflowContextAdapter adapts *WorkflowContext to outbox.WorkflowContext interface.

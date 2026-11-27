@@ -204,6 +204,48 @@ var ErrInstanceAlreadyExists = storage.ErrInstanceAlreadyExists
 // released): the run is aborted instead of writing over the new owner's.
 var ErrLockNotHeld = storage.ErrLockNotHeld
 
+// ErrActorNameTaken is returned (wrapped) by RegisterName when the name is
+// bound to another instance.
+var ErrActorNameTaken = storage.ErrActorNameTaken
+
+// ErrTaskConflict is returned by CompleteTask and FailTask when the caller
+// is not the task's claimant or the task is no longer claimed.
+var ErrTaskConflict = storage.ErrTaskConflict
+
+// ErrTaskNotFound is returned (wrapped) when a task ID does not exist.
+var ErrTaskNotFound = storage.ErrTaskNotFound
+
+// ErrFSConflict is returned by FSWrite and FSDelete when expectedVersion
+// does not match the stored version.
+var ErrFSConflict = storage.ErrFSConflict
+
+// ErrNotOwner is returned (wrapped) when a workflow revokes a capability it
+// did not issue, or unregisters a name another instance holds.
+var ErrNotOwner = storage.ErrNotOwner
+
+// ErrCursorNotFound is returned by ReadChannelSince when the cursor message
+// no longer exists (it was consumed or cleaned up). ReadChannelAfter takes
+// the numeric message ID instead and keeps working after a deletion.
+var ErrCursorNotFound = storage.ErrCursorNotFound
+
+// ErrInvalidArgument is returned (wrapped) when a kernel primitive rejects
+// its arguments before touching storage (an empty name, an unknown kind, a
+// payload that cannot be encoded). Like the other kernel errors, it is
+// recorded as the outcome of the step.
+var ErrInvalidArgument = errors.New("invalid argument")
+
+// ErrRunAborted matches the error of a run that stopped without an outcome:
+// a step hit a storage error, the run lost its lock, or the worker is shutting
+// down. Nothing of the failed step is recorded; the instance stays running
+// and a later run executes the step again. Once a run is aborted, every
+// further step, activity and receive of that run returns the same error, so
+// swallowing it does not let the run go on.
+var ErrRunAborted = replay.ErrRunAborted
+
+// RunAbortedError is the error an aborted run's steps return. Its Cause is
+// the storage error, ErrLockNotHeld or the context error that stopped it.
+type RunAbortedError = replay.AbortError
+
 // ErrSourceHashMismatch indicates that an instance was started under another
 // version of the workflow's source than the one this worker has registered.
 // The instance is left for a worker that has its version of the code.

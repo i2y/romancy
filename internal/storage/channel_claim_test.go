@@ -213,10 +213,7 @@ func TestDeliverChannelMessage_CompetingClaim(t *testing.T) {
 	s, ctx := newClaimTestStorage(t)
 
 	for _, inst := range []string{"inst-1", "inst-2"} {
-		createClaimInstance(t, ctx, s, inst, "wf")
-		if err := s.SubscribeToChannel(ctx, inst, "ch", ChannelModeCompeting); err != nil {
-			t.Fatalf("subscribe %s failed: %v", inst, err)
-		}
+		waitOnChannel(t, ctx, s, inst, "ch", ChannelModeCompeting)
 	}
 
 	msgID, err := s.PublishToChannel(ctx, "ch", []byte(`{"x":1}`), nil)
@@ -267,10 +264,7 @@ func TestDeliverChannelMessage_CompetingClaim(t *testing.T) {
 // consumed work items.
 func TestDeliverChannelMessage_CompetingConsumes(t *testing.T) {
 	s, ctx := newClaimTestStorage(t)
-	createClaimInstance(t, ctx, s, "inst-1", "wf")
-	if err := s.SubscribeToChannel(ctx, "inst-1", "ch", ChannelModeCompeting); err != nil {
-		t.Fatalf("subscribe failed: %v", err)
-	}
+	waitOnChannel(t, ctx, s, "inst-1", "ch", ChannelModeCompeting)
 
 	msgID, err := s.PublishToChannel(ctx, "ch", []byte(`{"x":1}`), nil)
 	if err != nil {
@@ -300,10 +294,7 @@ func TestDeliverChannelMessage_CompetingConsumes(t *testing.T) {
 // delivery — other subscribers still need them.
 func TestDeliverChannelMessage_BroadcastRetains(t *testing.T) {
 	s, ctx := newClaimTestStorage(t)
-	createClaimInstance(t, ctx, s, "inst-1", "wf")
-	if err := s.SubscribeToChannel(ctx, "inst-1", "ch", ChannelModeBroadcast); err != nil {
-		t.Fatalf("subscribe failed: %v", err)
-	}
+	waitOnChannel(t, ctx, s, "inst-1", "ch", ChannelModeBroadcast)
 
 	msgID, err := s.PublishToChannel(ctx, "ch", []byte(`{"x":1}`), nil)
 	if err != nil {
@@ -320,5 +311,17 @@ func TestDeliverChannelMessage_BroadcastRetains(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatal("broadcast message must be retained for other subscribers")
+	}
+}
+
+// waitOnChannel leaves instanceID suspended in Receive on channel, as the
+// engine does: subscribed, wait registered, lock released. Publishers only
+// deliver to such waiting subscribers.
+func waitOnChannel(t *testing.T, ctx context.Context, s *SQLiteStorage, instanceID, channel string, mode ChannelMode) {
+	t.Helper()
+	subscribeAndLock(t, ctx, s, instanceID, channel, "w-setup", mode)
+	registered, err := s.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, channel, "w-setup", "receive_"+channel+":1", nil)
+	if err != nil || !registered {
+		t.Fatalf("register wait for %s: registered=%v err=%v", instanceID, registered, err)
 	}
 }

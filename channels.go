@@ -4,6 +4,7 @@ package romancy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -72,6 +73,9 @@ type ReceivedMessage[T any] struct {
 // Once a channel has subscribers, its mode is locked. Attempting to subscribe
 // with a different mode will return a ChannelModeConflictError.
 func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error {
+	if err := ctx.abortedErr(); err != nil {
+		return err
+	}
 	// Handle ModeDirect: convert to actual channel name and record for Receive
 	actualChannel := channelName
 	actualMode := mode
@@ -87,7 +91,10 @@ func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error
 	activityID := ctx.GenerateActivityID(fmt.Sprintf("subscribe_%s", channelName))
 
 	// Check if already subscribed (replay)
-	if _, ok := ctx.GetCachedResult(activityID); ok {
+	if cached, ok := ctx.GetCachedResult(activityID); ok {
+		if err, isErr := cached.(error); isErr {
+			return restoreActivityError(err) // a recorded refusal
+		}
 		// Still need to record direct subscription on replay
 		if mode == ModeDirect {
 			ctx.recordDirectSubscription(channelName)
@@ -95,16 +102,24 @@ func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error
 		return nil
 	}
 
+	// Another instance's direct channel is its own (SEMANTICS §3). The
+	// refusal is recorded, so a replay refuses again.
+	if mode != ModeDirect {
+		if err := enforceDirectPrivacy(ctx, channelName); err != nil {
+			return recordRefusal(ctx, activityID, "subscribe_"+channelName, err)
+		}
+	}
+
 	// Subscribe to channel
 	s := ctx.Storage()
 	if s == nil {
-		return fmt.Errorf("storage not available")
+		return ctx.abortRun(fmt.Errorf("storage not available"))
 	}
 
 	// Check for mode conflict
 	existingMode, err := s.GetChannelMode(ctx.Context(), actualChannel)
 	if err != nil {
-		return fmt.Errorf("failed to check channel mode: %w", err)
+		return ctx.abortRun(fmt.Errorf("failed to check channel mode: %w", err))
 	}
 	if existingMode != "" && existingMode != actualMode {
 		return &ChannelModeConflictError{
@@ -115,7 +130,7 @@ func Subscribe(ctx *WorkflowContext, channelName string, mode ChannelMode) error
 	}
 
 	if err := s.SubscribeToChannel(ctx.Context(), ctx.InstanceID(), actualChannel, actualMode); err != nil {
-		return fmt.Errorf("failed to subscribe to channel: %w", err)
+		return ctx.abortRun(fmt.Errorf("failed to subscribe to channel: %w", err))
 	}
 
 	// Record for replay
@@ -159,29 +174,54 @@ var ErrChannelForbidden = fmt.Errorf("channel: permission denied")
 // enforceChannelCapability implements sealed-channel semantics: while no
 // grants of kind exist for the channel it is open to everyone; once the
 // first grant is issued the operation requires a valid capability token.
+//
+// A seal on L also covers every physical name "L:..." — the direct channel
+// of instance X for L is "L:X", so publishing to that name is SendTo(X, L)
+// and reading it is a direct Receive on L. Without this, naming the physical
+// channel would bypass the seal SendTo and Receive enforce on L.
 func enforceChannelCapability(ctx *WorkflowContext, kind, channelName, token string) error {
 	s := ctx.Storage()
 	if s == nil {
 		return nil
 	}
-	sealed, err := s.HasCapabilityGrants(ctx.Context(), kind, channelName)
-	if err != nil {
-		return err
-	}
-	if !sealed {
-		return nil
-	}
-	if token == "" {
-		return fmt.Errorf("%w: channel %q is sealed for %s", ErrChannelForbidden, channelName, kind)
-	}
-	ok, err := CheckCapability(ctx, kind, channelName, token)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("%w: invalid capability for channel %q", ErrChannelForbidden, channelName)
+	return checkChannelSeal(ctx.Context(), s, kind, channelName, token)
+}
+
+// checkChannelSeal is enforceChannelCapability for callers outside a
+// workflow (the CloudEvents endpoint).
+func checkChannelSeal(ctx context.Context, s storage.Storage, kind, channelName, token string) error {
+	for _, scope := range channelSealScopes(channelName) {
+		sealed, err := s.HasCapabilityGrants(ctx, kind, scope)
+		if err != nil {
+			return err
+		}
+		if !sealed {
+			continue
+		}
+		if token == "" {
+			return fmt.Errorf("%w: channel %q is sealed for %s", ErrChannelForbidden, scope, kind)
+		}
+		ok, err := s.CheckCapability(ctx, kind, scope, hashCapabilitySecret(tokenSecret(token)))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: invalid capability for channel %q", ErrChannelForbidden, scope)
+		}
 	}
 	return nil
+}
+
+// channelSealScopes returns name followed by each of its prefixes that ends
+// before a ':' — the channels whose seal applies to name.
+func channelSealScopes(name string) []string {
+	scopes := []string{name}
+	for i := len(name) - 1; i > 0; i-- {
+		if name[i] == ':' {
+			scopes = append(scopes, name[:i])
+		}
+	}
+	return scopes
 }
 
 // WithPublishCapability presents a channel_pub capability token for a
@@ -229,6 +269,9 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 	options := &receiveOptions{}
 	for _, opt := range opts {
 		opt(options)
+	}
+	if err := ctx.abortedErr(); err != nil {
+		return nil, err
 	}
 
 	// Check if this channel was subscribed with ModeDirect
@@ -328,7 +371,7 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 					ChannelName: channelName,
 				}
 			}
-			return nil, err
+			return nil, restoreActivityError(err)
 		}
 		if msg, ok := result.(*ReceivedMessage[T]); ok {
 			return msg, nil
@@ -338,107 +381,54 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 
 	// Sealed-channel enforcement comes after the cache lookup: replays of a
 	// completed receive never re-check, keeping replay deterministic even if
-	// the capability is later revoked.
+	// the capability is later revoked. A refusal is the receive's outcome and
+	// is recorded, so a replay refuses again even if grants changed since.
 	if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelSub, channelName, options.capabilityToken); err != nil {
-		return nil, err
+		return nil, recordRefusal(ctx, activityID, "receive_"+channelName, err)
+	}
+	if !ctx.isDirectSubscription(channelName) {
+		if err := enforceDirectPrivacy(ctx, channelName); err != nil {
+			return nil, recordRefusal(ctx, activityID, "receive_"+channelName, err)
+		}
 	}
 
 	// Verify subscription exists
 	s := ctx.Storage()
 	if s == nil {
-		return nil, fmt.Errorf("storage not available")
+		return nil, ctx.abortRun(fmt.Errorf("storage not available"))
 	}
 
 	sub, err := s.GetChannelSubscription(ctx.Context(), ctx.InstanceID(), actualChannel)
-	if err != nil || sub == nil {
+	if err != nil {
+		return nil, ctx.abortRun(fmt.Errorf("failed to read subscription: %w", err))
+	}
+	if sub == nil {
 		return nil, ErrChannelNotSubscribed
 	}
 
 	// Check for pending messages before suspending (Edda-style)
 	pendingMessages, err := s.GetPendingChannelMessagesForInstance(ctx.Context(), ctx.InstanceID(), actualChannel)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check pending messages: %w", err)
+		return nil, ctx.abortRun(fmt.Errorf("failed to check pending messages: %w", err))
 	}
 
-	var msg *storage.ChannelMessage
 	if len(pendingMessages) > 0 {
-		if sub.Mode == storage.ChannelModeCompeting {
-			// Claim the first claimable message; a fresh claim by another
-			// live instance just skips it rather than retrying the whole
-			// pending scan.
-			for _, m := range pendingMessages {
-				claimed, err := s.ClaimChannelMessage(ctx.Context(), m.ID, ctx.InstanceID())
-				if err != nil {
-					return nil, fmt.Errorf("failed to claim message: %w", err)
-				}
-				if claimed {
-					msg = m
-					break
-				}
+		result, err := receivePending[T](ctx, s, sub, pendingMessages, channelName, activityID)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil {
+			// Call OnEventWaitComplete hook
+			if h := ctx.Hooks(); h != nil {
+				h.OnEventWaitComplete(ctx.Context(), hooks.EventWaitCompleteInfo{
+					InstanceID:   ctx.InstanceID(),
+					WorkflowName: ctx.WorkflowName(),
+					EventType:    channelName,
+					Duration:     time.Since(startTime),
+				})
 			}
-		} else {
-			msg = pendingMessages[0]
+			return result, nil
 		}
-	}
-
-	if msg != nil {
-		// Message is already available - process it immediately
-
-		// Update cursor for broadcast mode
-		if sub.Mode == storage.ChannelModeBroadcast {
-			if err := s.UpdateDeliveryCursor(ctx.Context(), ctx.InstanceID(), actualChannel, msg.ID); err != nil {
-				return nil, fmt.Errorf("failed to update cursor: %w", err)
-			}
-		}
-
-		// Deserialize the message
-		var data T
-		if err := json.Unmarshal(msg.Data, &data); err != nil {
-			return nil, fmt.Errorf("failed to deserialize message data: %w", err)
-		}
-
-		var metadata map[string]any
-		if len(msg.Metadata) > 0 {
-			if err := json.Unmarshal(msg.Metadata, &metadata); err != nil {
-				return nil, fmt.Errorf("failed to deserialize metadata: %w", err)
-			}
-		}
-
-		result := &ReceivedMessage[T]{
-			ID:          msg.ID,
-			ChannelName: channelName,
-			Data:        data,
-			Metadata:    metadata,
-			CreatedAt:   msg.PublishedAt,
-		}
-
-		// Record to history for replay (synchronous message processing)
-		if err := ctx.RecordActivityResult(activityID, result, nil); err != nil {
-			return nil, fmt.Errorf("failed to record activity result: %w", err)
-		}
-
-		// Competing mode consumes the message: delete it (cascading the claim)
-		// once history is durable so it cannot be delivered again.
-		if sub.Mode == storage.ChannelModeCompeting {
-			if err := s.DeleteChannelMessage(ctx.Context(), msg.ID); err != nil {
-				return nil, fmt.Errorf("failed to delete consumed message: %w", err)
-			}
-		}
-
-		// Cache for replay
-		ctx.SetCachedResult(activityID, result)
-
-		// Call OnEventWaitComplete hook
-		if h := ctx.Hooks(); h != nil {
-			h.OnEventWaitComplete(ctx.Context(), hooks.EventWaitCompleteInfo{
-				InstanceID:   ctx.InstanceID(),
-				WorkflowName: ctx.WorkflowName(),
-				EventType:    channelName,
-				Duration:     time.Since(startTime),
-			})
-		}
-
-		return result, nil
 	}
 
 	// No pending messages - need to wait for message
@@ -462,68 +452,64 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 	for _, opt := range opts {
 		opt(options)
 	}
-
-	if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelPub, channelName, options.capabilityToken); err != nil {
+	dataJSON, metadataJSON, err := encodeMessage(data, options.metadata)
+	if err != nil {
 		return err
 	}
-
-	// Generate activity ID for deterministic replay
-	activityID := ctx.GenerateActivityID(fmt.Sprintf("publish_%s", channelName))
-
-	// Check if already published (replay)
-	if _, ok := ctx.GetCachedResult(activityID); ok {
+	// Called from workflow code, a publish is a recorded effect (runEffect):
+	// the capability check, the message and the record commit together, and a
+	// replay returns the recorded outcome — published or refused — without
+	// publishing or checking again, so a seal that changed in between cannot
+	// send the replay down another path. Inside an activity body it runs
+	// directly; the enclosing activity is the replay unit.
+	return runEffectErr(ctx, "publish_"+channelName, func(c *WorkflowContext) error {
+		if err := enforceChannelCapability(c, storage.CapabilityKindChannelPub, channelName, options.capabilityToken); err != nil {
+			return err
+		}
+		s := c.Storage()
+		if s == nil {
+			return fmt.Errorf("storage not available")
+		}
+		if err := publishAndWake(c, s, channelName, dataJSON, metadataJSON); err != nil {
+			return fmt.Errorf("failed to publish to channel: %w", err)
+		}
 		return nil
-	}
+	})
+}
 
-	// Serialize data
-	dataJSON, err := json.Marshal(data)
+// encodeMessage serializes a message's data and metadata.
+func encodeMessage(data any, metadata map[string]any) (dataJSON, metadataJSON []byte, err error) {
+	dataJSON, err = json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("failed to serialize message data: %w", err)
+		return nil, nil, fmt.Errorf("%w: failed to serialize message data: %w", ErrInvalidArgument, err)
 	}
-
-	// Serialize metadata
-	var metadataJSON []byte
-	if options.metadata != nil {
-		metadataJSON, err = json.Marshal(options.metadata)
+	if metadata != nil {
+		metadataJSON, err = json.Marshal(metadata)
 		if err != nil {
-			return fmt.Errorf("failed to serialize message metadata: %w", err)
+			return nil, nil, fmt.Errorf("%w: failed to serialize message metadata: %w", ErrInvalidArgument, err)
 		}
 	}
+	return dataJSON, metadataJSON, nil
+}
 
-	// Publish to channel
-	s := ctx.Storage()
-	if s == nil {
-		return fmt.Errorf("storage not available")
-	}
-
-	messageID, err := s.PublishToChannel(ctx.Context(), channelName, dataJSON, metadataJSON)
+// publishAndWake stores a message on the physical channel and wakes the
+// subscribers waiting on it — after commit when ctx is inside a transaction,
+// so a rollback delivers nothing.
+func publishAndWake(ctx *WorkflowContext, s storage.Storage, channel string, dataJSON, metadataJSON []byte) error {
+	messageID, err := s.PublishToChannel(ctx.Context(), channel, dataJSON, metadataJSON)
 	if err != nil {
-		return fmt.Errorf("failed to publish to channel: %w", err)
+		return err
 	}
-
-	// Wake up waiting subscribers (Edda-style: delivery + load balancing)
-	// If in transaction, defer delivery until commit to ensure consistency
 	if s.InTransaction(ctx.Context()) {
-		// Capture variables for closure
-		wfCtx := ctx
-		store := s
-		chName := channelName
-		msgID := messageID
-		dJSON := dataJSON
-		mJSON := metadataJSON
-
 		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
-			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON)
+			// The transaction has ended: wake outside it.
+			afterCommit := ctx.WithContext(context.WithoutCancel(storage.WithoutTransaction(ctx.Context())))
+			wakeWaitingSubscribers(afterCommit, s, channel, messageID, dataJSON, metadataJSON)
 			return nil
 		})
-	} else {
-		// Deliver immediately
-		wakeWaitingSubscribers(ctx, s, channelName, messageID, dataJSON, metadataJSON)
+		return nil
 	}
-
-	// Record for replay
-	ctx.SetCachedResult(activityID, true)
-
+	wakeWaitingSubscribers(ctx, s, channel, messageID, dataJSON, metadataJSON)
 	return nil
 }
 
@@ -564,7 +550,13 @@ func wakeWaitingSubscribers(
 		Metadata: metadataJSON,
 	}
 
+	// Each delivery is its own lock epoch (SEMANTICS §1). The workflow
+	// context built by the engine carries no worker id, so it comes from the
+	// app; an empty holder would let concurrent deliverers share one "lock".
 	workerID := ctx.WorkerID()
+	if app := ctx.App(); app != nil {
+		workerID = app.config.workerID
+	}
 	lockTimeoutSec := 300 // 5 minutes
 
 	for _, sub := range waitingSubs {
@@ -574,7 +566,7 @@ func wakeWaitingSubscribers(
 			sub.InstanceID,
 			channelName,
 			message,
-			workerID,
+			storage.NewLockIdentity(workerID),
 			lockTimeoutSec,
 		)
 		if err != nil {
@@ -588,6 +580,146 @@ func wakeWaitingSubscribers(
 		}
 	}
 }
+
+// receivePending takes the first pending message this subscriber may consume
+// and records it as the receive's result. It runs as one fenced transaction
+// (see inFencedTransaction): the claim, the cursor, the record and, in
+// competing mode, the consume-delete commit together, and only while the run
+// holds the instance lock. A claim that went stale meanwhile therefore cannot
+// let a second consumer record the same message, and a run that lost its
+// lease leaves no claim behind to hide the message from everyone else.
+// It answers nil when every pending message belongs to someone else.
+func receivePending[T any](
+	ctx *WorkflowContext,
+	s storage.Storage,
+	sub *storage.ChannelSubscription,
+	pending []*storage.ChannelMessage,
+	channelName, activityID string,
+) (*ReceivedMessage[T], error) {
+	var received *ReceivedMessage[T]
+	err := ctx.inFencedTransaction(func(tx *WorkflowContext) error {
+		var msg *storage.ChannelMessage
+		if sub.Mode == storage.ChannelModeCompeting {
+			// Claim the first claimable message; a fresh claim by another
+			// live instance just skips it rather than retrying the scan.
+			for _, m := range pending {
+				claimed, err := s.ClaimChannelMessage(tx.Context(), m.ID, ctx.InstanceID())
+				if err != nil {
+					return fmt.Errorf("failed to claim message: %w", err)
+				}
+				if claimed {
+					msg = m
+					break
+				}
+			}
+			if msg == nil {
+				return errNothingClaimed
+			}
+		} else {
+			msg = pending[0]
+			if sub.Mode == storage.ChannelModeBroadcast {
+				if err := s.UpdateDeliveryCursor(tx.Context(), ctx.InstanceID(), sub.Channel, msg.ID); err != nil {
+					return fmt.Errorf("failed to update cursor: %w", err)
+				}
+			}
+		}
+
+		var data T
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
+			return &messageDecodeError{fmt.Errorf("failed to deserialize message data: %w", err)}
+		}
+		var metadata map[string]any
+		if len(msg.Metadata) > 0 {
+			if err := json.Unmarshal(msg.Metadata, &metadata); err != nil {
+				return &messageDecodeError{fmt.Errorf("failed to deserialize metadata: %w", err)}
+			}
+		}
+		result := &ReceivedMessage[T]{
+			ID:          msg.ID,
+			ChannelName: channelName,
+			Data:        data,
+			Metadata:    metadata,
+			CreatedAt:   msg.PublishedAt,
+		}
+		if err := tx.RecordActivityResult(activityID, result, nil); err != nil {
+			return fmt.Errorf("failed to record activity result: %w", err)
+		}
+		// Competing mode consumes the message.
+		if sub.Mode == storage.ChannelModeCompeting {
+			if err := s.DeleteChannelMessage(tx.Context(), msg.ID); err != nil {
+				return fmt.Errorf("failed to delete consumed message: %w", err)
+			}
+		}
+		received = result
+		return nil
+	})
+	if errors.Is(err, errNothingClaimed) {
+		return nil, nil
+	}
+	var decodeErr *messageDecodeError
+	if errors.As(err, &decodeErr) {
+		// The message does not fit T: nothing was consumed, and a replay
+		// meets the same message again.
+		return nil, decodeErr.err
+	}
+	if err != nil {
+		return nil, ctx.abortRun(err)
+	}
+	ctx.SetCachedResult(activityID, received)
+	return received, nil
+}
+
+// recordRefusal ends a channel operation refused with ErrChannelForbidden:
+// the refusal is its recorded outcome, so a replay refuses again whatever
+// changed since. Any other error aborts the run (it is no outcome).
+func recordRefusal(ctx *WorkflowContext, activityID, name string, err error) error {
+	if !errors.Is(err, ErrChannelForbidden) {
+		return ctx.abortRun(err)
+	}
+	refusal := &recordedActivityError{err: err, record: activityFailureRecord(name, err)}
+	if recErr := ctx.RecordActivityResult(activityID, nil, refusal); recErr != nil {
+		return ctx.abortRun(recErr)
+	}
+	return err
+}
+
+// enforceDirectPrivacy refuses reading a channel named "L:X" where X is the
+// ID of another existing instance: that is X's direct channel, the target
+// of SendTo, and only X reads it. Sending to it stays open. Instance IDs may
+// contain ':', so every split point is checked.
+func enforceDirectPrivacy(ctx *WorkflowContext, channel string) error {
+	s := ctx.Storage()
+	if s == nil {
+		return fmt.Errorf("storage not available")
+	}
+	for i := 0; i < len(channel); i++ {
+		if channel[i] != ':' {
+			continue
+		}
+		owner := channel[i+1:]
+		if owner == "" || owner == ctx.InstanceID() {
+			continue
+		}
+		inst, err := s.GetInstance(ctx.Context(), owner)
+		if err != nil {
+			return fmt.Errorf("failed to look up the owner of channel %q: %w", channel, err)
+		}
+		if inst != nil {
+			return fmt.Errorf("%w: %q is the direct channel of instance %s", ErrChannelForbidden, channel, owner)
+		}
+	}
+	return nil
+}
+
+// errNothingClaimed rolls receivePending back when every pending message is
+// claimed by someone else.
+var errNothingClaimed = errors.New("no claimable message")
+
+// messageDecodeError rolls receivePending back when the pending message does
+// not decode into the receiver's type.
+type messageDecodeError struct{ err error }
+
+func (e *messageDecodeError) Error() string { return e.err.Error() }
 
 // PublishOption configures publish behavior.
 type PublishOption func(*publishOptions)
@@ -613,71 +745,27 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 	for _, opt := range opts {
 		opt(options)
 	}
-
-	if err := enforceChannelCapability(ctx, storage.CapabilityKindChannelPub, channelName, options.capabilityToken); err != nil {
+	dataJSON, metadataJSON, err := encodeMessage(data, options.metadata)
+	if err != nil {
 		return err
 	}
-
-	// Generate activity ID for deterministic replay
-	activityID := ctx.GenerateActivityID(fmt.Sprintf("send_to_%s_%s", targetInstanceID, channelName))
-
-	// Check if already sent (replay)
-	if _, ok := ctx.GetCachedResult(activityID); ok {
-		return nil
-	}
-
-	// Serialize data
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to serialize message data: %w", err)
-	}
-
-	// Serialize metadata
-	var metadataJSON []byte
-	if options.metadata != nil {
-		metadataJSON, err = json.Marshal(options.metadata)
-		if err != nil {
-			return fmt.Errorf("failed to serialize message metadata: %w", err)
+	// A recorded effect from workflow code, as Publish is.
+	return runEffectErr(ctx, fmt.Sprintf("send_to_%s_%s", targetInstanceID, channelName), func(c *WorkflowContext) error {
+		if err := enforceChannelCapability(c, storage.CapabilityKindChannelPub, channelName, options.capabilityToken); err != nil {
+			return err
 		}
-	}
-
-	// Publish to direct channel (Edda approach: dynamic channel names)
-	// This ensures only the target instance can receive the message
-	s := ctx.Storage()
-	if s == nil {
-		return fmt.Errorf("storage not available")
-	}
-
-	directChannel := fmt.Sprintf("%s:%s", channelName, targetInstanceID)
-	messageID, err := s.PublishToChannel(ctx.Context(), directChannel, dataJSON, metadataJSON)
-	if err != nil {
-		return fmt.Errorf("failed to send to instance: %w", err)
-	}
-
-	// Wake up the target subscriber (Edda-style: delivery + load balancing)
-	// If in transaction, defer delivery until commit to ensure consistency
-	if s.InTransaction(ctx.Context()) {
-		// Capture variables for closure
-		wfCtx := ctx
-		store := s
-		chName := directChannel
-		msgID := messageID
-		dJSON := dataJSON
-		mJSON := metadataJSON
-
-		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
-			wakeWaitingSubscribers(wfCtx, store, chName, msgID, dJSON, mJSON)
-			return nil
-		})
-	} else {
-		// Deliver immediately
-		wakeWaitingSubscribers(ctx, s, directChannel, messageID, dataJSON, metadataJSON)
-	}
-
-	// Record for replay
-	ctx.SetCachedResult(activityID, true)
-
-	return nil
+		s := c.Storage()
+		if s == nil {
+			return fmt.Errorf("storage not available")
+		}
+		// Publish to the direct channel (Edda approach: dynamic channel
+		// names), which only the target instance receives from.
+		directChannel := fmt.Sprintf("%s:%s", channelName, targetInstanceID)
+		if err := publishAndWake(c, s, directChannel, dataJSON, metadataJSON); err != nil {
+			return fmt.Errorf("failed to send to instance: %w", err)
+		}
+		return nil
+	})
 }
 
 // ========================================
@@ -752,32 +840,45 @@ func GetGroupMembers(ctx context.Context, s storage.Storage, groupName string) (
 // ========================================
 
 // Recur implements Erlang-style tail recursion for workflows.
-// It archives the current workflow's history and starts a new instance
-// with the provided input, maintaining the same instance ID.
+// It archives the current workflow's history and restarts the same
+// instance (same instance ID) with the provided input and a fresh history.
 //
 // This is useful for long-running workflows that need to periodically
 // "reset" their history to prevent unbounded growth.
 //
-// The workflow will:
-// 1. Archive current history to workflow_history_archive
-// 2. Clean up all subscriptions (events, timers, channels, groups)
-// 3. Mark current instance as "recurred"
-// 4. Create a new instance with continued_from set to current instance
-// 5. Start executing with the new input
+// In one transaction that first proves the run still holds the lock, the
+// engine:
+// 1. Archives the current history to workflow_history_archive
+// 2. Cleans up all subscriptions (events, timers, channels) and groups,
+// keeping the broadcast delivery cursors: a channel subscribed again
+// continues after the last message delivered before the recur
+// 3. Drops the registered compensations: a later iteration's failure does
+// not undo an earlier iteration
+// 4. Stores the new input on the instance
+// 5. Marks the instance "recurred"
 //
-// Example:
+// The app then restarts the recurred instance with the new input. A
+// recurred instance counts as alive: monitors get no DOWN for it, and its
+// names, capabilities, tasks and files stay its own.
+//
+// Recur returns its input type; the workflow returns its zero output with
+// the error:
 //
 //	workflow := romancy.DefineWorkflow("counter", func(ctx *romancy.WorkflowContext, input CounterInput) (CounterResult, error) {
 //	    // Process batch
 //	    newCount := input.Count + 1
 //	    if newCount < 1000 {
 //	        // Continue with new input (tail recursion)
-//	        return romancy.Recur(ctx, CounterInput{Count: newCount})
+//	        _, err := romancy.Recur(ctx, CounterInput{Count: newCount})
+//	        return CounterResult{}, err
 //	    }
 //	    return CounterResult{FinalCount: newCount}, nil
 //	})
 func Recur[T any](ctx *WorkflowContext, input T) (T, error) {
 	var zero T
+	if err := ctx.abortedErr(); err != nil {
+		return zero, err
+	}
 
 	// Return SuspendSignal that the replay engine will handle
 	return zero, NewRecurSuspend(ctx.InstanceID(), input)

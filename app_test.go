@@ -11,11 +11,13 @@ import (
 )
 
 func TestHandler(t *testing.T) {
-	app := NewApp(WithDatabase(":memory:"))
+	// A database with the schema: the endpoint checks channel seals before
+	// it accepts an event.
+	app, cleanup := createTestApp(t)
+	defer cleanup()
 	if err := app.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start app: %v", err)
 	}
-	defer func() { _ = app.Shutdown(context.Background()) }()
 
 	handler := app.Handler()
 	if handler == nil {
@@ -111,11 +113,11 @@ func TestHandler(t *testing.T) {
 }
 
 func TestHandlerIntegrationWithServeMux(t *testing.T) {
-	app := NewApp(WithDatabase(":memory:"))
+	app, cleanup := createTestApp(t)
+	defer cleanup()
 	if err := app.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start app: %v", err)
 	}
-	defer func() { _ = app.Shutdown(context.Background()) }()
 
 	// Simulate integration with standard http.ServeMux
 	mainMux := http.NewServeMux()

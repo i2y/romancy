@@ -11,11 +11,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	sqlite3 "modernc.org/sqlite"
 )
 
 // txKey is the context key for transactions.
 type txKey struct{}
+
+// WithoutTransaction returns ctx detached from the transaction it carries,
+// if any. Post-commit callbacks use it: the transaction they were registered
+// in has ended by the time they run.
+func WithoutTransaction(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(txKey{}).(*txState); !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, txKey{}, nil)
+}
 
 // txState holds transaction state including post-commit callbacks.
 type txState struct {
@@ -25,8 +36,11 @@ type txState struct {
 
 // SQLiteStorage implements the Storage interface using SQLite.
 type SQLiteStorage struct {
-	db     *sql.DB
-	driver Driver
+	db *sql.DB
+	// immediate is a second pool on the same database whose transactions
+	// begin IMMEDIATE (see beginImmediate).
+	immediate *sql.DB
+	driver    Driver
 }
 
 // NewSQLiteStorage creates a new SQLite storage.
@@ -38,21 +52,28 @@ func NewSQLiteStorage(dbPath string) (*SQLiteStorage, error) {
 	if dbPath == ":memory:" {
 		connStr = "file::memory:?cache=shared"
 	}
-	connStr += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	const sqliteParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	connStr += "?" + sqliteParams
 
 	// For shared memory, the connection string already has query params, so use & instead of ?
 	if dbPath == ":memory:" {
-		connStr = "file::memory:?cache=shared&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+		connStr = "file::memory:?cache=shared&" + sqliteParams
 	}
 
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+	immediate, err := sql.Open("sqlite", connStr+"&_txlock=immediate")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
 
 	return &SQLiteStorage{
-		db:     db,
-		driver: &SQLiteDriver{},
+		db:        db,
+		immediate: immediate,
+		driver:    &SQLiteDriver{},
 	}, nil
 }
 
@@ -70,7 +91,7 @@ func (s *SQLiteStorage) DB() *sql.DB {
 
 // Close closes the database connection.
 func (s *SQLiteStorage) Close() error {
-	return s.db.Close()
+	return errors.Join(s.immediate.Close(), s.db.Close())
 }
 
 // parseSQLiteTime parses a SQLite datetime TEXT value into time.Time.
@@ -107,6 +128,25 @@ func (s *SQLiteStorage) getConn(ctx context.Context) Executor {
 
 // --- Transaction Manager ---
 
+// sqliteBusy is SQLITE_BUSY (5), the primary code of SQLITE_BUSY_SNAPSHOT
+// (517) and the other extended busy codes.
+const sqliteBusy = 5
+
+// IsWriteConflict reports whether err is SQLite's SQLITE_BUSY or one of its
+// extended codes: the transaction lost the race for the write lock.
+//
+// A deferred transaction that reads before it writes, such as an activity
+// whose body reads first (FSRead, a query through ctx.Session()), holds a
+// read snapshot when it first writes. In WAL mode that write fails at once,
+// without the busy timeout: with SQLITE_BUSY while another connection holds
+// the write lock, and with SQLITE_BUSY_SNAPSHOT once another connection has
+// committed since the snapshot. Waiting inside the transaction cannot help;
+// it can only be rolled back and run again from the start.
+func IsWriteConflict(err error) bool {
+	var sqErr *sqlite3.Error
+	return errors.As(err, &sqErr) && sqErr.Code()&0xff == sqliteBusy
+}
+
 // BeginTransaction starts a new transaction.
 func (s *SQLiteStorage) BeginTransaction(ctx context.Context) (context.Context, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -115,6 +155,25 @@ func (s *SQLiteStorage) BeginTransaction(ctx context.Context) (context.Context, 
 	}
 	state := &txState{tx: tx}
 	return context.WithValue(ctx, txKey{}, state), nil
+}
+
+// beginImmediate begins a transaction that takes the write lock at BEGIN.
+// The kernel's own transactions read before they write (a pending re-check
+// before a wait registration, a candidate scan before a requeue), and a
+// deferred SQLite transaction cannot upgrade to a write once another
+// connection has committed since its read: WAL answers SQLITE_BUSY_SNAPSHOT
+// at once, without the busy timeout. Holding the write lock from BEGIN also
+// keeps a publish from committing between the re-check and the registration.
+// Activity transactions (BeginTransaction) stay deferred: their bodies run
+// user code of any length, and holding the write lock across it would stall
+// every other writer. An activity that hits a snapshot conflict is run again
+// in a new transaction instead (see IsWriteConflict).
+func (s *SQLiteStorage) beginImmediate(ctx context.Context) (context.Context, error) {
+	tx, err := s.immediate.BeginTx(ctx, nil)
+	if err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, txKey{}, &txState{tx: tx}), nil
 }
 
 // CommitTransaction commits the current transaction.
@@ -359,7 +418,8 @@ func (s *SQLiteStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instan
 		UPDATE workflow_instances
 		SET status = ?, updated_at = datetime('now')
 		WHERE instance_id = ? AND locked_by = ?
-	`, status, instanceID, workerID)
+		AND (status = ? OR status NOT IN `+terminalStatusList+`)
+	`, status, instanceID, workerID, status)
 	if err != nil {
 		return err
 	}
@@ -368,7 +428,31 @@ func (s *SQLiteStorage) UpdateInstanceStatusIfLocked(ctx context.Context, instan
 		return err
 	}
 	if affected == 0 {
-		return s.lockLost(ctx, instanceID, workerID)
+		return s.statusWriteRefused(ctx, instanceID, workerID)
+	}
+	return nil
+}
+
+// statusWriteRefused explains a fenced status write that matched no row:
+// ErrLockNotHeld when the caller lost the lock, ErrInstanceTerminated when
+// the instance already terminated, nil when the write was a no-op.
+func (s *SQLiteStorage) statusWriteRefused(ctx context.Context, instanceID, workerID string) error {
+	var lockedBy sql.NullString
+	var status WorkflowStatus
+	err := s.getConn(ctx).QueryRowContext(ctx, `
+		SELECT locked_by, status FROM workflow_instances WHERE instance_id = ?
+	`, instanceID).Scan(&lockedBy, &status)
+	if err == sql.ErrNoRows {
+		return ErrLockNotHeld
+	}
+	if err != nil {
+		return err
+	}
+	if lockedBy.String != workerID {
+		return ErrLockNotHeld
+	}
+	if IsTerminalStatus(status) {
+		return ErrInstanceTerminated
 	}
 	return nil
 }
@@ -457,6 +541,17 @@ func (s *SQLiteStorage) CancelInstance(ctx context.Context, instanceID, reason s
 	}
 	if rows == 0 {
 		return ErrWorkflowNotCancellable
+	}
+	// A cancelled instance never waits again: drop its timers and channel
+	// waits so nothing fires for it later.
+	if _, err := conn.ExecContext(ctx, `DELETE FROM workflow_timer_subscriptions WHERE instance_id = ?`, instanceID); err != nil {
+		return fmt.Errorf("failed to delete timer subscriptions: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `
+		UPDATE channel_subscriptions SET activity_id = NULL, timeout_at = NULL
+		WHERE instance_id = ?
+	`, instanceID); err != nil {
+		return fmt.Errorf("failed to clear channel waits: %w", err)
 	}
 	return nil
 }
@@ -637,11 +732,11 @@ func (s *SQLiteStorage) FindResumableWorkflows(ctx context.Context, workflowName
 // write lock, so no FOR UPDATE is needed; the IN-subquery's row set is
 // evaluated as of the statement, and two concurrent claimants take disjoint
 // sets because a row claimed by the first no longer matches.
-func (s *SQLiteStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, workflowNames []string, leaseSec, limit int) ([]*ResumableWorkflow, error) {
+func (s *SQLiteStorage) ClaimResumableWorkflows(ctx context.Context, workerID string, versions []WorkflowVersion, leaseSec, limit int) ([]*ResumableWorkflow, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	if len(workflowNames) == 0 {
+	if len(versions) == 0 {
 		return nil, nil
 	}
 	conn := s.getConn(ctx)
@@ -649,14 +744,9 @@ func (s *SQLiteStorage) ClaimResumableWorkflows(ctx context.Context, workerID st
 	nowStr := now.Format("2006-01-02 15:04:05")
 	expiresStr := now.Add(time.Duration(leaseSec) * time.Second).Format("2006-01-02 15:04:05")
 
-	placeholders := make([]string, len(workflowNames))
-	for i := range workflowNames {
-		placeholders[i] = "?"
-	}
+	filter, filterArgs := versionFilter(versions, questionMarks)
 	args := []any{workerID, nowStr, expiresStr, nowStr}
-	for _, name := range workflowNames {
-		args = append(args, name)
-	}
+	args = append(args, filterArgs...)
 	args = append(args, limit)
 
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
@@ -666,13 +756,13 @@ func (s *SQLiteStorage) ClaimResumableWorkflows(ctx context.Context, workerID st
 			SELECT instance_id FROM workflow_instances
 			WHERE status = '%s'
 			AND framework = 'go'
-			AND workflow_name IN (%s)
+			AND %s
 			AND (locked_by IS NULL OR locked_by = '' OR datetime(lock_expires_at) < datetime('now'))
 			ORDER BY updated_at ASC
 			LIMIT ?
 		)
 		RETURNING instance_id, workflow_name
-	`, StatusRunning, strings.Join(placeholders, ",")), args...)
+	`, StatusRunning, filter), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1117,6 +1207,13 @@ func (s *SQLiteStorage) AddCompensation(ctx context.Context, entry *Compensation
 	return err
 }
 
+// ClearCompensations removes every compensation registered for the instance.
+func (s *SQLiteStorage) ClearCompensations(ctx context.Context, instanceID string) error {
+	conn := s.getConn(ctx)
+	_, err := conn.ExecContext(ctx, `DELETE FROM workflow_compensations WHERE instance_id = ?`, instanceID)
+	return err
+}
+
 // GetCompensations retrieves compensations for a workflow in LIFO order (by created_at DESC).
 // Uses millisecond-precision timestamps set by AddCompensation for reliable ordering.
 // Status tracking is done via history events (CompensationExecuted, CompensationFailed).
@@ -1166,8 +1263,8 @@ func (s *SQLiteStorage) PublishToChannel(ctx context.Context, channelName string
 		metadataStr = sql.NullString{String: string(metadata), Valid: true}
 	}
 
-	// Generate UUID for message_id
-	msgID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().UnixNano()%1000000)
+	// Generate UUID for message_id (UNIQUE; a clock-derived id can collide)
+	msgID := uuid.New().String()
 
 	result, err := conn.ExecContext(ctx, `
 		INSERT INTO channel_messages (channel, data, metadata, message_id, data_type)
@@ -1278,7 +1375,7 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 	var needTx bool
 	if !s.InTransaction(ctx) {
 		var err error
-		ctx, err = s.BeginTransaction(ctx)
+		ctx, err = s.beginImmediate(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -1300,12 +1397,15 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 		return false, err
 	}
 	if pending {
-		_, err = conn.ExecContext(ctx, `
+		res, err := conn.ExecContext(ctx, `
 			UPDATE workflow_instances
 			SET locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = datetime('now')
 			WHERE instance_id = ? AND locked_by = ?
 		`, instanceID, workerID)
 		if err != nil {
+			return false, err
+		}
+		if err := heldByCaller(res); err != nil {
 			return false, err
 		}
 		if needTx {
@@ -1315,6 +1415,24 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 			needTx = false
 		}
 		return false, nil
+	}
+
+	// Suspend and release first, fenced on the caller's lock: a run that lost
+	// its lease must not overwrite the live run's wait registration.
+	res, err := conn.ExecContext(ctx, `
+		UPDATE workflow_instances
+		SET status = ?, locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = datetime('now')
+		WHERE instance_id = ? AND locked_by = ?
+		AND status NOT IN `+terminalStatusList+`
+	`, StatusWaitingForMessage, instanceID, workerID)
+	if err != nil {
+		return false, err
+	}
+	if err := heldByCaller(res); err != nil {
+		if refused := s.statusWriteRefused(ctx, instanceID, workerID); refused != nil {
+			return false, refused
+		}
+		return false, err
 	}
 
 	// Update subscription to set activity_id (non-null = waiting state)
@@ -1327,16 +1445,6 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 		SET timeout_at = ?, activity_id = ?
 		WHERE instance_id = ? AND channel = ?
 	`, timeoutStr, activityID, instanceID, channelName)
-	if err != nil {
-		return false, err
-	}
-
-	// Update instance status and release the lock
-	_, err = conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET status = ?, locked_by = NULL, locked_at = NULL, lock_expires_at = NULL, updated_at = datetime('now')
-		WHERE instance_id = ? AND locked_by = ?
-	`, StatusWaitingForMessage, instanceID, workerID)
 	if err != nil {
 		return false, err
 	}
@@ -1402,43 +1510,100 @@ func (s *SQLiteStorage) hasPendingChannelMessage(ctx context.Context, instanceID
 }
 
 func (s *SQLiteStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int, error) {
+	var needTx bool
+	if !s.InTransaction(ctx) {
+		var err error
+		ctx, err = s.beginImmediate(ctx)
+		if err != nil {
+			return 0, err
+		}
+		needTx = true
+		defer func() {
+			if needTx {
+				_ = s.RollbackTransaction(ctx)
+			}
+		}()
+	}
 	conn := s.getConn(ctx)
-	res, err := conn.ExecContext(ctx, `
-		UPDATE workflow_instances
-		SET status = ?, updated_at = datetime('now')
-		WHERE status = ? AND locked_by IS NULL
-		AND instance_id IN (
-			SELECT s.instance_id FROM channel_subscriptions s
-			WHERE s.activity_id IS NOT NULL AND s.activity_id != ''
-			AND (
-				(s.mode = ? AND EXISTS (
-					SELECT 1 FROM channel_messages m
-					LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
-					LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
-					WHERE m.channel = s.channel AND (
-						c.message_id IS NULL
-						OR c.instance_id = s.instance_id
-						OR c.claimed_at < ?
-						OR ci.status IN ('completed', 'failed', 'cancelled')
-					)
-				))
-				OR
-				(s.mode != ? AND EXISTS (
-					SELECT 1 FROM channel_messages m
-					LEFT JOIN channel_delivery_cursors dc
-						ON dc.instance_id = s.instance_id AND dc.channel = s.channel
-					WHERE m.channel = s.channel AND m.id > COALESCE(dc.last_delivered_id, 0)
-				))
-			)
+
+	// Candidates first, then a conditional flip per instance: an UPDATE of
+	// workflow_instances cannot read workflow_instances in its own subquery
+	// on MySQL (error 1093), and the flipped instance's wait is cleared with
+	// it so its stale activity id and deadline cannot fire later.
+	stale := time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second).Format("2006-01-02 15:04:05")
+	rows, err := conn.QueryContext(ctx, `
+		SELECT DISTINCT w.instance_id
+		FROM workflow_instances w
+		JOIN channel_subscriptions s ON s.instance_id = w.instance_id
+		WHERE w.status = ? AND w.locked_by IS NULL
+		AND s.activity_id IS NOT NULL AND s.activity_id != ''
+		AND (
+			(s.mode = ? AND EXISTS (
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
+				LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
+				WHERE m.channel = s.channel AND (
+					c.message_id IS NULL
+					OR c.instance_id = s.instance_id
+					OR c.claimed_at < ?
+					OR ci.status IN `+terminalStatusList+`
+				)
+			))
+			OR
+			(s.mode != ? AND EXISTS (
+				SELECT 1 FROM channel_messages m
+				LEFT JOIN channel_delivery_cursors dc
+					ON dc.instance_id = s.instance_id AND dc.channel = s.channel
+				WHERE m.channel = s.channel AND m.id > COALESCE(dc.last_delivered_id, 0)
+			))
 		)
-	`, StatusRunning, StatusWaitingForMessage, string(ChannelModeCompeting),
-		time.Now().UTC().Add(-ChannelClaimStaleSeconds*time.Second).Format("2006-01-02 15:04:05"),
-		string(ChannelModeCompeting))
+	`, StatusWaitingForMessage, string(ChannelModeCompeting), stale, string(ChannelModeCompeting))
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	return int(n), err
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	requeued := 0
+	for _, id := range ids {
+		res, err := conn.ExecContext(ctx, `
+			UPDATE workflow_instances SET status = ?, updated_at = datetime('now')
+			WHERE instance_id = ? AND status = ? AND locked_by IS NULL
+		`, StatusRunning, id, StatusWaitingForMessage)
+		if err != nil {
+			return 0, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return 0, err
+		} else if n == 0 {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE channel_subscriptions SET activity_id = NULL, timeout_at = NULL
+			WHERE instance_id = ?
+		`, id); err != nil {
+			return 0, err
+		}
+		requeued++
+	}
+
+	if needTx {
+		if err := s.CommitTransaction(ctx); err != nil {
+			return 0, err
+		}
+		needTx = false
+	}
+	return requeued, nil
 }
 
 // GetPendingChannelMessages retrieves pending messages for a channel after a given ID.
@@ -1739,6 +1904,25 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	workerID string,
 	lockTimeoutSec int,
 ) (*ChannelDeliveryResult, error) {
+	// One transaction: the claim, the receive record, the consume-delete, the
+	// cursor and the status flip land together or not at all. A crash in
+	// between must not leave a consumed message without its receive, or a
+	// recorded receive whose wait is still open to a second message.
+	if !s.InTransaction(ctx) {
+		txCtx, err := s.beginImmediate(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := s.DeliverChannelMessageWithLock(txCtx, instanceID, channelName, message, workerID, lockTimeoutSec)
+		if err != nil || res == nil {
+			_ = s.RollbackTransaction(txCtx)
+			return res, err
+		}
+		if err := s.CommitTransaction(txCtx); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 	conn := s.getConn(ctx)
 
 	// Step 1: Try to acquire lock (Lock-First pattern)
@@ -1753,9 +1937,10 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 
 	// Step 2: Get workflow info and subscription activity ID
 	var workflowName string
+	var status WorkflowStatus
 	err = conn.QueryRowContext(ctx, `
-		SELECT workflow_name FROM workflow_instances WHERE instance_id = ?
-	`, instanceID).Scan(&workflowName)
+		SELECT workflow_name, status FROM workflow_instances WHERE instance_id = ?
+	`, instanceID).Scan(&workflowName, &status)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to get workflow info: %w", err)
@@ -1767,13 +1952,18 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 		SELECT COALESCE(activity_id, ''), mode FROM channel_subscriptions
 		WHERE instance_id = ? AND channel = ?
 	`, instanceID, channelName).Scan(&historyActivityID, &subscriptionMode)
-	if err != nil {
+	if err != nil && err != sql.ErrNoRows {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to get subscription info: %w", err)
 	}
-	// Fallback to legacy format if no activity ID stored
-	if historyActivityID == "" {
-		historyActivityID = fmt.Sprintf("channel:%s:%d", channelName, message.ID)
+	// Only a subscriber that is waiting on this channel takes the message:
+	// the history slot it fills is that wait's activity id. Anyone else —
+	// resumed in the meantime, terminated, never waiting — leaves the message
+	// pending for its next Receive instead of having it recorded where no
+	// Receive will ever read it (and, in competing mode, deleted).
+	if status != StatusWaitingForMessage || historyActivityID == "" {
+		_ = s.ReleaseLock(ctx, instanceID, workerID)
+		return nil, nil
 	}
 
 	// For competing mode, claim the message for this instance first so other
@@ -1856,8 +2046,8 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	// Step 5: Update status to 'running'
 	_, err = conn.ExecContext(ctx, `
 		UPDATE workflow_instances SET status = ?, updated_at = datetime('now')
-		WHERE instance_id = ?
-	`, StatusRunning, instanceID)
+		WHERE instance_id = ? AND status = ?
+	`, StatusRunning, instanceID, StatusWaitingForMessage)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, instanceID, workerID)
 		return nil, fmt.Errorf("failed to update status: %w", err)
@@ -2047,10 +2237,11 @@ func (s *SQLiteStorage) ArchiveHistory(ctx context.Context, instanceID string) e
 
 	// Copy to archive
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO workflow_history_archive (original_id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, original_created_at)
-		SELECT id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at
+		INSERT INTO workflow_history_archive (instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at)
+		SELECT instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at
 		FROM workflow_history
 		WHERE instance_id = ?
+		ORDER BY id
 	`, instanceID)
 	if err != nil {
 		return err
@@ -2067,10 +2258,10 @@ func (s *SQLiteStorage) ArchiveHistory(ctx context.Context, instanceID string) e
 func (s *SQLiteStorage) GetArchivedHistory(ctx context.Context, instanceID string) ([]*ArchivedHistoryEvent, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, original_id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, original_created_at, archived_at
+		SELECT id, instance_id, activity_id, event_type, event_data, event_data_binary, data_type, created_at, archived_at
 		FROM workflow_history_archive
 		WHERE instance_id = ?
-		ORDER BY original_id ASC
+		ORDER BY id ASC
 	`, instanceID)
 	if err != nil {
 		return nil, err
@@ -2081,14 +2272,10 @@ func (s *SQLiteStorage) GetArchivedHistory(ctx context.Context, instanceID strin
 	for rows.Next() {
 		var e ArchivedHistoryEvent
 		var eventData sql.NullString
-		var originalID sql.NullInt64
 		var originalCreatedAtStr, archivedAtStr sql.NullString
-		err := rows.Scan(&e.ID, &originalID, &e.InstanceID, &e.ActivityID, &e.EventType, &eventData, &e.EventDataBinary, &e.DataType, &originalCreatedAtStr, &archivedAtStr)
+		err := rows.Scan(&e.ID, &e.InstanceID, &e.ActivityID, &e.EventType, &eventData, &e.EventDataBinary, &e.DataType, &originalCreatedAtStr, &archivedAtStr)
 		if err != nil {
 			return nil, err
-		}
-		if originalID.Valid {
-			e.OriginalID = originalID.Int64
 		}
 		if eventData.Valid {
 			e.EventData = []byte(eventData.String)
@@ -2135,16 +2322,39 @@ func (s *SQLiteStorage) CleanupInstanceSubscriptions(ctx context.Context, instan
 // Actor Registry
 // ========================================
 
+// RegisterActorName binds name to instanceID. Registering a name the
+// instance already holds succeeds (SEMANTICS §6: registration is
+// idempotent); a name bound to another instance answers ErrActorNameTaken.
 func (s *SQLiteStorage) RegisterActorName(ctx context.Context, name, instanceID, framework string) error {
-	_, err := s.getConn(ctx).ExecContext(ctx, `
+	conn := s.getConn(ctx)
+	if _, err := conn.ExecContext(ctx, `
 		INSERT INTO actor_names (name, instance_id, framework) VALUES (?, ?, ?)
-	`, name, instanceID, framework)
-	return err
+		ON CONFLICT (name) DO NOTHING
+	`, name, instanceID, framework); err != nil {
+		return err
+	}
+	var holder string
+	err := conn.QueryRowContext(ctx, `SELECT instance_id FROM actor_names WHERE name = ?`, name).Scan(&holder)
+	if err != nil {
+		return err
+	}
+	if holder != instanceID {
+		return fmt.Errorf("%w: %q is bound to %s", ErrActorNameTaken, name, holder)
+	}
+	return nil
 }
 
 func (s *SQLiteStorage) UnregisterActorName(ctx context.Context, name string) error {
 	_, err := s.getConn(ctx).ExecContext(ctx, `DELETE FROM actor_names WHERE name = ?`, name)
 	return err
+}
+
+func (s *SQLiteStorage) UnregisterOwnActorName(ctx context.Context, name, owner string) error {
+	return deleteOwned(ctx, s.getConn(ctx), s.driver.Placeholder, "actor_names", "name", "instance_id", name, owner)
+}
+
+func (s *SQLiteStorage) RevokeOwnCapability(ctx context.Context, capabilityID, owner string) error {
+	return deleteOwned(ctx, s.getConn(ctx), s.driver.Placeholder, "actor_capabilities", "id", "granted_by", capabilityID, owner)
 }
 
 func (s *SQLiteStorage) WhereisActor(ctx context.Context, name string) (string, error) {
@@ -2184,8 +2394,7 @@ func (s *SQLiteStorage) EmitActorDownForTerminated(ctx context.Context) (int, er
 		SELECT m.id, m.target_instance_id, m.channel, w.status
 		FROM actor_monitors m
 		JOIN workflow_instances w ON w.instance_id = m.target_instance_id
-		WHERE w.status IN ('completed', 'failed', 'cancelled', 'recurred')
-	`)
+		WHERE w.status IN `+terminalStatusList)
 	if err != nil {
 		return 0, err
 	}
@@ -2196,7 +2405,6 @@ func (s *SQLiteStorage) EmitActorDownForTerminated(ctx context.Context) (int, er
 		status   string
 	}
 	var monitors []monitorRow
-	targetSet := map[string]bool{}
 	for rows.Next() {
 		var m monitorRow
 		if err := rows.Scan(&m.id, &m.targetID, &m.channel, &m.status); err != nil {
@@ -2204,29 +2412,37 @@ func (s *SQLiteStorage) EmitActorDownForTerminated(ctx context.Context) (int, er
 			return 0, err
 		}
 		monitors = append(monitors, m)
-		targetSet[m.targetID] = true
 	}
 	_ = rows.Close()
 
+	emitted := 0
 	for _, m := range monitors {
-		payload := fmt.Sprintf(`{"type":"DOWN","actor":%q,"status":%q}`, m.targetID, m.status)
-		msgID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), m.id)
+		// Consume the monitor first: of two overlapping sweeps only the one
+		// whose delete takes the row emits the DOWN.
+		res, err := tx.ExecContext(ctx, `DELETE FROM actor_monitors WHERE id = ?`, m.id)
+		if err != nil {
+			return 0, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return 0, err
+		} else if n == 0 {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO channel_messages (channel, data, message_id, data_type)
 			VALUES (?, ?, ?, 'json')
-		`, m.channel, payload, msgID); err != nil {
+		`, m.channel, downPayload(m.targetID, m.status), "down-"+uuid.New().String()); err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM actor_monitors WHERE id = ?`, m.id); err != nil {
-			return 0, err
-		}
+		emitted++
 	}
-	for targetID := range targetSet {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM actor_names WHERE instance_id = ?`, targetID); err != nil {
-			return 0, err
-		}
+	// A terminated actor's names are freed whether or not anyone monitored it.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM actor_names WHERE instance_id IN (
+			SELECT instance_id FROM workflow_instances WHERE status IN `+terminalStatusList+`)`); err != nil {
+		return 0, err
 	}
-	return len(monitors), tx.Commit()
+	return emitted, tx.Commit()
 }
 
 // ========================================
@@ -2399,20 +2615,21 @@ func (s *SQLiteStorage) GetBlobInfo(ctx context.Context, hash string) (*BlobInfo
 	if err != nil {
 		return nil, err
 	}
-	switch v := rawCreatedAt.(type) {
-	case time.Time:
-		info.CreatedAt = v.UTC().Format(time.RFC3339)
-	case string:
-		info.CreatedAt = v
-	case []byte:
-		info.CreatedAt = string(v)
-	}
+	info.CreatedAt = canonicalTSFrom(rawCreatedAt)
 	return &info, nil
 }
 
 func (s *SQLiteStorage) DeleteExpiredCapabilities(ctx context.Context) (int64, error) {
-	res, err := s.getConn(ctx).ExecContext(ctx,
-		`DELETE FROM actor_capabilities WHERE expires_at IS NOT NULL AND expires_at <= ?1`,
+	res, err := s.getConn(ctx).ExecContext(ctx, `
+		DELETE FROM actor_capabilities
+		WHERE expires_at IS NOT NULL AND expires_at <= ?1
+		  AND EXISTS (
+			SELECT 1 FROM actor_capabilities o
+			WHERE o.kind = actor_capabilities.kind AND o.target = actor_capabilities.target
+			  AND o.id <> actor_capabilities.id
+			  AND (o.expires_at IS NULL OR o.expires_at > ?1
+			       OR o.created_at > actor_capabilities.created_at
+			       OR (o.created_at = actor_capabilities.created_at AND o.id > actor_capabilities.id)))`,
 		canonicalTS(time.Now()))
 	if err != nil {
 		return 0, err
@@ -2428,15 +2645,14 @@ func (s *SQLiteStorage) PostTask(ctx context.Context, task *ActorTask) error {
 	if err != nil {
 		return err
 	}
-	return s.publishTaskNotice(ctx, task.Channel, fmt.Sprintf(
-		`{"type":"task_posted","task_id":%q,"channel":%q}`, task.ID, task.Channel))
+	return s.publishTaskNotice(ctx, task.Channel, taskPostedNotice(task.ID, task.Channel))
 }
 
 // publishTaskNotice appends an event to the channel's task-event stream
 // ({channel}:tasks). Runs on the caller's conn so it joins an enclosing
 // transaction when present.
 func (s *SQLiteStorage) publishTaskNotice(ctx context.Context, channel, dataJSON string) error {
-	msgID := fmt.Sprintf("task-notice-%d-%d", time.Now().UnixNano(), time.Now().UnixNano()%1000000)
+	msgID := "task-notice-" + uuid.New().String()
 	_, err := s.getConn(ctx).ExecContext(ctx, `
 		INSERT INTO channel_messages (channel, data, message_id, data_type)
 		VALUES (?1, ?2, ?3, 'json')`,
@@ -2463,15 +2679,29 @@ func (s *SQLiteStorage) GetTask(ctx context.Context, taskID string) (*ActorTask,
 }
 
 func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string) (*ActorTask, error) {
+	conn := s.getConn(ctx)
+	// Optimistic claim: pick the oldest open task, then take it with a
+	// conditional UPDATE — exactly one claimant wins (spec/TaskClaim.tla) and
+	// the winner knows which row it took. A claimant that lost the race
+	// retries against the next oldest task.
 	for range 3 {
-		res, err := s.getConn(ctx).ExecContext(ctx, `
-			UPDATE actor_tasks SET state = 'claimed', claimed_by = ?1, updated_at = ?2,
-				claimed_at = ?2, attempts = attempts + 1
-			WHERE id = (
-				SELECT id FROM (SELECT id FROM actor_tasks
-					WHERE channel = ?3 AND state = 'open' ORDER BY created_at LIMIT 1) _t
-			) AND state = 'open'`,
-			claimant, time.Now().UTC(), channel)
+		var id string
+		err := conn.QueryRowContext(ctx, `
+			SELECT id FROM actor_tasks
+			WHERE channel = ? AND state = 'open'
+			ORDER BY created_at, id LIMIT 1`, channel).Scan(&id)
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		now := time.Now().UTC()
+		res, err := conn.ExecContext(ctx, `
+			UPDATE actor_tasks SET state = 'claimed', claimed_by = ?, claimed_at = ?,
+				attempts = attempts + 1, updated_at = ?
+			WHERE id = ? AND state = 'open'`,
+			claimant, now, now, id)
 		if err != nil {
 			return nil, err
 		}
@@ -2480,26 +2710,19 @@ func (s *SQLiteStorage) ClaimTask(ctx context.Context, channel, claimant string)
 			return nil, err
 		}
 		if n == 0 {
-			continue
+			continue // another claimant took it first
 		}
-		var t ActorTask
-		var claimedBy, result sql.NullString
-		err = s.getConn(ctx).QueryRowContext(ctx, `
-			SELECT id, channel, COALESCE(data, ''), claimed_by, COALESCE(result, ''), attempts
-			FROM actor_tasks WHERE channel = ?3 AND claimed_by = ?1 AND state = 'claimed'
-			ORDER BY updated_at DESC LIMIT 1`, claimant, claimant, channel).Scan(
-			&t.ID, &t.Channel, &t.Data, &claimedBy, &result, &t.Attempts)
+		t, err := s.GetTask(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		t.State = "claimed"
-		t.ClaimedBy = claimedBy.String
-		t.Result = []byte(result.String)
-		if err := s.publishTaskNotice(ctx, channel, fmt.Sprintf(
-			`{"type":"task_claimed","task_id":%q,"claimed_by":%q}`, t.ID, claimant)); err != nil {
+		if t == nil {
+			return nil, fmt.Errorf("claimed task %s vanished", id)
+		}
+		if err := s.publishTaskNotice(ctx, channel, taskClaimedNotice(id, claimant)); err != nil {
 			return nil, err
 		}
-		return &t, nil
+		return t, nil
 	}
 	return nil, nil
 }
@@ -2520,15 +2743,20 @@ func (s *SQLiteStorage) CompleteTask(ctx context.Context, taskID, claimant strin
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return ErrTaskConflict
-	}
 	task, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return err
 	}
-	return s.publishTaskNotice(ctx, task.Channel, fmt.Sprintf(
-		`{"type":"task_state","task_id":%q,"state":%q}`, taskID, state))
+	if n == 0 {
+		if task == nil {
+			return ErrTaskNotFound
+		}
+		if task.ClaimedBy == claimant && task.State == state {
+			return nil // already settled by this claimant: a re-executed step
+		}
+		return ErrTaskConflict
+	}
+	return s.publishTaskNotice(ctx, task.Channel, taskStateNotice(taskID, state))
 }
 
 func (s *SQLiteStorage) ReclaimStaleTasks(ctx context.Context, maxAge time.Duration) (int64, error) {
@@ -2553,7 +2781,7 @@ func (s *SQLiteStorage) ListTasks(ctx context.Context, channel, state string) ([
 		query += ` AND state = ?2`
 		args = append(args, state)
 	}
-	query += ` ORDER BY created_at`
+	query += ` ORDER BY created_at, id`
 	rows, err := s.getConn(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -2571,13 +2799,28 @@ func (s *SQLiteStorage) ListTasks(ctx context.Context, channel, state string) ([
 }
 
 func (s *SQLiteStorage) ChannelMessagesSince(ctx context.Context, channel, messageID string) ([]*ChannelMessage, error) {
+	if messageID == "" {
+		return s.ChannelMessagesAfter(ctx, channel, 0)
+	}
+	var cursor int64
+	err := s.getConn(ctx).QueryRowContext(ctx,
+		`SELECT id FROM channel_messages WHERE channel = ?1 AND message_id = ?2`, channel, messageID).Scan(&cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s on %s", ErrCursorNotFound, messageID, channel)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.ChannelMessagesAfter(ctx, channel, cursor)
+}
+
+func (s *SQLiteStorage) ChannelMessagesAfter(ctx context.Context, channel string, afterID int64) ([]*ChannelMessage, error) {
 	rows, err := s.getConn(ctx).QueryContext(ctx, `
 		SELECT id, channel, message_id, data_type, COALESCE(data, ''), data_binary, metadata, published_at
 		FROM channel_messages
-		WHERE channel = ?1
-		  AND id > COALESCE((SELECT id FROM channel_messages WHERE message_id = ?2), 0)
+		WHERE channel = ?1 AND id > ?2
 		ORDER BY id`,
-		channel, messageID)
+		channel, afterID)
 	if err != nil {
 		return nil, err
 	}

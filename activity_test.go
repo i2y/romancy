@@ -258,7 +258,9 @@ func TestActivity_executeWithRetry_SuccessOnFirstTry(t *testing.T) {
 	ctx := context.Background()
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", nil, false)
 
-	result, err := activity.executeWithRetry(wfCtx, "input", "test:1")
+	result, err := activity.executeWithRetry(wfCtx, "test:1", func() (string, error) {
+		return activity.runBody(wfCtx, "input")
+	})
 
 	require.NoError(t, err)
 	assert.Equal(t, "success", result)
@@ -281,7 +283,9 @@ func TestActivity_executeWithRetry_SuccessAfterRetries(t *testing.T) {
 	ctx := context.Background()
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", nil, false)
 
-	result, err := activity.executeWithRetry(wfCtx, "input", "test:1")
+	result, err := activity.executeWithRetry(wfCtx, "test:1", func() (string, error) {
+		return activity.runBody(wfCtx, "input")
+	})
 
 	require.NoError(t, err)
 	assert.Equal(t, "success", result)
@@ -301,7 +305,9 @@ func TestActivity_executeWithRetry_ExhaustedRetries(t *testing.T) {
 	ctx := context.Background()
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", nil, false)
 
-	result, err := activity.executeWithRetry(wfCtx, "input", "test:1")
+	result, err := activity.executeWithRetry(wfCtx, "test:1", func() (string, error) {
+		return activity.runBody(wfCtx, "input")
+	})
 
 	require.Error(t, err)
 	assert.Empty(t, result)
@@ -326,7 +332,9 @@ func TestActivity_executeWithRetry_TerminalErrorNoRetry(t *testing.T) {
 	ctx := context.Background()
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", nil, false)
 
-	result, err := activity.executeWithRetry(wfCtx, "input", "test:1")
+	result, err := activity.executeWithRetry(wfCtx, "test:1", func() (string, error) {
+		return activity.runBody(wfCtx, "input")
+	})
 
 	require.Error(t, err)
 	assert.Empty(t, result)
@@ -350,7 +358,9 @@ func TestActivity_executeWithRetry_ContextCancellation(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := activity.executeWithRetry(wfCtx, "input", "test:1")
+	_, err := activity.executeWithRetry(wfCtx, "test:1", func() (string, error) {
+		return activity.runBody(wfCtx, "input")
+	})
 
 	require.Error(t, err)
 	assert.Equal(t, context.Canceled, err)
@@ -373,7 +383,9 @@ func TestActivity_executeWithRetry_Timeout(t *testing.T) {
 	ctx := context.Background()
 	wfCtx := NewWorkflowContext(ctx, "inst-1", "worker-1", "workflow", nil, false)
 
-	_, err := activity.executeWithRetry(wfCtx, "input", "test:1")
+	_, err := activity.executeWithRetry(wfCtx, "test:1", func() (string, error) {
+		return activity.runBody(wfCtx, "input")
+	})
 
 	require.Error(t, err)
 }

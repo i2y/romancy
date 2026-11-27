@@ -217,7 +217,6 @@ type ChannelDeliveryResult struct {
 // ArchivedHistoryEvent represents an archived history event (from recur).
 type ArchivedHistoryEvent struct {
 	ID                int64            `json:"id"`
-	OriginalID        int64            `json:"original_id"`
 	InstanceID        string           `json:"instance_id"`
 	ActivityID        string           `json:"activity_id"`
 	EventType         HistoryEventType `json:"event_type"`

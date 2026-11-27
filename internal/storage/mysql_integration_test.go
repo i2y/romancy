@@ -57,32 +57,6 @@ func setupMySQLContainer(t *testing.T) (*MySQLStorage, func()) {
 	return store, cleanup
 }
 
-func cleanupMySQLTables(t *testing.T, store *MySQLStorage) {
-	t.Helper()
-	ctx := context.Background()
-
-	tables := []string{
-		"channel_message_claims",
-		"channel_delivery_cursors",
-		"channel_subscriptions",
-		"channel_messages",
-		"workflow_group_memberships",
-		"outbox_events",
-		"workflow_compensations",
-		"workflow_timer_subscriptions",
-		"workflow_history_archive",
-		"workflow_history",
-		"workflow_instances",
-		"system_locks",
-	}
-
-	for _, table := range tables {
-		if _, err := store.db.ExecContext(ctx, "DELETE FROM "+table); err != nil {
-			t.Logf("Warning: failed to clean table %s: %v", table, err)
-		}
-	}
-}
-
 func TestMySQLIntegration_Initialize(t *testing.T) {
 	store, cleanup := setupMySQLContainer(t)
 	defer cleanup()
