@@ -158,7 +158,7 @@ actor_capabilities(
 **タスク実行と one_for_all の兄弟リスタートは at-least-once。**
 
 - タスクの claim には heartbeat がないため、300 秒を超える正規の実行は reclaim され、別ワーカーが**同じ仕事を再実行しうる**。完了書き込みは `claimed_by` の fence で守られる（DB 行の clobber は起きない — `schema/spec/TaskReclaim.tla`）が、副作用の二重実行は防げない。**タスクハンドラは冪等に書くこと**
-- one_for_all の cancel は協調的（子が観察して止まる方式）で race window がある。cancel が間に合わず兄弟が正常終了した場合でも新世代は spawn される（`schema/spec/SupervisorRestart.tla` — 信頼できる cancel がある場合のみ「completed は二度と起動しない」が保証される）。**子アクターの副作用も冪等であること**
+- one_for_all / rest_for_one で生きている兄弟を止める cancel は**条件付き**（2026-11-26 修正）。cancel が間に合わず兄弟が先に終わっていた場合は、実際のステータスに restart mode を適用する（正常終了した transient/temporary は再起動しない、permanent は再起動する）。終端ステータスは吸収的なので、cancel 済みの子が復活することもない。修正前は cancel の拒否を無視して新世代を spawn していた。なお `schema/spec/SupervisorRestart.tla` の「信頼できる cancel が必要」という説明は仕組みを取り違えていて、必要なのは「0 行なら respawn しない条件付き cancel」と「終端の吸収性」の 2 つ（下記 TLA+ レビュー参照）。**子アクターの副作用は at-least-once のままなので冪等であること**
 
 ---
 
@@ -197,6 +197,67 @@ ALTER TABLE workflow_instances ADD COLUMN sandboxed INTEGER NOT NULL DEFAULT 0;
 
 - Recur / トランザクショナル publish / saga 補償の TLA+ モデル未作成
 - タスクの heartbeat/renewal なし — 300s 超タスクは二重実行しうる（at-least-once、TaskReclaim.tla で証明済み）
-- one_for_all cancel race は設計固有（SupervisorRestart.tla）— 信頼できる cancel が必要なら別途設計
+- ~~one_for_all cancel race は設計固有（SupervisorRestart.tla）— 信頼できる cancel が必要なら別途設計~~ → 2026-11-26 解消（条件付き cancel + 終端ステータスの吸収性。「重要な利用上の注意」参照）
 - edda の test_cross_language_channel は環境依存 flake
+
+
+---
+
+## 実装状況アップデート（2026-11-26、2026-11-25 実装分のレビュー後）
+
+2026-11-25 時点で「実装済み」とした機能には、3 言語とも正しさの穴が多数あった。主なものは次のとおり。
+
+- workflow コードから呼んだプリミティブがリプレイのたびに再実行される（§2 違反）
+- PG/MySQL で動かない SQL（MySQL の `?N` プレースホルダ、PG の型推論エラーなど）
+- セッション TZ やホスト TZ に依存する時刻比較（shikibu は JST ホストでしか正しく動かなかった）
+- リースを失った run による書き込み、終了済みインスタンスの復活
+
+レビューでこれらを修正し、SQLite/PG/MySQL で回帰テストを追加した。修正後に 3 言語で共通になったカーネル規則：
+
+| 規則 | 内容 |
+|---|---|
+| プリミティブは記録付きステップ | workflow コードから呼ぶ名前・monitor・capability・task・チャネル読み取り・publish/send_to は 1 回だけ実行し、結果をエラーも含めて履歴に記録する。リプレイは記録を返す。activity 本体の中では直接実行する（activity が記録の単位） |
+| 副作用は fenced transaction | ロック証明（lease を延長する条件付き UPDATE）→ 副作用 → 記録を 1 トランザクションで行う。リースを失った run は何も適用しない。失敗した副作用はロールバックし、エラーだけを別に記録する。ロック喪失とキャンセルは記録しない |
+| 終端ステータスは吸収的 | completed/failed/cancelled から他のステータスへは戻らない。古いタイマー・待機・配信では復活しない |
+| 待機登録は fenced | `locked_by` 一致を条件に登録する。requeue は status と待機（activity_id/timeout_at）を同時に消す。receive タイムアウトは待機が変わっていないときだけ発火する |
+| competing の消費は原子的 | メッセージ行をロックしてから claim し、claim・受信記録・削除を 1 トランザクションで行う。配信は待機登録済みの購読者にだけ行う |
+| 封印は direct の物理名にも及ぶ | チャネル `ch` の grant は `ch:{instance}` にも効く |
+| DOWN は 1 回 | スイープは monitor 行の削除に成功したときだけ DOWN を出す。名前は、終了したインスタンスのものを monitor の有無にかかわらず解放する |
+| supervisor | 各周期の終わりに poll 間隔だけ待つ（romancy は DOWN で早めに起きる Receive のタイムアウト、edda/shikibu は sleep）。生きている子は条件付き cancel で止め、拒否されたら実ステータスを読み直して restart mode を適用する |
+| 時刻は UTC | PG/MySQL のセッション TZ を UTC に固定し、アプリ側も UTC で書く（edda は EddaApp が作るエンジンのみ）。romancy の MySQL 接続は加えて `clientFoundRows=true` を付ける（同一秒の再取得・refresh を「0 行 = 喪失」と誤判定しないため） |
+| Recur は 1 トランザクション | romancy はロック証明つきで archive・購読/グループの掃除・入力更新・recurred 化をまとめる。shikibu はロック証明つきで archive・recurred 化・後継インスタンスの作成をまとめる（旧 ID の購読行は残るが、recurred には配信されないので実害はない）。edda は下記の差異を参照 |
+
+### 3 言語で残っている差異
+
+- **名前の重複エラー**：romancy は `ErrActorNameTaken`、edda は `ValueError`、shikibu は `ActorNameTakenError`（記録されるコードはどれも `actor_name_taken`）
+- **cancel 後の書き込み**：edda は cancel で `locked_by` を消すので `LockLostError`、romancy は残すので `ErrInstanceTerminated`
+
+### TLA+ スイート（schema/spec）のレビュー結果
+
+判定は「部分的に妥当」。TLC が実際に回るモデルの安全性の議論は正しいが、主張ほど強くない。
+
+- 19 config のうち 3 つは演算子の優先順位と `UNCHANGED` の誤りで TLC が評価できず、1 つ（ActorFS_new）は自分の liveness 性質に違反する。コメントの「verified」は Go checker の結果だった
+- CI は 6 config しか回さず、終了コードを `|| true` で捨てて grep で判定しているので、上の失敗を検出できない
+- EpochFencing は worker ごとに資格情報が 1 つなので、エポックの存在理由である「同じ worker の再取得」を表現できない
+- CompetingMessageClaim は consume を 1 ステップにまとめていて、「高々 1 回」が構造上自明になっている。実装は複数の文に分かれていて、そこにバグがあった
+- WaitRegistration はステータスと待機登録を 1 変数にまとめていて、requeue の掃除漏れが見えない
+- 空虚な性質（TaskReclaim の `SingleWriter` など）と、Go checker と TLC の状態数のずれがある
+
+修正パッチと新しいモデル（EpochFencingRuns、CompetingMessageClaimSplit、WaitRegistrationSub、SupervisorRestartCAS ほか）は 2026-11-27 に schema に適用した。CI は `spec/tlc-matrix.txt` の全 config（55 個）を TLC の終了コードで判定し、tla2tools のバージョンとチェックサムを固定する。
+
+### 2026-11-27 の決定（SEMANTICS.md に反映し、3 言語で実装）
+
+| 項目 | 決定 |
+|---|---|
+| Recur のアイデンティティ | 3 言語とも同じ ID で続く。archive・購読/タイマー/グループの掃除・補償の登録の削除・入力更新・recurred 化をロック証明つきの 1 トランザクションで行い、broadcast の配信カーソルは残す。`continued_from` はもう書かない。supervisor の ID も子の ID も recur で変わらない |
+| activity の失敗 | transactional でも諦めた失敗を `ActivityFailed` として記録する。リプレイは記録した失敗を返す |
+| 記録するエラー | カーネル定義のコード（`task_conflict`・`task_not_found`・`actor_name_taken`・`fs_conflict`・`sandboxed`・`channel_forbidden`・`not_owner`・`cursor_not_found`・`invalid_argument`）を持つものだけ。それ以外は run を中断する（記録せず、complete/fail/補償もせず、ロックを解放して `running` のまま残す）。ロック喪失とシャットダウンも同じ。封印チャネルでのブロッキング受信の拒否も記録する |
+| 補償中の cancel | 3 言語とも拒否する |
+| capability | 期限切れでも封印は解けない（掃除は最新の grant を残す）。revoke は発行者だけ、unregister は名前の保持者だけ（他は `not_owner`）。鍵（オプションか `DURAX_CAPABILITY_KEY`）があれば secret は `HMAC-SHA256(key, capability_id)` で、履歴にトークンを残さない。CloudEvents の受信口も封印を守る（`capabilitytoken` 拡張属性、なければ 403） |
+| カーソル読み取り | `read_channel_since` はカーソルのメッセージが消えていたら `cursor_not_found`。数値 ID で読む `read_channel_after` を追加 |
+| direct チャネル | 他インスタンスの `L:X` の購読・受信・読み取りは封印の有無にかかわらず拒否。送信は許す |
+| MySQL | セッションを READ COMMITTED に固定。インスタンス ID を持つ列（`granted_by`・`owner`・`claimed_by`・`created_by`）を `VARCHAR(255)` に広げた（migration `20261208000000`）。識別子の比較はデータベースの照合順序に従う（バイナリにしたければデータベースごと `utf8mb4_0900_bin` で作る。列単位では変えない） |
+| SQLite | ファイル DB は 3 言語とも WAL。読み取りから始まる activity の書き込み競合は、その試行をロールバックして新しいトランザクションでやり直す（リトライに数えない） |
+| 期限 | タイマーと受信タイムアウトは早く発火しない（秒精度の列に合わせて、`<=` で比べるタイマーの期限は秒単位に切り上げる） |
+| TLA+ | 修正パッチと新モデルを schema に適用し、CI で全 config を検証する |
 

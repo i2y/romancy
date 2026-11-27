@@ -207,6 +207,60 @@ var orderActivity = romancy.DefineActivity("process_order",
 )
 ```
 
+## Replay Safety
+
+Called from workflow code, `Publish` and `SendTo` are recorded steps. The message and a history record of the publish commit together, and when the workflow is replayed after a suspension or a crash, the call returns the recorded outcome instead of publishing again. A refusal on a sealed channel (`ErrChannelForbidden`) is recorded the same way, so a replay takes the same branch even if the grants changed in the meantime.
+
+The step first proves that the run still holds the instance lock. A run that has lost its lease to another worker publishes nothing and gets `ErrLockNotHeld`.
+
+Inside an activity, `Publish` and `SendTo` run directly, in the activity's transaction (see above); there the activity is the unit that is recorded and replayed.
+
+## Delivery Guarantees
+
+- **Broadcast**: a subscription starts after the latest message on the channel, and the subscriber then sees every later message once.
+- **Competing**: each message is consumed at most once. Claiming the message, recording the receive in history and deleting the message commit in one transaction. A message is handed only to a subscriber that is waiting for it, so it cannot be lost on an instance that is busy elsewhere.
+- **Stranded claims**: if a consumer dies after claiming a message, the claim is taken over once it is 300 seconds old, or as soon as the consumer is completed, failed or cancelled.
+- **No missed wakeups**: registering a wait re-checks for pending messages in the same transaction, so a message published while the workflow suspends still wakes it.
+
+## Sealed Channels
+
+A channel is open until a capability grant exists for it. Once `IssueCapability` has issued a `channel_pub` grant for a channel, publishing to it requires a token. The same applies to `channel_sub` and receiving:
+
+```go
+token, capID, err := romancy.IssueCapability(ctx, "channel_pub", "orders")
+
+// Without the token, Publish and SendTo on "orders" fail with ErrChannelForbidden
+err = romancy.Publish(ctx, "orders", order, romancy.WithPublishCapability(token))
+
+// A channel sealed for channel_sub requires the token on Receive (and ReadChannelSince)
+msg, err := romancy.Receive[Order](ctx, "orders", romancy.WithReceiveCapability(subToken))
+```
+
+The seal also covers the direct channels derived from the name: `SendTo(ctx, target, "orders", ...)` and a `Publish` to the physical name `"orders:<instanceID>"` need the same token.
+
+- **Expiry does not unseal.** `IssueCapability(ctx, kind, target, romancy.WithCapabilityTTL(time.Hour))` issues a grant that stops validating after an hour, but the channel stays sealed: the cleanup of expired grants always keeps a channel's newest grant. Only revoking the last grant re-opens a channel.
+- **Only the issuer revokes.** `RevokeCapability` from another instance fails with `ErrNotOwner`; an unknown capability ID is a no-op.
+- **CloudEvents need the token too.** An event posted to the CloudEvents endpoint for a channel sealed for `channel_pub` must carry the token in the `capabilitytoken` extension attribute (binary mode: the `ce-capabilitytoken` header). Without a valid token the endpoint answers `403 Forbidden` and publishes nothing. The attribute is not stored with the message.
+- **Tokens and history.** Without a capability key, the issued token is recorded in the issuing workflow's history (a replay returns it from there). With `romancy.WithCapabilityKey(key)`, or the `DURAX_CAPABILITY_KEY` environment variable, the secret is derived from the capability ID and history holds no token. Give every worker the same key and do not change it while instances that issued capabilities are running.
+
+## Direct Channels Are Private
+
+Whatever the seal state, an instance cannot subscribe to, receive from or read another instance's direct channel: `Subscribe`, `Receive`, `ReadChannelSince` and `ReadChannelAfter` on `"orders:<other instance ID>"` fail with `ErrChannelForbidden`. Sending to it (`SendTo`, or `Publish` to the physical name) stays allowed.
+
+## Reading a Channel as a Log
+
+`ReadChannelSince` and `ReadChannelAfter` read a channel's messages without subscribing, as a recorded step:
+
+```go
+// After a message ID read earlier; ErrCursorNotFound once that message is gone
+msgs, err := romancy.ReadChannelSince(ctx, "events", lastMessageID)
+
+// After the numeric ID of the last message read; keeps working after it is deleted
+msgs, err = romancy.ReadChannelAfter(ctx, "events", lastID)
+```
+
+Both need a `channel_sub` token on a sealed channel (`romancy.WithReceiveCapability(token)`). Pass `""` or `0` to read from the beginning.
+
 ## ReceivedMessage Structure
 
 When receiving a message, you get a `ReceivedMessage[T]` struct:

@@ -23,7 +23,7 @@ When an activity is called during replay:
 2. **Cache Check**: If replaying, check if result is cached for this `activity_id`
 3. **Return Cached**: If found, return cached result **without executing the function**
 4. **Execute**: If not cached, run the function and record the result
-5. **Error Handling**: Failed activities are recorded with full error details
+5. **Error Handling**: The final failure of a transactional activity (the default) is not written to history, so a replay runs that activity again; a non-transactional activity's failure is recorded with its message only (see [Automatic Retry](/docs/core-features/retry#retryexhaustederror))
 
 ### Activity ID Patterns
 
@@ -206,6 +206,8 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 ### ❌ Never Re-executed (Cached)
 
 - Completed activity business logic
+- Activities that gave up: the recorded failure is returned again (see [Failures are recorded](/docs/core-features/retry#failures-are-recorded))
+- Kernel primitives called from workflow code (`RegisterName`, `Monitor`, `IssueCapability`, `PostTask`, `ClaimTask`, `ReadChannelSince`, `Publish`, `SendTo`, ...): each runs once and its outcome, an error with a kernel code included, is returned from history
 
 ### Example
 
@@ -301,7 +303,7 @@ Romancy persists all activity results to the `workflow_history` table:
 **Event Types:**
 
 - **ActivityCompleted**: Successful activity execution
-- **ActivityFailed**: Activity raised an error (includes error type and message)
+- **ActivityFailed**: An activity gave up (terminal error or retries exhausted), transactional or not. Replay restores it as a `TerminalError`, a `RetryExhaustedError` or a kernel error where it was one, otherwise as a plain error with the message
 - **EventReceived**: Event received via `WaitEvent()`
 - **TimerExpired**: Timer expired via `Sleep()`
 
@@ -813,6 +815,16 @@ All history recording is transactional:
 - Rollback on failure (ensures consistency)
 - No orphaned history records
 - Deterministic replay guaranteed
+
+### Aborted Runs
+
+A primitive records its outcome only when it returns a value or a kernel-defined error (`ErrActorNameTaken`, `ErrChannelForbidden`, `ErrNotOwner`, `ErrCursorNotFound`, ...). Any other error, such as a database outage, would make a replay take a branch the code never meant to take, so it is not recorded. It aborts the run instead:
+
+- the failing primitive, and every primitive and activity after it in the same run, returns an error matching `romancy.ErrRunAborted`;
+- the run ends without completing, failing or compensating the instance and releases its lock;
+- the instance stays `running`, and a later run replays it and executes the primitive again.
+
+A run that loses its lock, or whose worker shuts down, ends the same way: nothing is recorded and no compensation runs. Do not swallow `ErrRunAborted` in workflow code; return it.
 
 ### Compensating Workflow Recovery
 

@@ -35,6 +35,14 @@ romancy.WithDatabase("mysql://user:password@localhost:3306/dbname")
 
 **Default**: `"file:romancy.db"`
 
+**Session settings**: Romancy writes timestamps in UTC and compares them with database-side `NOW()`, so it pins the session time zone to UTC: `timezone=UTC` on PostgreSQL, and `time_zone='+00:00'` with `loc=UTC` on MySQL. Leave these out of the URL, or set them to UTC. On a server whose default zone is not UTC, any other value shifts lease expiries and deadlines by the zone offset.
+
+On MySQL, Romancy also adds `parseTime=true` and `clientFoundRows=true`. With `clientFoundRows`, an UPDATE reports the rows it matched rather than the rows it changed. Lock acquisition, lease refresh and fenced writes depend on that, so do not override it.
+
+MySQL sessions also run at `READ COMMITTED` (`transaction_isolation='READ-COMMITTED'`), PostgreSQL's default. Romancy's locking protocols assume it: MySQL's default `REPEATABLE READ` would serve stale snapshots and take gap locks. Do not override it either.
+
+MySQL compares identifiers (instance IDs, channel names, actor names, FS paths) under the database's collation. The default, `utf8mb4_0900_ai_ci`, ignores case and accents, so `"Orders"` and `"orders"` are one channel there and two on PostgreSQL and SQLite. For byte-exact comparison, create the database with `COLLATE utf8mb4_0900_bin`; do not change the collation of single columns.
+
 ### WithAutoMigrate(enabled)
 
 Enables or disables automatic database migration on startup.
@@ -276,6 +284,25 @@ romancy.WithLeaderLeaseDuration(30 * time.Second)
 |--------|-------------|---------|
 | `WithLeaderHeartbeatInterval(d)` | Leader lease renewal interval | `15s` |
 | `WithLeaderLeaseDuration(d)` | Leader lease expiration time | `45s` |
+
+## Capabilities
+
+### WithCapabilityKey(key)
+
+Derives capability secrets from a key, so issued tokens are never written to workflow history:
+
+```go
+app := romancy.NewApp(
+    romancy.WithDatabase("postgres://..."),
+    romancy.WithCapabilityKey([]byte(os.Getenv("CAPABILITY_KEY"))),
+)
+```
+
+With a key, `IssueCapability` derives a capability's secret as `HMAC-SHA256(key, capabilityID)` and records only the capability's ID, kind and target; a replay derives the token again. Without a key, the token is recorded in the issuing workflow's history.
+
+- Default: the bytes of the `DURAX_CAPABILITY_KEY` environment variable, if set; otherwise no key.
+- Give every worker sharing the database the same key (Edda and Shikibu read the same variable).
+- Do not change the key while instances that issued capabilities are running: their replays would derive different tokens.
 
 ## Observability
 

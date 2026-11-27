@@ -31,6 +31,7 @@ Romancy is a Go port of [Edda](https://github.com/i2y/edda) (Python), providing 
 - 🤖 **MCP Integration**: Expose workflows as MCP tools for AI assistants
 - 📬 **Channel Messaging**: Broadcast and competing message delivery between workflows
 - 🔄 **Recur Pattern**: Erlang-style tail recursion for long-running workflows
+- 🧩 **Actor OS Primitives**: Names, monitors, capabilities and sealed channels, tasks, an actor filesystem and supervision trees, shared with Edda and Shikibu
 - 📡 **PostgreSQL LISTEN/NOTIFY**: Real-time event delivery without polling
 - 🤖 **LLM Integration**: Durable LLM calls via bucephalus with automatic caching for replay
 
@@ -307,6 +308,8 @@ Activities are automatically transactional by default, ensuring atomicity betwee
 2. History recording (replay data)
 3. Event publishing (outbox table)
 
+Each retry attempt runs in its own transaction, so a failed attempt leaves nothing behind before the next one (see [Automatic Retry](https://i2y.github.io/romancy/docs/core-features/retry/)).
+
 ```go
 // Default: activity runs in a transaction
 var createOrder = romancy.DefineActivity("create_order",
@@ -328,7 +331,7 @@ var callExternalAPI = romancy.DefineActivity("call_api",
         resp, err := http.Get(url)
         // ...
     },
-    romancy.WithTransactional(false),
+    romancy.WithTransactional[string, map[string]any](false),
 )
 ```
 
@@ -433,6 +436,50 @@ romancy.Publish(ctx, "channel", data, romancy.WithMetadata(map[string]any{
 }))
 ```
 
+### Actor Primitives
+
+Workflows double as actors of a kernel shared with Edda and Shikibu (same schema, same semantics):
+
+- **Names**: `RegisterName`, `UnregisterName`, `Whereis`
+- **Monitors**: `Monitor`, `Unmonitor` (one DOWN message when the target completes, fails or is cancelled)
+- **Capabilities and sealed channels**: `IssueCapability` (with `WithCapabilityTTL`), `CheckCapability`, `RevokeCapability`, `WithPublishCapability`, `WithReceiveCapability`. Only the issuer revokes; an expired grant keeps its channel sealed; CloudEvents posted to a sealed channel need the token in their `capabilitytoken` attribute. With `WithCapabilityKey` (or `DURAX_CAPABILITY_KEY`) issued tokens are never written to history
+- **Channel logs**: `ReadChannelSince` (after a message ID), `ReadChannelAfter` (after a numeric message ID)
+- **Tasks**: `PostTask`, `ClaimTask`, `CompleteTask`, `FailTask`, `ListTasks`, `WaitTask`, `WaitAnyTask`
+- **Actor FS and blobs**: `FSRead`, `FSWrite`, `FSList`, `FSDelete` (inside activities), `StorePayload`, `LoadPayload`
+- **Supervision trees**: `DefineSupervisor` with `OneForOne`, `OneForAll` and `RestForOne`
+
+```go
+var watcher = romancy.DefineWorkflow("watcher",
+    func(ctx *romancy.WorkflowContext, _ struct{}) (string, error) {
+        target, err := romancy.Whereis(ctx, "ingest")
+        if err != nil || target == "" {
+            return "", err
+        }
+        // The DOWN message arrives on this instance's direct channel
+        if err := romancy.Subscribe(ctx, "down", romancy.ModeDirect); err != nil {
+            return "", err
+        }
+        if err := romancy.Monitor(ctx, target, "down"); err != nil {
+            return "", err
+        }
+        msg, err := romancy.Receive[map[string]any](ctx, "down")
+        if err != nil {
+            return "", err
+        }
+        return fmt.Sprint(msg.Data["status"]), nil // "completed", "failed" or "cancelled"
+    },
+)
+
+var sup = romancy.DefineSupervisor("pipeline-sup",
+    romancy.SuperviseConfig{Strategy: romancy.OneForOne, MaxRestarts: 5, WithinSeconds: 60},
+    []romancy.ChildSpec{{Name: "ingest", Workflow: "ingest", Restart: romancy.RestartPermanent}},
+)
+// romancy.RegisterWorkflow(app, sup)
+// romancy.StartWorkflow(ctx, app, sup, romancy.SupervisorState{})
+```
+
+Called from workflow code, every primitive is a recorded step: a replay returns the recorded outcome, errors included, instead of running it again. A primitive with a side effect first proves that the run still holds the instance lock, so a run that lost its lease changes nothing (`ErrLockNotHeld`). Task handlers and supervised children are at-least-once and must be idempotent. See [Actor OS](https://i2y.github.io/romancy/docs/actor-os/) for the full list and rules.
+
 ### Sandboxed Actors
 
 Workflows can be started as sandboxed actors when they should receive only explicitly delegated capabilities:
@@ -454,7 +501,9 @@ Delegation itself uses the existing capability tokens: pass tokens the child nee
 Long-running workflows can use Erlang-style tail recursion to prevent unbounded history growth:
 
 ```go
-// For Recur, input and output types must be the same
+// Recur returns its input type: with the same input and output type, the
+// workflow can return it directly. Otherwise: _, err := romancy.Recur(ctx, in)
+// followed by return Out{}, err.
 type CounterState struct {
     Count      int  `json:"count"`
     Completed  bool `json:"completed"`
@@ -477,8 +526,10 @@ var counterWorkflow = romancy.DefineWorkflow("counter",
 ```
 
 **Key benefits**:
-- History is archived before each recur
-- `continued_from` field tracks workflow lineage
+- History is archived before each recur (`workflow_history_archive`)
+- The instance ID stays the same, so names, monitors and supervisors keep tracking the same actor (Edda and Shikibu recur in place too)
+- Compensations registered in an iteration are dropped at the recur; broadcast channels subscribed again continue after the last delivered message
+- Archiving, cleanup and the restart record commit in one transaction fenced by the instance lock
 - Prevents memory/storage issues with long-running workflows
 
 ## HTTP Integration

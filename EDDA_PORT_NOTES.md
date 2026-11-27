@@ -180,7 +180,75 @@ per-row claim の集約で新規性が薄いため spec 追加は見送り、実
 
 ## 2026-11-25 追記
 
-- **supervisor 移植時の注意**: edda/shikibu は recur で**新インスタンス**を作る（romancy は同一 ID で input 更新）。supervisor ループは recur チェーンをたどる設計にすること。子インスタンスには正しい `source_hash` が必要 — 空だと resumable sweep から見えず永久に進まない
+- **supervisor 移植時の注意**: （2026-11-27 以降は 3 言語とも recur で同じ ID を使うので、recur チェーンをたどる必要はない。当時の edda/shikibu は recur で新インスタンスを作っていた）。子インスタンスには正しい `source_hash` が必要 — 空だと resumable sweep から見えず永久に進まない
 - **romancy の Recur に潜在バグがあった**: 新 input が履歴にだけ書かれ `workflow_instances.input_data` が更新されず、全イテレーションが元 input で再起動していた。`UpdateInstanceInputIfLocked` で修正済み（commit cda1e53）。shikibu では `archive_history` のカラムリスト抜けを修正（commit 60bd58e）
 - **クロス言語テスト flake**: edda の `test_cross_language_channel` で Ruby→Python 配送がタイムアウトすることがある（環境依存、既存の flake）
+
+
+---
+
+## 2026-11-26 追記：レビューで見つかったバグの型（移植チェックリスト）
+
+2026-11-25 実装分（actor primitives・supervisor・sandbox）を 3 言語でレビューして直した際、同じ型のバグが言語をまたいで繰り返し見つかった。新しいプリミティブや新しいポートを書くときのチェックリストとして残す。
+
+### リプレイ
+- workflow コードから storage を直接呼ぶプリミティブは、リプレイのたびに再実行される。記録付きステップにすること（romancy `steps.go` の runStep/runEffect、edda `context._run_step`、shikibu `WorkflowContext#step`）。読み取り（Whereis、ListTasks など）も記録しないと、リプレイで分岐が変わる
+- ステップの結果はエラーも含めて記録する。センチネルはコードとして保存し、リプレイ後も判定できるようにする（romancy `stepRecord.Code`）
+- activity 本体の中ではステップ ID を生成しない。リプレイでは activity 本体が走らないので、カウンタがずれる。直接実行し、activity を記録の単位にする
+- `IsReplaying()` は run 単位の定数（historyCount > 0）で、「この呼び出しがリプレイか」ではない。これで判定したせいで、FS が最初のサスペンド以降すべて失敗していた
+
+### fencing
+- 副作用は「ロック証明 → 副作用 → 記録」を 1 トランザクションで行う。ロック証明を最後にすると、PG/MySQL で行ロックの順序が cancel と逆になってデッドロックする（shikibu で再現）
+- PG の READ COMMITTED では、`INSERT … SELECT … WHERE EXISTS (locked_by = ?)` は行ロックを取らないので、同時の lease 奪取と原子的にならない。インスタンス行を `FOR NO KEY UPDATE`（MySQL は `FOR UPDATE`）でロックするか、条件付き UPDATE で証明する
+- ロック喪失（LockLostError / ErrLockNotHeld）を activity のリトライ対象にしない
+- 呼び出し側のトランザクションの中で fenced write が拒否されても、呼び出し側のトランザクションを rollback しない。SQLAlchemy の `AsyncSession.rollback()` は savepoint ではなく最外のトランザクションを巻き戻す
+- edda の `workflow_lock`：heartbeat が owner task を cancel する方式では、呼び出し元（親の activity など）のタスクに cancel 要求が残る。`asyncio.timeout` と同じく `uncancel()` してから `LockLostError` に変換する。start() はリースを失っても例外にせずインスタンス ID を返す（新しいオーナーが続ける。romancy の StartWorkflow と同じ）
+- Recur の archive・掃除・入力更新・recurred 化もロック証明つきの 1 トランザクションにする。リースを失った run の Recur が新オーナーの履歴をアーカイブしていた（romancy・shikibu）
+
+### ステータスと待機
+- 終端ステータス（completed/failed/cancelled）を吸収的にする。条件付き UPDATE に `status NOT IN (終端)` を入れる
+- requeue（waiting → running）では待機登録（activity_id/timeout_at）も同時に消す。残すと、古いタイムアウトが完了済みインスタンスを再実行する
+- receive タイムアウトを発火する前に、待機の activity_id/timeout_at が変わっていないこと、インスタンスがまだ待機中であることを確認する
+- 配信は待機登録済みの購読者にだけ行う。待機していない購読者に competing メッセージを渡すと失われる
+- タスク通知や DOWN のように「挿入するだけで誰も起こさない」メッセージで待つ経路は、requeue のバックストップでしか起きない。WaitTask/WaitAnyTask のタイムアウトが発火しないバグが 3 言語すべてにあった
+
+### SQL 方言
+- MySQL の `?` は、直後が識別子の先頭になれない文字のときだけプレースホルダになる。`?1` は構文エラー
+- MySQL の RowsAffected は既定で「変更した行数」なので、同じ値の書き込み（同一秒の再取得・refresh）は 0 になる。Go のドライバでは `clientFoundRows=true` が必要
+- MySQL は `UPDATE t … WHERE id IN (SELECT … FROM t)` を拒否する（エラー 1093）。候補を先に SELECT する
+- PG の `$n` を型の違う 2 か所で使うと型推論エラー（42P08）になる。パラメータを分ける
+- PG ではトランザクション内の制約違反がトランザクション全体を abort する。`ON CONFLICT DO NOTHING` か savepoint を使う
+- SQLite（WAL）では、deferred トランザクションの「読んでから書く」が即座に失敗する（別接続が書き込み中なら `SQLITE_BUSY`、読み取り後に別接続がコミットしていれば `SQLITE_BUSY_SNAPSHOT`。どちらも busy timeout は効かない）。最初が読み取りのカーネル内部トランザクションは `BEGIN IMMEDIATE` にする。ユーザーコードを含む activity トランザクションは deferred のまま、競合したらその試行をトランザクションごとやり直す（romancy `attemptInTransaction`）。同じトランザクション内でのリトライでは直らない
+- activity のリトライは試行ごとに新しいトランザクションで行う（edda/shikibu は最初からそう。romancy は 2026-11-27 まで全試行を 1 トランザクションで実行していて、失敗した試行の書き込みが成功時にコミットされ、PG では aborted トランザクションのせいでリトライが必ず失敗していた）
+- Ruby の sqlite3 gem で Sequel の `busy_timeout` を使うと、GVL を握ったまま待つ。`busy_handler_timeout` を使う
+- MySQL の `INSERT IGNORE` は重複だけでなく、切り詰めや FK 違反まで警告にして黙って続ける。重複キーのエラー（1062）だけを no-op にする
+- MySQL のセッションは READ COMMITTED に固定する（既定の REPEATABLE READ は古いスナップショットとギャップロックを持ち込む）
+- MySQL の識別子の比較はデータベースの照合順序に従う（既定の `utf8mb4_0900_ai_ci` は大文字小文字とアクセントを区別しない）。列ごとに照合順序を変えると、capability の target と、それが守るチャネルやパスの比較がずれて封印を迂回できる
+- SQLite の `datetime()` も MySQL の `TIMESTAMP(0)` も秒精度。期限を `<=` で比べるなら秒単位に切り上げて保存しないと、最大 1 秒早く発火する（`<` で比べる側は切り上げると 1 秒遅れる）
+
+### 時刻
+- DB 側の `NOW()`/`CURRENT_TIMESTAMP` はセッション TZ に従う。アプリ側の UTC 時刻と混ぜる箇所があるなら、セッション TZ を UTC に固定する（PG `timezone=UTC`、MySQL `time_zone='+00:00'`）
+- テストは非 UTC のホスト TZ と非 UTC の DB サーバー TZ の両方で回す。shikibu は JST ホストでだけ通るテストが、UTC/US ホストで 10 分〜8 時間 resume が止まるバグを隠していた
+
+### 「形式モデル」節の訂正
+
+上の「形式モデル（3プロジェクト共通）」節にある「TLC 全構成グリーン済み、Go checker 状態数一致」「新プロトコル 36 状態全網羅」は言い過ぎだった。2026-11-26 のレビューで次のことが分かった。
+
+- InstanceClaim_old と EpochFencing_old/_new の 3 config は、演算子の優先順位と `UNCHANGED` の誤りで TLC が評価できない。「verified」は Go checker の結果だった
+- CompetingMessageClaim は consume を 1 ステップにまとめているので、「高々 1 回」が構造上自明になっている
+
+詳細は ACTOR_OS_DESIGN.md の「TLA+ スイートのレビュー結果」を参照。
+
+---
+
+## 2026-11-27 追記：決定と、移植時に揃えること
+
+SEMANTICS.md に反映した決定（詳細は ACTOR_OS_DESIGN.md の「2026-11-27 の決定」）。新しいポートでも同じにする。
+
+- **Recur は同じ ID で続く**：archive・購読/タイマー/グループの掃除・補償の登録の削除・入力更新・recurred 化をロック証明つきの 1 トランザクションで行う。broadcast の配信カーソルは残す。recurred を拾うスイープを必ず用意する（commit 後にクラッシュしても次の iteration が走るように）
+- **記録するエラーはカーネルのコードを持つものだけ**。ドライバのエラーなどは run を中断する：記録せず、その run の以後のプリミティブと activity をすべて同じ中断エラーで失敗させ、complete/fail/補償をせずにロックを解放する。Python は `BaseException`、Ruby は `Exception` の派生にして、普通の `except`/`rescue` で握りつぶされないようにする
+- **ロック喪失とシャットダウンで補償を走らせない**（romancy は、ステップが `ErrLockNotHeld` を返すと補償していた）
+- **activity の諦めた失敗は transactional でも記録する**
+- **capability**：期限切れの掃除は各 `(kind, target)` の最新の grant を残す（MySQL は DELETE のサブクエリで同じテーブルを参照できないので派生テーブルで包む）。revoke/unregister は所有者だけ。鍵があれば secret は `HMAC-SHA256(key, capability_id)` の 16 進小文字、記録は `{"id","kind","target","derived":true}`。CloudEvents の受信口も封印を確認し、`capabilitytoken` 拡張属性を保存前に取り除く
+- **direct チャネルの秘匿**：`L:X` の X 判定は `:` の全分割点で行う（インスタンス ID が `:` を含みうる）
 

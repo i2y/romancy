@@ -165,7 +165,7 @@ Content-Type: application/json
 {
   "error": "Failed to find specversion in HTTP request",
   "error_type": "ValidationError",
-  "retryable": false
+  "retryable": "false"
 }
 ```
 
@@ -179,6 +179,37 @@ Content-Type: application/json
 
 - 🚫 **DO NOT retry** - Fix the event structure and resend
 
+### Forbidden (403 Forbidden)
+
+When the event's channel is sealed (**non-retryable**). An event is published to the channel named by its `type`, or `type:<instance ID>` when it targets one instance. Once a `channel_pub` capability has been issued for that channel, the event must carry a valid token in the `capabilitytoken` extension attribute (in binary mode, the `ce-capabilitytoken` header):
+
+```bash
+curl -X POST http://localhost:8001/ \
+  -H "Content-Type: application/cloudevents+json" \
+  -d '{
+    "specversion": "1.0",
+    "type": "payment.completed",
+    "source": "payment-service",
+    "id": "event-123",
+    "capabilitytoken": "cap:channel_pub:payment.completed:..."
+  }'
+```
+
+Without a token, or with an invalid or expired one:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{
+  "error": "...",
+  "error_type": "Forbidden",
+  "retryable": "false"
+}
+```
+
+Nothing is published and no workflow starts. The `capabilitytoken` attribute is never stored with the message.
+
 ### Server Error (500 Internal Server Error)
 
 When an internal error occurs (**retryable**):
@@ -191,7 +222,7 @@ Content-Type: application/json
 {
   "error": "Database connection failed",
   "error_type": "DatabaseError",
-  "retryable": true
+  "retryable": "true"
 }
 ```
 
@@ -213,7 +244,7 @@ All error responses include structured information to help clients decide whethe
 {
   "error": "Human-readable error message",
   "error_type": "ErrorTypeName",
-  "retryable": true | false
+  "retryable": "true" | "false"
 }
 ```
 
@@ -221,9 +252,9 @@ All error responses include structured information to help clients decide whethe
 
 - **`error`** (string): Human-readable error message
 - **`error_type`** (string): Error type name for debugging
-- **`retryable`** (boolean): Whether the client should retry
-  - `false`: Client error (400) - Fix the request before retrying
-  - `true`: Server error (500) - Retry with exponential backoff
+- **`retryable`** (string, `"true"` or `"false"`): Whether the client should retry
+  - `"false"`: Client error (400, 403) - Fix the request before retrying
+  - `"true"`: Server error (500) - Retry with exponential backoff
 
 ## Client Retry Logic
 
@@ -245,7 +276,7 @@ import (
 type ErrorResponse struct {
 	Error     string `json:"error"`
 	ErrorType string `json:"error_type"`
-	Retryable bool   `json:"retryable"`
+	Retryable string `json:"retryable"` // "true" or "false"
 }
 
 // SendCloudEventWithRetry sends a CloudEvent with automatic retry on server errors
@@ -284,7 +315,7 @@ func SendCloudEventWithRetry(eventData map[string]any, maxRetries int) error {
 			fmt.Println("✅ Event accepted")
 			return nil
 
-		case http.StatusBadRequest: // 400
+		case http.StatusBadRequest, http.StatusForbidden: // 400, 403
 			// Client error - DO NOT retry
 			var errResp ErrorResponse
 			json.Unmarshal(body, &errResp)
@@ -340,6 +371,7 @@ Romancy complies with the following CloudEvents specifications:
 ✅ **Client Error Responses (Non-Retryable):**
 
 - `400 Bad Request` - Malformed CloudEvent
+- `403 Forbidden` - The event's channel is sealed and the event carries no valid `capabilitytoken`
 - `415 Unsupported Media Type` - (Reserved for future use)
 
 ✅ **Server Error Responses (Retryable):**
@@ -359,7 +391,7 @@ Romancy extends the CloudEvents specification with additional error metadata:
 {
   "error": "Error message",
   "error_type": "ErrorTypeName",
-  "retryable": boolean
+  "retryable": "true" | "false"
 }
 ```
 
@@ -535,7 +567,7 @@ case http.StatusBadRequest:
 case http.StatusInternalServerError:
 	var errResp ErrorResponse
 	json.NewDecoder(resp.Body).Decode(&errResp)
-	if errResp.Retryable {
+	if errResp.Retryable == "true" {
 		return retryWithBackoff()
 	}
 }

@@ -30,8 +30,9 @@ var longRunningWorkflow = romancy.DefineWorkflow("processor",
 
 1. Archiving the current workflow's history
 2. Cleaning up all subscriptions (events, timers, channels, groups)
-3. Marking the current instance as "recurred"
-4. Creating a new instance that continues from the current state
+3. Dropping the registered compensations: a later iteration's failure does not undo an earlier one
+4. Recording the new input on the instance and marking it "recurred"
+5. Restarting the **same instance** with the new input and a fresh history
 
 ```go
 var longRunningWorkflow = romancy.DefineWorkflow("processor",
@@ -62,7 +63,7 @@ var longRunningWorkflow = romancy.DefineWorkflow("processor",
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Workflow Instance: wf-001                                   │
+│ Workflow Instance: wf-001 (input: count=1)                  │
 ├─────────────────────────────────────────────────────────────┤
 │ History (100 entries)                                       │
 │ ├── activity_1: result_1                                    │
@@ -73,21 +74,29 @@ var longRunningWorkflow = romancy.DefineWorkflow("processor",
                             │ Recur(ctx, newInput)
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
+│ One transaction, after proving the run holds the lock:      │
 │ 1. Archive history to workflow_history_archive              │
-│ 2. Clean up subscriptions (channels, events, timers)        │
-│ 3. Mark wf-001 as status="recurred"                         │
-│ 4. Create new instance wf-002 with continued_from="wf-001"  │
+│ 2. Clean up subscriptions and group memberships             │
+│ 3. Drop registered compensations                            │
+│ 4. Store newInput as the instance input                     │
+│ 5. Mark wf-001 as status="recurred"                         │
 └─────────────────────────────────────────────────────────────┘
                             │
+                            │ the app restarts recurred instances
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Workflow Instance: wf-002                                   │
-│ continued_from: wf-001                                      │
+│ Workflow Instance: wf-001 (input: count=2)                  │
 ├─────────────────────────────────────────────────────────────┤
-│ History (fresh - 0 entries)                                 │
+│ History (fresh)                                             │
 │ └── (starts accumulating again)                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+The steps commit together. A run that lost its lease to another worker changes nothing (the new owner's history and subscriptions stay), and a failure part-way leaves the iteration as it was rather than an instance with no history and its old input.
+
+Subscriptions do not carry over, so each iteration calls `Subscribe` again. The broadcast delivery cursors do carry over: a broadcast channel subscribed again continues after the last message delivered before the `Recur`, so a message published between `Recur` and the next `Subscribe` is still delivered. (A channel the instance never subscribed to before starts after its latest message.) Competing messages wait in the channel until a subscriber receives them.
+
+If the app stops after the `Recur` commits, nothing is lost: on startup, and periodically, the app picks up `recurred` instances and runs their next iteration.
 
 ## Basic Usage
 
@@ -128,26 +137,15 @@ var counterWorkflow = romancy.DefineWorkflow("counter",
 )
 ```
 
-## Tracking Workflow Lineage
+## Instance Identity
 
-Each recurred workflow tracks its origin via `continued_from`:
+Romancy recurs **in place**: the instance ID stays the same across iterations. Callers, registered names, monitors and supervisors keep referring to the same actor, and a recurred instance counts as alive (monitors do not get a DOWN message for it). The capabilities it issued, its tasks and its `/actor/{id}/` files stay its own, and a sandboxed instance stays sandboxed.
 
-```go
-// Get workflow instance to see lineage
-instance, _ := app.GetInstance(ctx, instanceID)
-if instance.ContinuedFrom != "" {
-    fmt.Printf("This workflow continued from: %s\n", instance.ContinuedFrom)
-}
-```
+Earlier iterations remain queryable in `workflow_history_archive` (see [Archived History](#archived-history)).
 
-You can trace the full history:
-
-```
-wf-003 (current, running)
-  └── continued_from: wf-002 (recurred)
-        └── continued_from: wf-001 (recurred)
-              └── continued_from: "" (original)
-```
+{{< callout type="info" >}}
+Edda (Python) and Shikibu (Ruby) also recur in place since their 2026-11-27 releases. Their earlier versions recurred onto a new instance linked to the old one by `continued_from`; `WorkflowInstance.ContinuedFrom` is set only on instances created that way.
+{{< /callout >}}
 
 ## Use Cases
 
@@ -206,7 +204,12 @@ var daemonWorkflow = romancy.DefineWorkflow("daemon",
                 romancy.WithReceiveTimeout(1*time.Minute),
             )
             if err != nil {
-                continue // Timeout - check again
+                var timeoutErr *romancy.ChannelMessageTimeoutError
+                if errors.As(err, &timeoutErr) {
+                    continue // Timeout - check again
+                }
+                // Includes the suspend signal: return it so the workflow waits
+                return DaemonResult{}, err
             }
 
             if msg.Data.Type == "shutdown" {
@@ -315,17 +318,17 @@ var workflow = romancy.DefineWorkflow("bounded_processor",
 
 ## Archived History
 
-When `Recur` is called, history is moved to `workflow_history_archive` table. This data can be:
+When `Recur` is called, history is moved to the `workflow_history_archive` table, keyed by the same instance ID for every iteration. This data can be:
 
 - Kept for audit/debugging purposes
 - Periodically cleaned up via background jobs
 - Queried for historical analysis
 
 ```sql
--- Query archived history
+-- Query archived history (all iterations of the instance)
 SELECT * FROM workflow_history_archive
 WHERE instance_id = 'wf-001'
-ORDER BY sequence_number;
+ORDER BY id;
 ```
 
 ## See Also

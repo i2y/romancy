@@ -97,6 +97,15 @@ Only **successfully completed** activities are compensated:
 - ❌ Failed activities → No compensation needed
 - ⏭️ Not-yet-executed activities → No compensation needed
 
+### When Compensations Do Not Run
+
+- **The run was interrupted, not failed.** A run that loses its lock, whose worker shuts down, or that hits a database error inside a kernel primitive (`romancy.ErrRunAborted`) ends without failing the workflow. Nothing is compensated; a later run replays the workflow and carries on.
+- **A recur ended the iteration.** `Recur` drops the compensations registered so far: each iteration is a finished unit, and a failure in a later iteration does not undo an earlier one.
+
+### Cancelling During Compensation
+
+`CancelWorkflow` on an instance that is already compensating returns `ErrWorkflowNotCancellable` and leaves it alone, so its compensations are never stopped half-way.
+
 ## Implementation Example
 
 ### Complete Order Processing Saga
