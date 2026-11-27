@@ -121,6 +121,15 @@ func (a *Activity[I, O]) Execute(
 		return zero, err
 	}
 
+	// Called inside another activity's body (or a compensation), the
+	// activity is part of that one (SEMANTICS §2): its function runs
+	// directly, in the outer attempt's transaction if there is one. It takes
+	// no ID and records nothing; its retry policy, timeout and compensation
+	// do not apply and no hooks run. An error is the outer attempt's error.
+	if ctx.inActivity {
+		return a.fn(ContextWithWorkflowContext(ctx.Context(), ctx), input)
+	}
+
 	// Generate or use provided activity ID
 	activityID := options.activityID
 	if activityID == "" {
@@ -379,8 +388,9 @@ func (a *Activity[I, O]) runBody(ctx *WorkflowContext, input I) (O, error) {
 	}
 	// The body has its own copy of the context, marked as inside an
 	// activity: activities run from several goroutines of one workflow mark
-	// neither the workflow nor each other.
-	bodyCtx := ctx.WithContext(ctx.Context())
+	// neither the workflow nor each other. The copy carries the attempt's
+	// deadline, so primitives and nested activities in the body see it too.
+	bodyCtx := ctx.WithContext(execCtx)
 	bodyCtx.inActivity = true
 	execCtx = ContextWithWorkflowContext(execCtx, bodyCtx)
 	return a.fn(execCtx, input)
@@ -435,9 +445,10 @@ func (a *Activity[I, O]) executeWithRetry(ctx *WorkflowContext, activityID strin
 
 		lastErr = err
 
-		// Run inside another activity's transaction (a nested activity), a
-		// write conflict is handed back to the enclosing attempt, which
-		// restarts as a whole, instead of being retried here.
+		// Run inside a transaction this activity did not begin, a write
+		// conflict is handed back to the code that began it, instead of being
+		// retried here. (An activity called inside another activity's body
+		// never gets here: it is part of the outer attempt, see Execute.)
 		if s := ctx.Storage(); s != nil && s.InTransaction(ctx.Context()) && storage.IsWriteConflict(err) {
 			var zero O
 			return zero, err
