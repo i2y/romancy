@@ -111,6 +111,7 @@ func processConcurrently(ctx *romancy.WorkflowContext, data string) ([3]ProcessR
 - Give each activity call that runs concurrently its own ID with `romancy.WithActivityID`. Auto-generated IDs follow the order of the calls, which goroutines do not keep.
 - Choose IDs that an auto-generated one can never be. Auto IDs are `{activity name}:{n}`, and an explicit ID does not advance the count: with `process_a:1` as the explicit ID, the next `processA.Execute(ctx, data)` without one would also be `process_a:1`, and would return this call's result without running. An ID is used once per instance, so a helper called more than once needs a part that differs per call, such as a batch number. Romancy logs a warning (`activity ID used twice in one run`) when a run uses an ID twice.
 - Run only activities from the goroutines. Call `Sleep`, `WaitEvent`, `Receive`, `Publish` and the other workflow APIs from the workflow function itself: their history IDs also follow the order of the calls.
+- An activity called inside another activity's body takes no ID. It runs as part of the outer activity, which is the recorded unit (see [Calling an Activity from Another Activity](/docs/core-features/workflows-activities#calling-an-activity-from-another-activity)).
 - Each activity runs in its own transaction. SQLite lets one transaction write at a time, so activities that write take turns there.
 
 ### How Replay Works Internally

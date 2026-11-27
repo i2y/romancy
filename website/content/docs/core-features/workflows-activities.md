@@ -174,6 +174,47 @@ var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
 )
 ```
 
+### Calling an Activity from Another Activity
+
+An activity called inside another activity's body is part of the outer activity. Call it with the context the outer function receives (`romancy.GetWorkflowContext(ctx)`); its function then runs directly, in the outer attempt's transaction:
+
+```go
+var reserveItem = romancy.DefineActivity("reserve_item",
+	func(ctx context.Context, itemID string) (string, error) {
+		session := romancy.GetWorkflowContext(ctx).Session()
+		if _, err := session.ExecContext(ctx, "INSERT INTO reservations (item_id) VALUES (?)", itemID); err != nil {
+			return "", err
+		}
+		return itemID, nil
+	},
+)
+
+var reserveOrder = romancy.DefineActivity("reserve_order",
+	func(ctx context.Context, itemIDs []string) ([]string, error) {
+		wfCtx := romancy.GetWorkflowContext(ctx)
+		reserved := make([]string, 0, len(itemIDs))
+		for _, itemID := range itemIDs {
+			// Runs as part of reserve_order, in its transaction
+			id, err := reserveItem.Execute(wfCtx, itemID)
+			if err != nil {
+				return nil, err
+			}
+			reserved = append(reserved, id)
+		}
+		return reserved, nil
+	},
+)
+```
+
+- The nested call takes no activity ID and is not recorded in history; `WithActivityID` on it is ignored. Only `reserve_order` is recorded, and a replay returns its result without running its body.
+- The nested call's writes commit or roll back with the outer activity. `WithTransactional` on the nested activity has no effect: it uses the outer activity's transaction, or none when the outer activity is not transactional.
+- An error from the nested call is an error of the outer attempt. The outer activity's retry policy decides whether the whole attempt runs again. The nested activity's own retry policy, timeout and compensation do not apply, and no activity hooks run for it.
+- An activity called from a compensation function runs the same way.
+
+To get two steps that are recorded and retried separately, call both activities from the workflow.
+
+Before v0.7.3 the nested call took an ID from the workflow's counter and committed in a transaction of its own. A replay does not run the outer activity's body, so the IDs of later calls shifted, and a later call of the same activity from the workflow could receive the nested call's result. History that already holds such a record keeps it.
+
 ## Retry Policies
 
 Activities automatically retry on failure with exponential backoff. This provides resilience against transient failures like network timeouts or temporary service unavailability.

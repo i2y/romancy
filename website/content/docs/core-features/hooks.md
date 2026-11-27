@@ -81,7 +81,7 @@ The `hooks.WorkflowHooks` interface defines these methods. Every method receives
 | `OnWorkflowComplete` | `hooks.WorkflowCompleteInfo` | Called when a workflow completes successfully |
 | `OnWorkflowFailed` | `hooks.WorkflowFailedInfo` | Called once when a workflow fails; when a compensation also fails, `Error` reports both |
 | `OnWorkflowCancelled` | `hooks.WorkflowCancelledInfo` | Called when a workflow is cancelled, in the process that cancels it |
-| `OnActivityStart` | `hooks.ActivityStartInfo` | Called for every activity call, including one answered from history; `IsReplay` reports whether the run is replaying history |
+| `OnActivityStart` | `hooks.ActivityStartInfo` | Called for every activity call from workflow code, including one answered from history; `IsReplay` reports whether the run is replaying history. An activity called inside another activity's body is part of that one and runs no hooks |
 | `OnActivityComplete` | `hooks.ActivityCompleteInfo` | Called after an activity body completes successfully (not for results answered from history) |
 | `OnActivityFailed` | `hooks.ActivityFailedInfo` | Called when an activity fails with an error |
 | `OnActivityRetry` | `hooks.ActivityRetryInfo` | Called before an activity retry attempt |
