@@ -67,7 +67,7 @@ if err := app.Start(ctx); err != nil {
 
 All lifecycle events are automatically captured:
 
-- ✅ Workflow start, complete, failure, cancellation
+- ✅ Workflow start, complete, failure, cancellation, and runs that end without finishing the workflow
 - ✅ Activity execution, retries and results answered from history during replay
 - ✅ Event waits, received events and timers
 
@@ -80,7 +80,7 @@ The `hooks.WorkflowHooks` interface defines these methods. Every method receives
 | `OnWorkflowStart` | `hooks.WorkflowStartInfo` | Called when a run of a workflow starts: its first run, and every later run after a wait, a timer, a recur or a crash. `InputData` is the workflow input in the first run, when the process that called `StartWorkflow` runs it; `nil` in later runs, and in a first run that a resumption poll begins (when the starting process does not register the workflow, or started it inside an activity) |
 | `OnWorkflowComplete` | `hooks.WorkflowCompleteInfo` | Called when a workflow completes successfully |
 | `OnWorkflowFailed` | `hooks.WorkflowFailedInfo` | Called once when a workflow fails; when a compensation also fails, `Error` reports both |
-| `OnWorkflowCancelled` | `hooks.WorkflowCancelledInfo` | Called when a workflow is cancelled |
+| `OnWorkflowCancelled` | `hooks.WorkflowCancelledInfo` | Called when a workflow is cancelled, in the process that cancels it |
 | `OnActivityStart` | `hooks.ActivityStartInfo` | Called for every activity call, including one answered from history; `IsReplay` reports whether the run is replaying history |
 | `OnActivityComplete` | `hooks.ActivityCompleteInfo` | Called after an activity body completes successfully (not for results answered from history) |
 | `OnActivityFailed` | `hooks.ActivityFailedInfo` | Called when an activity fails with an error |
@@ -96,6 +96,26 @@ The `hooks.WorkflowHooks` interface defines these methods. Every method receives
 | `OnReplayComplete` | `hooks.ReplayCompleteInfo` | Called when workflow replay completes |
 
 Workflows run concurrently, so hooks are called from many goroutines at once: guard any state your hooks keep.
+
+### Runs That Suspend
+
+A workflow that waits for a timer, a message or an event runs in several runs, possibly on different workers. After `OnWorkflowStart`, each run calls exactly one of `OnWorkflowComplete`, `OnWorkflowFailed` and `OnWorkflowSuspended`, in the process that ran it. A run that finds its instance cancelled meanwhile ends with `OnWorkflowSuspended`; `OnWorkflowCancelled` comes from the cancellation.
+
+| Hook Method | Info Struct | Description |
+|-------------|-------------|-------------|
+| `OnWorkflowSuspended` | `hooks.WorkflowSuspendedInfo` | Called when a run ends without finishing the workflow. `Reason` is `hooks.SuspendWaiting` (a timer, a message or an event), `hooks.SuspendRecur` or `hooks.SuspendAborted` (the run lost its lock, hit a storage error, the worker shut down, or the instance was cancelled meanwhile). `Error` is the cause of an aborted run, or the error that kept the wait or the recur from being registered |
+
+`OnWorkflowSuspended` is in its own interface, `hooks.WorkflowSuspendHooks`, so that `WorkflowHooks` implementations written before it keep compiling. `hooks.NoOpHooks` implements it: a hooks type that embeds `NoOpHooks` only defines the method.
+
+```go
+type runHooks struct {
+	hooks.NoOpHooks
+}
+
+func (h *runHooks) OnWorkflowSuspended(ctx context.Context, info hooks.WorkflowSuspendedInfo) {
+	log.Printf("run of %s ended: %s", info.InstanceID, info.Reason)
+}
+```
 
 ## Best Practices
 

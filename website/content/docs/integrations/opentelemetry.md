@@ -109,15 +109,19 @@ workflow/order_workflow
 
 | Span | Started by | Attributes |
 |------|------------|------------|
-| `workflow/<workflow name>` | a run of the workflow | `romancy.instance_id`, `romancy.workflow_name`, `romancy.start_time`; at the end `romancy.duration_ms`, and `romancy.cancel_reason` when cancelled |
+| `workflow/<workflow name>` | a run of the workflow | `romancy.instance_id`, `romancy.workflow_name`, `romancy.start_time`; at the end `romancy.duration_ms`, `romancy.cancel_reason` when cancelled, and `romancy.suspend_reason` when the run ends without finishing the workflow |
 | `activity/<activity name>` | an activity call (a child of the workflow span) | `romancy.instance_id`, `romancy.workflow_name`, `romancy.activity_id`, `romancy.activity_name`, `romancy.is_replay`; at the end `romancy.duration_ms`, and `romancy.attempt` when it failed |
 | `activity_cache_hit/<activity name>` | an activity call answered from history during replay (the activity span, renamed) | those of the activity span |
-| `event_wait/<event type>` | `WaitEvent` / `Receive` | `romancy.instance_id`, `romancy.workflow_name`, `romancy.event_type`, `romancy.timeout_ms` (with a timeout); `romancy.duration_ms` when the wait ends |
+| `event_wait/<event type>` | `WaitEvent` / `Receive` | `romancy.instance_id`, `romancy.workflow_name`, `romancy.event_type`, `romancy.timeout_ms` (with a timeout); `romancy.duration_ms` when the wait ends in the same run, `romancy.suspend_reason` when the run suspends to wait |
+| `event_timeout/<event type>` | an event wait's timeout, in the process that handles it (when the wait's own span has ended) | `romancy.instance_id`, `romancy.workflow_name`, `romancy.event_type`; error status |
 | `event_received/<event type>` | a delivered event | `romancy.event_type`, `romancy.event_id`, `romancy.event_source`, `romancy.instance_id` |
-| `timer/<timer id>` | `Sleep` / `SleepUntil` | `romancy.instance_id`, `romancy.workflow_name`, `romancy.timer_id`, `romancy.expires_at`; `romancy.fired_at` when it fires |
-| `replay/<workflow name>` | a run that replays history | `romancy.instance_id`, `romancy.workflow_name`, `romancy.history_events`; at the end `romancy.cache_hits`, `romancy.new_activities`, `romancy.duration_ms` |
+| `timer/<timer id>` | `Sleep` / `SleepUntil` | `romancy.instance_id`, `romancy.workflow_name`, `romancy.timer_id`, `romancy.expires_at`; it ends with the run that waits for the timer (`romancy.suspend_reason`) |
+| `timer_fired/<timer id>` | a timer firing, in the process that fires it | `romancy.instance_id`, `romancy.workflow_name`, `romancy.timer_id`, `romancy.fired_at` |
+| `replay/<workflow name>` | a run that replays history | `romancy.instance_id`, `romancy.workflow_name`, `romancy.history_events`; when the run completes `romancy.cache_hits`, `romancy.new_activities`, `romancy.duration_ms` |
 
 A retry adds an `activity_retry` event to the activity span, with `romancy.attempt`, `romancy.max_attempts`, `romancy.next_delay_ms` and `romancy.error`. A failed workflow, a failed activity, a cancelled workflow and an event timeout set the span status to error.
+
+A workflow span covers one run. A run that waits, recurs or is aborted ends every span the process holds for the instance, with `romancy.suspend_reason` set to `waiting`, `recur` or `aborted` (the hooks implement `OnWorkflowSuspended`, see [Lifecycle Hooks](/docs/core-features/hooks#runs-that-suspend)). The next run, possibly on another worker, starts new spans, so a wait shows as the gap between two runs; `romancy.instance_id` ties the runs of an instance together. These spans keep an unset status: an aborted run, for example on shutdown, records its error as an event.
 
 ## Trace Context
 

@@ -456,7 +456,7 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 - Goroutine-based concurrent execution
 - Any scenario where execution order is non-deterministic
 
-**Choosing manual IDs:** auto-generated IDs are `{activity name}:{n}`, and a manual ID does not advance the count. A manual `fetch_data:1` would therefore also be the ID of the next `fetchData.Execute(ctx, url)` without one, which would return the earlier call's result without running. Use IDs an auto-generated one cannot be, such as `fetch_data:url-1`, unique within the instance. Run only activities from goroutines: call `Sleep`, `WaitEvent`, `Receive`, `Publish` and the other workflow APIs from the workflow function itself (see [Deterministic Replay](/docs/core-features/durable-execution/replay)).
+**Choosing manual IDs:** auto-generated IDs are `{activity name}:{n}`, and a manual ID does not advance the count. A manual `fetch_data:1` would therefore also be the ID of the next `fetchData.Execute(ctx, url)` without one, which would return the earlier call's result without running. Use IDs an auto-generated one cannot be, such as `fetch_data:url-1`, unique within the instance. Romancy logs a warning (`activity ID used twice in one run`) when a run uses an ID twice. Run only activities from goroutines: call `Sleep`, `WaitEvent`, `Receive`, `Publish` and the other workflow APIs from the workflow function itself (see [Deterministic Replay](/docs/core-features/durable-execution/replay)).
 
 ### Best Practices
 
