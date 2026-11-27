@@ -43,8 +43,7 @@ func main() {
 	case "get":
 		fs := flag.NewFlagSet("get", flag.ExitOnError)
 		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
-		_ = fs.Parse(cmdArgs)
-		args := fs.Args()
+		args := parseFlags(fs, cmdArgs)
 
 		if len(args) < 1 {
 			fmt.Println("Error: instance_id is required")
@@ -60,8 +59,7 @@ func main() {
 		fs := flag.NewFlagSet("event", flag.ExitOnError)
 		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		fs.StringVar(&baseURL, "url", "http://localhost:8080", "Base URL of running Romancy server")
-		_ = fs.Parse(cmdArgs)
-		args := fs.Args()
+		args := parseFlags(fs, cmdArgs)
 
 		if len(args) < 3 {
 			fmt.Println("Error: instance_id, event_type, and json_data are required")
@@ -78,7 +76,7 @@ func main() {
 		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		statusFlag := fs.String("status", "", "Filter by status")
 		pageToken := fs.String("page-token", "", "Pagination token for next page")
-		_ = fs.Parse(cmdArgs)
+		parseFlags(fs, cmdArgs)
 
 		if err := cmdList(*statusFlag, *pageToken); err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -89,8 +87,7 @@ func main() {
 		fs := flag.NewFlagSet("cancel", flag.ExitOnError)
 		fs.StringVar(&dbPath, "db", "romancy.db", "Database path or URL")
 		fs.StringVar(&baseURL, "url", "http://localhost:8080", "Base URL of running Romancy server")
-		_ = fs.Parse(cmdArgs)
-		args := fs.Args()
+		args := parseFlags(fs, cmdArgs)
 
 		if len(args) < 1 {
 			fmt.Println("Error: instance_id is required")
@@ -390,6 +387,22 @@ func statusEmoji(status storage.WorkflowStatus) string {
 		return "⏪ compensating"
 	default:
 		return string(status)
+	}
+}
+
+// parseFlags parses flags given before or after the positional arguments
+// (the flag package alone stops at the first positional one) and returns the
+// positional arguments.
+func parseFlags(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		_ = fs.Parse(args)
+		args = fs.Args()
+		if len(args) == 0 {
+			return positional
+		}
+		positional = append(positional, args[0])
+		args = args[1:]
 	}
 }
 
