@@ -391,8 +391,9 @@ func (e *Engine) ResumeWorkflowWithLockID(
 }
 
 // executeWorkflow executes or replays a workflow. Each run calls the
-// OnWorkflowStart hook once, and at most one of OnWorkflowComplete and
-// OnWorkflowFailed.
+// OnWorkflowStart hook once, then exactly one of OnWorkflowComplete,
+// OnWorkflowFailed and, on hooks that implement hooks.WorkflowSuspendHooks,
+// OnWorkflowSuspended.
 func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName string, input any, runner WorkflowRunner, lockID string) error {
 	// Load history using iterator (streams from storage in batches)
 	iter := storage.NewHistoryIterator(ctx, e.storage, instanceID, &storage.HistoryIteratorOptions{
@@ -502,9 +503,25 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName s
 
 	duration := time.Since(startTime)
 
+	// A run that does not finish its workflow says so: it waits, recurs or
+	// was aborted, and a later run, possibly on another worker, continues.
+	finished := false
+	suspended := hooks.WorkflowSuspendedInfo{
+		InstanceID:   instanceID,
+		WorkflowName: workflowName,
+		Reason:       hooks.SuspendAborted,
+		Duration:     duration,
+	}
+	defer func() {
+		if !finished {
+			e.notifySuspended(ctx, suspended)
+		}
+	}()
+
 	// A run that lost its lock stops here: whatever it would record now
 	// belongs to the run the new owner is making, or will make.
 	if lockLost.Load() {
+		suspended.Error = storage.ErrLockNotHeld
 		return storage.ErrLockNotHeld
 	}
 
@@ -514,16 +531,23 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName s
 	// when workflow code swallowed the step's error and returned something
 	// else. The lock is released by the caller and a later run replays it.
 	if abortErr := execCtx.Aborted(); abortErr != nil {
+		suspended.Error = abortErr
 		return abortErr
 	}
 	if err != nil && (errors.Is(err, ErrRunAborted) || errors.Is(err, storage.ErrLockNotHeld) || ctx.Err() != nil) {
-		return execCtx.Abort(err)
+		suspended.Error = execCtx.Abort(err)
+		return suspended.Error
 	}
 
 	if err != nil {
 		// Check for SuspendSignal
 		if sig := AsSuspendSignal(err); sig != nil {
-			return e.handleSuspendSignal(ctx, instanceID, sig, lockID)
+			suspended.Reason = hooks.SuspendWaiting
+			if sig.Type == SuspendForRecur {
+				suspended.Reason = hooks.SuspendRecur
+			}
+			suspended.Error = e.handleSuspendSignal(ctx, instanceID, sig, lockID)
+			return suspended.Error
 		}
 
 		// Regular error - run compensations before marking as failed. The
@@ -545,6 +569,7 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName s
 		// Mark as failed
 		_ = e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusFailed, err.Error(), lockID)
 
+		finished = true
 		e.hooks.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{
 			InstanceID:   instanceID,
 			WorkflowName: workflowName,
@@ -558,15 +583,33 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName s
 	// Success - serialize result and mark as completed
 	resultData, err := json.Marshal(result)
 	if err != nil {
+		serializeErr := fmt.Errorf("failed to serialize result: %w", err)
 		_ = e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusFailed, "failed to serialize result", lockID)
-		return fmt.Errorf("failed to serialize result: %w", err)
+		finished = true
+		e.hooks.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{
+			InstanceID:   instanceID,
+			WorkflowName: workflowName,
+			Error:        serializeErr,
+			Duration:     duration,
+		})
+		return serializeErr
 	}
 
+	// An instance cancelled during this run stays cancelled: the result is
+	// not kept, and the run ends quietly.
 	if err := e.storage.UpdateInstanceOutputIfLocked(ctx, instanceID, resultData, lockID); err != nil {
+		suspended.Error = err
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return nil
+		}
 		return fmt.Errorf("failed to set result: %w", err)
 	}
 
 	if err := e.storage.UpdateInstanceStatusIfLocked(ctx, instanceID, storage.StatusCompleted, "", lockID); err != nil {
+		suspended.Error = err
+		if errors.Is(err, storage.ErrInstanceTerminated) {
+			return nil
+		}
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -581,6 +624,7 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName s
 		})
 	}
 
+	finished = true
 	e.hooks.OnWorkflowComplete(ctx, hooks.WorkflowCompleteInfo{
 		InstanceID:   instanceID,
 		WorkflowName: workflowName,
@@ -589,6 +633,14 @@ func (e *Engine) executeWorkflow(ctx context.Context, instanceID, workflowName s
 	})
 
 	return nil
+}
+
+// notifySuspended calls OnWorkflowSuspended on hooks that implement
+// hooks.WorkflowSuspendHooks.
+func (e *Engine) notifySuspended(ctx context.Context, info hooks.WorkflowSuspendedInfo) {
+	if h, ok := e.hooks.(hooks.WorkflowSuspendHooks); ok {
+		h.OnWorkflowSuspended(ctx, info)
+	}
 }
 
 // handleSuspendSignal handles all workflow suspension cases.

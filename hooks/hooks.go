@@ -74,6 +74,50 @@ type WorkflowCancelledInfo struct {
 	Duration     time.Duration
 }
 
+// WorkflowSuspendHooks is implemented by hooks that want to know when a run
+// ends without finishing its workflow, for example to end what they opened
+// in OnWorkflowStart: the workflow continues in a later run, possibly on
+// another worker.
+//
+// After OnWorkflowStart, a run calls exactly one of OnWorkflowComplete,
+// OnWorkflowFailed and OnWorkflowSuspended, in the same process.
+// (OnWorkflowCancelled is called by the cancellation, not by a run; a run
+// that finds its instance cancelled calls OnWorkflowSuspended.) The
+// interface is separate from WorkflowHooks so that existing implementations
+// keep compiling: the engine calls it on hooks that implement it. NoOpHooks
+// does, so hooks that embed it can just define the method.
+type WorkflowSuspendHooks interface {
+	OnWorkflowSuspended(ctx context.Context, info WorkflowSuspendedInfo)
+}
+
+// SuspendReason tells why a run ended without finishing its workflow.
+type SuspendReason string
+
+const (
+	// SuspendWaiting: the workflow waits for a timer, a channel message or
+	// an event.
+	SuspendWaiting SuspendReason = "waiting"
+	// SuspendRecur: the workflow recurred and continues with new input.
+	SuspendRecur SuspendReason = "recur"
+	// SuspendAborted: the run stopped without an outcome: it lost its lock,
+	// hit a storage error, the worker shut down, or the instance was
+	// cancelled meanwhile. Unless the instance ended, a later run replays it.
+	SuspendAborted SuspendReason = "aborted"
+)
+
+// WorkflowSuspendedInfo contains information about a run that ended without
+// finishing its workflow.
+type WorkflowSuspendedInfo struct {
+	InstanceID   string
+	WorkflowName string
+	Reason       SuspendReason
+	// Error is the cause of an aborted run, or the error that kept a wait
+	// or a recur from being registered. It is nil when the run suspended as
+	// planned.
+	Error    error
+	Duration time.Duration
+}
+
 // ActivityStartInfo contains information about an activity start.
 type ActivityStartInfo struct {
 	InstanceID   string
@@ -212,3 +256,8 @@ func (n *NoOpHooks) OnTimerFired(ctx context.Context, info TimerFiredInfo)      
 func (n *NoOpHooks) OnReplayStart(ctx context.Context, info ReplayStartInfo)             {}
 func (n *NoOpHooks) OnReplayComplete(ctx context.Context, info ReplayCompleteInfo)       {}
 func (n *NoOpHooks) OnActivityCacheHit(ctx context.Context, info ActivityCacheHitInfo)   {}
+
+// OnWorkflowSuspended implements WorkflowSuspendHooks.
+func (n *NoOpHooks) OnWorkflowSuspended(ctx context.Context, info WorkflowSuspendedInfo) {}
+
+var _ WorkflowSuspendHooks = (*NoOpHooks)(nil)

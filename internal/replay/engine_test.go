@@ -884,3 +884,83 @@ func TestEngine_StartWorkflowClaimedByAnotherRun(t *testing.T) {
 	assert.False(t, ran, "the runner ran although another run holds the instance")
 	assert.Empty(t, recorder.names, "hooks were called for a run that did not happen")
 }
+
+// runEndHooks records how each run ended.
+type runEndHooks struct {
+	hooks.NoOpHooks
+	mu   sync.Mutex
+	ends []string // "complete", "failed" or "suspended:<reason>"
+	errs []error  // the error each end hook received
+}
+
+func (h *runEndHooks) end(how string, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ends = append(h.ends, how)
+	h.errs = append(h.errs, err)
+}
+
+func (h *runEndHooks) OnWorkflowComplete(context.Context, hooks.WorkflowCompleteInfo) {
+	h.end("complete", nil)
+}
+
+func (h *runEndHooks) OnWorkflowFailed(_ context.Context, info hooks.WorkflowFailedInfo) {
+	h.end("failed", info.Error)
+}
+
+func (h *runEndHooks) OnWorkflowSuspended(_ context.Context, info hooks.WorkflowSuspendedInfo) {
+	h.end("suspended:"+string(info.Reason), info.Error)
+}
+
+// After OnWorkflowStart, each run calls exactly one end hook: complete,
+// failed, or suspended with the reason.
+func TestEngine_EachRunEndsWithOneHook(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour)
+	var store storage.Storage
+	tests := []struct {
+		name    string
+		runner  WorkflowRunner
+		want    string
+		wantErr bool
+	}{
+		{"completed", func(*ExecutionContext) (any, error) { return "done", nil }, "complete", false},
+		{"failed", func(*ExecutionContext) (any, error) { return nil, errors.New("boom") }, "failed", true},
+		{"unserializable result", func(*ExecutionContext) (any, error) { return func() {}, nil }, "failed", true},
+		{"waiting for a timer", func(ec *ExecutionContext) (any, error) {
+			return nil, NewTimerSuspend(ec.InstanceID(), "sleep:1", "sleep:1", expiresAt)
+		}, "suspended:waiting", false},
+		{"waiting for a message", func(ec *ExecutionContext) (any, error) {
+			return nil, NewChannelMessageSuspend(ec.InstanceID(), "orders", "receive_orders:1", nil)
+		}, "suspended:waiting", false},
+		{"recur", func(ec *ExecutionContext) (any, error) {
+			return nil, NewRecurSuspend(ec.InstanceID(), map[string]int{"n": 1})
+		}, "suspended:recur", false},
+		{"aborted", func(ec *ExecutionContext) (any, error) {
+			return nil, ec.Abort(errors.New("storage down"))
+		}, "suspended:aborted", true},
+		{"cancelled during the run", func(ec *ExecutionContext) (any, error) {
+			if err := store.UpdateInstanceStatus(ec.Context(), ec.InstanceID(), storage.StatusCancelled, ""); err != nil {
+				return nil, err
+			}
+			return "done", nil
+		}, "suspended:aborted", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store = setupTestStorage(t)
+			recorder := &runEndHooks{}
+			engine := NewEngine(store, recorder, "worker-1")
+			require.NoError(t, store.CreateInstance(ctx, &storage.WorkflowInstance{
+				InstanceID:   "inst-end",
+				WorkflowName: "end_workflow",
+				Status:       storage.StatusRunning,
+			}))
+
+			_ = engine.StartWorkflow(ctx, "inst-end", "end_workflow", nil, tt.runner)
+
+			require.Equal(t, []string{tt.want}, recorder.ends)
+			assert.Equal(t, tt.wantErr, recorder.errs[0] != nil, "end hook error: %v", recorder.errs[0])
+		})
+	}
+}
