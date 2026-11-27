@@ -565,3 +565,126 @@ func TestActivityCacheHitEndsStartedSpan(t *testing.T) {
 		t.Errorf("expected no open activity spans, got %d", n)
 	}
 }
+
+// openRunSpans opens a workflow, replay, activity, event wait and timer span
+// for an instance.
+func openRunSpans(h *OTelHooks, instanceID string) {
+	ctx := context.Background()
+	h.OnReplayStart(ctx, hooks.ReplayStartInfo{InstanceID: instanceID, WorkflowName: "wf"})
+	h.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{InstanceID: instanceID, WorkflowName: "wf", StartTime: time.Now()})
+	h.OnActivityStart(ctx, hooks.ActivityStartInfo{InstanceID: instanceID, WorkflowName: "wf", ActivityID: "step:1", ActivityName: "step"})
+	h.OnEventWaitStart(ctx, hooks.EventWaitStartInfo{InstanceID: instanceID, WorkflowName: "wf", EventType: "approved"})
+	h.OnTimerStart(ctx, hooks.TimerStartInfo{InstanceID: instanceID, WorkflowName: "wf", TimerID: "sleep:1", ExpiresAt: time.Now().Add(time.Hour)})
+}
+
+// openSpanCount counts the spans the hooks hold open.
+func openSpanCount(h *OTelHooks) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.workflowSpans) + len(h.workflowContexts) + len(h.replaySpans) +
+		len(h.activitySpans) + len(h.eventWaitSpans) + len(h.timerSpans)
+}
+
+// A run that suspends ends every span the process holds for its instance,
+// and only for it: a supervisor's child, whose ID starts with the
+// supervisor's, keeps its spans.
+func TestWorkflowSuspendedEndsInstanceSpans(t *testing.T) {
+	h, sr := setupTest()
+	ctx := context.Background()
+	openRunSpans(h, "sup")
+	openRunSpans(h, "sup:child:g1")
+
+	h.OnWorkflowSuspended(ctx, hooks.WorkflowSuspendedInfo{
+		InstanceID: "sup", WorkflowName: "wf", Reason: hooks.SuspendWaiting, Duration: time.Millisecond,
+	})
+
+	ended := sr.Ended()
+	if len(ended) != 5 {
+		t.Fatalf("ended %d spans, want the 5 of the instance", len(ended))
+	}
+	for _, span := range ended {
+		checkAttribute(t, span.Attributes(), "romancy.instance_id", "sup")
+		checkAttribute(t, span.Attributes(), "romancy.suspend_reason", "waiting")
+		if span.Status().Code != codes.Unset {
+			t.Errorf("span %s status = %v, want unset", span.Name(), span.Status().Code)
+		}
+	}
+	if got := openSpanCount(h); got != 6 { // the child's 5 spans and its workflow context
+		t.Fatalf("%d entries open, want the child's 6", got)
+	}
+
+	// An aborted run records its error on the workflow span.
+	h.OnWorkflowSuspended(ctx, hooks.WorkflowSuspendedInfo{
+		InstanceID: "sup:child:g1", WorkflowName: "wf", Reason: hooks.SuspendAborted, Error: errors.New("lock lost"),
+	})
+	ended = sr.Ended()
+	if len(ended) != 10 {
+		t.Fatalf("ended %d spans, want 10", len(ended))
+	}
+	var recorded bool
+	for _, span := range ended[5:] {
+		if span.Name() == "workflow/wf" {
+			for _, event := range span.Events() {
+				recorded = recorded || event.Name == "exception"
+			}
+		}
+	}
+	if !recorded {
+		t.Error("the aborted run's workflow span has no error event")
+	}
+	if got := openSpanCount(h); got != 0 {
+		t.Errorf("%d entries still open, want 0", got)
+	}
+}
+
+// A replay span left open by an earlier run is ended when the next replay
+// starts, and a failed run ends its replay span with its workflow span.
+func TestReplaySpansAreEnded(t *testing.T) {
+	h, sr := setupTest()
+	ctx := context.Background()
+	h.OnReplayStart(ctx, hooks.ReplayStartInfo{InstanceID: "wf-1", WorkflowName: "wf"})
+	h.OnReplayStart(ctx, hooks.ReplayStartInfo{InstanceID: "wf-1", WorkflowName: "wf"})
+	if got := len(sr.Ended()); got != 1 {
+		t.Fatalf("ended %d spans, want the earlier replay span", got)
+	}
+
+	h.OnWorkflowStart(ctx, hooks.WorkflowStartInfo{InstanceID: "wf-1", WorkflowName: "wf", StartTime: time.Now()})
+	h.OnWorkflowFailed(ctx, hooks.WorkflowFailedInfo{InstanceID: "wf-1", WorkflowName: "wf", Error: errors.New("boom")})
+	if got := len(sr.Ended()); got != 3 {
+		t.Fatalf("ended %d spans, want 3", got)
+	}
+	if got := openSpanCount(h); got != 0 {
+		t.Errorf("%d entries still open, want 0", got)
+	}
+}
+
+// A timer whose span ended with its run is marked by a timer_fired span when
+// it fires.
+func TestTimerFiredWithoutOpenSpan(t *testing.T) {
+	h, sr := setupTest()
+	h.OnTimerFired(context.Background(), hooks.TimerFiredInfo{
+		InstanceID: "wf-1", WorkflowName: "wf", TimerID: "sleep:1", FiredAt: time.Now(),
+	})
+	ended := sr.Ended()
+	if len(ended) != 1 || ended[0].Name() != "timer_fired/sleep:1" {
+		t.Fatalf("ended %d spans (%v), want one timer_fired/sleep:1", len(ended), ended)
+	}
+	checkAttribute(t, ended[0].Attributes(), "romancy.instance_id", "wf-1")
+}
+
+// A timeout handled after its wait's run ended is marked by an event_timeout
+// span with error status.
+func TestEventTimeoutWithoutOpenSpan(t *testing.T) {
+	h, sr := setupTest()
+	h.OnEventTimeout(context.Background(), hooks.EventTimeoutInfo{
+		InstanceID: "wf-1", WorkflowName: "wf", EventType: "payment.done",
+	})
+	ended := sr.Ended()
+	if len(ended) != 1 || ended[0].Name() != "event_timeout/payment.done" {
+		t.Fatalf("ended %d spans (%v), want one event_timeout/payment.done", len(ended), ended)
+	}
+	if ended[0].Status().Code != codes.Error {
+		t.Errorf("status = %v, want Error", ended[0].Status().Code)
+	}
+	checkAttribute(t, ended[0].Attributes(), "romancy.event_type", "payment.done")
+}

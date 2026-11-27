@@ -22,6 +22,11 @@ const (
 // It creates spans for workflow, activity, event, timer, and replay lifecycle events.
 // It is safe for concurrent use: workflows run concurrently and call their
 // hooks from different goroutines.
+//
+// A workflow span covers one run. A run that waits, recurs or is aborted
+// ends with OnWorkflowSuspended, which ends the spans the process holds for
+// the instance; the next run, possibly on another worker, opens new ones.
+// The spans of an instance share the romancy.instance_id attribute.
 type OTelHooks struct {
 	hooks.NoOpHooks
 	tracer trace.Tracer
@@ -35,18 +40,24 @@ type OTelHooks struct {
 	// Map of instance_id -> context with workflow span for child spans
 	workflowContexts map[string]context.Context
 
-	// Map of instance_id:activity_id -> active span for tracking activity spans
-	activitySpans map[string]trace.Span
+	// Open activity spans, by instance and activity ID
+	activitySpans map[spanKey]trace.Span
 
-	// Map of instance_id:event_type -> active span for tracking event wait spans
-	eventWaitSpans map[string]trace.Span
+	// Open event wait spans, by instance and event type
+	eventWaitSpans map[spanKey]trace.Span
 
-	// Map of instance_id:timer_id -> active span for tracking timer spans
-	timerSpans map[string]trace.Span
+	// Open timer spans, by instance and timer ID
+	timerSpans map[spanKey]trace.Span
 
-	// Map of instance_id -> active span for tracking replay spans
-	replaySpans map[string]trace.Span
+	// Open replay spans, by instance (id is empty)
+	replaySpans map[spanKey]trace.Span
 }
+
+// spanKey identifies an open span of an instance. A struct and not a joined
+// string: instance IDs may contain ':' (a supervisor's child is
+// "{supervisor}:{child}:g{n}"), and ending the spans of one instance must not
+// end those of another.
+type spanKey struct{ instanceID, id string }
 
 // NewOTelHooks creates a new OpenTelemetry hooks instance.
 // If tracerProvider is nil, the global tracer provider is used.
@@ -62,22 +73,27 @@ func NewOTelHooks(tracerProvider trace.TracerProvider) *OTelHooks {
 		tracer:           tracer,
 		workflowSpans:    make(map[string]trace.Span),
 		workflowContexts: make(map[string]context.Context),
-		activitySpans:    make(map[string]trace.Span),
-		eventWaitSpans:   make(map[string]trace.Span),
-		timerSpans:       make(map[string]trace.Span),
-		replaySpans:      make(map[string]trace.Span),
+		activitySpans:    make(map[spanKey]trace.Span),
+		eventWaitSpans:   make(map[spanKey]trace.Span),
+		timerSpans:       make(map[spanKey]trace.Span),
+		replaySpans:      make(map[spanKey]trace.Span),
 	}
 }
 
-// storeSpan records an open span under key.
-func (h *OTelHooks) storeSpan(spans map[string]trace.Span, key string, span trace.Span) {
+// storeSpan records an open span under key. A span still open under the key
+// (one whose end hook never came) is ended.
+func (h *OTelHooks) storeSpan(spans map[spanKey]trace.Span, key spanKey, span trace.Span) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	previous, ok := spans[key]
 	spans[key] = span
+	h.mu.Unlock()
+	if ok {
+		previous.End()
+	}
 }
 
 // peekSpan returns the open span under key.
-func (h *OTelHooks) peekSpan(spans map[string]trace.Span, key string) (trace.Span, bool) {
+func (h *OTelHooks) peekSpan(spans map[spanKey]trace.Span, key spanKey) (trace.Span, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	span, ok := spans[key]
@@ -85,7 +101,7 @@ func (h *OTelHooks) peekSpan(spans map[string]trace.Span, key string) (trace.Spa
 }
 
 // takeSpan removes and returns the open span under key.
-func (h *OTelHooks) takeSpan(spans map[string]trace.Span, key string) (trace.Span, bool) {
+func (h *OTelHooks) takeSpan(spans map[spanKey]trace.Span, key spanKey) (trace.Span, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	span, ok := spans[key]
@@ -95,16 +111,32 @@ func (h *OTelHooks) takeSpan(spans map[string]trace.Span, key string) (trace.Spa
 	return span, ok
 }
 
-// takeWorkflowSpan removes and returns the open workflow span of an instance.
-func (h *OTelHooks) takeWorkflowSpan(instanceID string) (trace.Span, bool) {
+// takeInstanceSpans removes and returns the open spans of an instance: its
+// workflow span (nil when none is open) and the others (replay, activity,
+// event wait and timer spans).
+func (h *OTelHooks) takeInstanceSpans(instanceID string) (workflow trace.Span, others []trace.Span) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	span, ok := h.workflowSpans[instanceID]
-	if ok {
-		delete(h.workflowSpans, instanceID)
-		delete(h.workflowContexts, instanceID)
+	workflow = h.workflowSpans[instanceID]
+	delete(h.workflowSpans, instanceID)
+	delete(h.workflowContexts, instanceID)
+	for _, spans := range []map[spanKey]trace.Span{h.replaySpans, h.activitySpans, h.eventWaitSpans, h.timerSpans} {
+		for key, span := range spans {
+			if key.instanceID == instanceID {
+				others = append(others, span)
+				delete(spans, key)
+			}
+		}
 	}
-	return span, ok
+	return workflow, others
+}
+
+// endSpans ends spans that the end of a run left open.
+func endSpans(spans []trace.Span, attrs ...attribute.KeyValue) {
+	for _, span := range spans {
+		span.SetAttributes(attrs...)
+		span.End()
+	}
 }
 
 // Workflow lifecycle
@@ -132,7 +164,9 @@ func (h *OTelHooks) OnWorkflowStart(ctx context.Context, info hooks.WorkflowStar
 
 // OnWorkflowComplete ends the workflow span with success status.
 func (h *OTelHooks) OnWorkflowComplete(ctx context.Context, info hooks.WorkflowCompleteInfo) {
-	if span, ok := h.takeWorkflowSpan(info.InstanceID); ok {
+	span, others := h.takeInstanceSpans(info.InstanceID)
+	endSpans(others)
+	if span != nil {
 		span.SetAttributes(
 			attribute.Int64("romancy.duration_ms", info.Duration.Milliseconds()),
 		)
@@ -143,7 +177,9 @@ func (h *OTelHooks) OnWorkflowComplete(ctx context.Context, info hooks.WorkflowC
 
 // OnWorkflowFailed ends the workflow span with error status.
 func (h *OTelHooks) OnWorkflowFailed(ctx context.Context, info hooks.WorkflowFailedInfo) {
-	if span, ok := h.takeWorkflowSpan(info.InstanceID); ok {
+	span, others := h.takeInstanceSpans(info.InstanceID)
+	endSpans(others)
+	if span != nil {
 		span.SetAttributes(
 			attribute.Int64("romancy.duration_ms", info.Duration.Milliseconds()),
 		)
@@ -155,7 +191,9 @@ func (h *OTelHooks) OnWorkflowFailed(ctx context.Context, info hooks.WorkflowFai
 
 // OnWorkflowCancelled ends the workflow span with cancellation status.
 func (h *OTelHooks) OnWorkflowCancelled(ctx context.Context, info hooks.WorkflowCancelledInfo) {
-	if span, ok := h.takeWorkflowSpan(info.InstanceID); ok {
+	span, others := h.takeInstanceSpans(info.InstanceID)
+	endSpans(others)
+	if span != nil {
 		span.SetAttributes(
 			attribute.Int64("romancy.duration_ms", info.Duration.Milliseconds()),
 			attribute.String("romancy.cancel_reason", info.Reason),
@@ -165,10 +203,31 @@ func (h *OTelHooks) OnWorkflowCancelled(ctx context.Context, info hooks.Workflow
 	}
 }
 
+// OnWorkflowSuspended ends the spans this process holds for the instance when
+// a run ends without finishing the workflow (it waits, recurs or was
+// aborted), with the reason in romancy.suspend_reason. A wait thus shows as
+// the gap until the next run's span. The status stays unset: an aborted run
+// (for example on shutdown) records its error as an event.
+func (h *OTelHooks) OnWorkflowSuspended(ctx context.Context, info hooks.WorkflowSuspendedInfo) {
+	reason := attribute.String("romancy.suspend_reason", string(info.Reason))
+	span, others := h.takeInstanceSpans(info.InstanceID)
+	endSpans(others, reason)
+	if span != nil {
+		span.SetAttributes(
+			attribute.Int64("romancy.duration_ms", info.Duration.Milliseconds()),
+			reason,
+		)
+		if info.Error != nil {
+			span.RecordError(info.Error)
+		}
+		span.End()
+	}
+}
+
 // Activity lifecycle
 
-func (h *OTelHooks) activityKey(instanceID, activityID string) string {
-	return instanceID + ":" + activityID
+func (h *OTelHooks) activityKey(instanceID, activityID string) spanKey {
+	return spanKey{instanceID, activityID}
 }
 
 // OnActivityStart creates a new span when an activity starts.
@@ -262,8 +321,8 @@ func (h *OTelHooks) OnActivityCacheHit(ctx context.Context, info hooks.ActivityC
 
 // Event handling
 
-func (h *OTelHooks) eventWaitKey(instanceID, eventType string) string {
-	return instanceID + ":" + eventType
+func (h *OTelHooks) eventWaitKey(instanceID, eventType string) spanKey {
+	return spanKey{instanceID, eventType}
 }
 
 // OnEventReceived creates a span for a received event.
@@ -311,19 +370,30 @@ func (h *OTelHooks) OnEventWaitComplete(ctx context.Context, info hooks.EventWai
 	}
 }
 
-// OnEventTimeout ends the event wait span with timeout status.
+// OnEventTimeout ends the event wait span with timeout status. A wait span
+// ends with the run that waits (OnWorkflowSuspended), and the timeout may be
+// handled on another worker: without an open span, a short
+// event_timeout/<event type> span marks the timeout.
 func (h *OTelHooks) OnEventTimeout(ctx context.Context, info hooks.EventTimeoutInfo) {
-	key := h.eventWaitKey(info.InstanceID, info.EventType)
-	if span, ok := h.takeSpan(h.eventWaitSpans, key); ok {
-		span.SetStatus(codes.Error, "event timeout")
-		span.End()
+	span, ok := h.takeSpan(h.eventWaitSpans, h.eventWaitKey(info.InstanceID, info.EventType))
+	if !ok {
+		_, span = h.tracer.Start(ctx, fmt.Sprintf("event_timeout/%s", info.EventType),
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				attribute.String("romancy.instance_id", info.InstanceID),
+				attribute.String("romancy.workflow_name", info.WorkflowName),
+				attribute.String("romancy.event_type", info.EventType),
+			),
+		)
 	}
+	span.SetStatus(codes.Error, "event timeout")
+	span.End()
 }
 
 // Timer handling
 
-func (h *OTelHooks) timerKey(instanceID, timerID string) string {
-	return instanceID + ":" + timerID
+func (h *OTelHooks) timerKey(instanceID, timerID string) spanKey {
+	return spanKey{instanceID, timerID}
 }
 
 // OnTimerStart creates a span when a timer starts.
@@ -340,16 +410,27 @@ func (h *OTelHooks) OnTimerStart(ctx context.Context, info hooks.TimerStartInfo)
 	h.storeSpan(h.timerSpans, h.timerKey(info.InstanceID, info.TimerID), span)
 }
 
-// OnTimerFired ends the timer span when the timer fires.
+// OnTimerFired ends the timer span when the timer fires. A timer span ends
+// with the run that waits for it (OnWorkflowSuspended), and the timer may
+// fire on another worker: without an open span, a short
+// timer_fired/<timer id> span marks the firing.
 func (h *OTelHooks) OnTimerFired(ctx context.Context, info hooks.TimerFiredInfo) {
-	key := h.timerKey(info.InstanceID, info.TimerID)
-	if span, ok := h.takeSpan(h.timerSpans, key); ok {
-		span.SetAttributes(
-			attribute.String("romancy.fired_at", info.FiredAt.String()),
+	span, ok := h.takeSpan(h.timerSpans, h.timerKey(info.InstanceID, info.TimerID))
+	if !ok {
+		_, span = h.tracer.Start(ctx, fmt.Sprintf("timer_fired/%s", info.TimerID),
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				attribute.String("romancy.instance_id", info.InstanceID),
+				attribute.String("romancy.workflow_name", info.WorkflowName),
+				attribute.String("romancy.timer_id", info.TimerID),
+			),
 		)
-		span.SetStatus(codes.Ok, "timer fired")
-		span.End()
 	}
+	span.SetAttributes(
+		attribute.String("romancy.fired_at", info.FiredAt.String()),
+	)
+	span.SetStatus(codes.Ok, "timer fired")
+	span.End()
 }
 
 // Replay
@@ -365,12 +446,12 @@ func (h *OTelHooks) OnReplayStart(ctx context.Context, info hooks.ReplayStartInf
 			attribute.String("romancy.resume_activity", info.ResumeActivity),
 		),
 	)
-	h.storeSpan(h.replaySpans, info.InstanceID, span)
+	h.storeSpan(h.replaySpans, spanKey{instanceID: info.InstanceID}, span)
 }
 
 // OnReplayComplete ends the replay span with success status.
 func (h *OTelHooks) OnReplayComplete(ctx context.Context, info hooks.ReplayCompleteInfo) {
-	if span, ok := h.takeSpan(h.replaySpans, info.InstanceID); ok {
+	if span, ok := h.takeSpan(h.replaySpans, spanKey{instanceID: info.InstanceID}); ok {
 		span.SetAttributes(
 			attribute.Int("romancy.cache_hits", info.CacheHits),
 			attribute.Int("romancy.new_activities", info.NewActivities),
@@ -381,5 +462,8 @@ func (h *OTelHooks) OnReplayComplete(ctx context.Context, info hooks.ReplayCompl
 	}
 }
 
-// Ensure OTelHooks implements WorkflowHooks interface
-var _ hooks.WorkflowHooks = (*OTelHooks)(nil)
+// Ensure OTelHooks implements the hook interfaces
+var (
+	_ hooks.WorkflowHooks        = (*OTelHooks)(nil)
+	_ hooks.WorkflowSuspendHooks = (*OTelHooks)(nil)
+)
