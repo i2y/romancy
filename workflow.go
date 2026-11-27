@@ -98,6 +98,7 @@ func RegisterWorkflow[I, O any](app *App, workflow Workflow[I, O], opts ...Workf
 
 		// Create WorkflowContext from ExecutionContext
 		wfCtx := NewWorkflowContextFromExecution(execCtx)
+		wfCtx.workflowName = name
 
 		// Set App reference for accessing app-level configuration (e.g., LLM defaults)
 		wfCtx.SetApp(app)
