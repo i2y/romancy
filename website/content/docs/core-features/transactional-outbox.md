@@ -53,10 +53,15 @@ type CreateOrderResult struct {
 	Status  string `json:"status"`
 }
 
+type CreateOrderInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID string, amount float64) (CreateOrderResult, error) {
+	func(ctx context.Context, input CreateOrderInput) (CreateOrderResult, error) {
 		// Business logic
-		fmt.Printf("Creating order %s\n", orderID)
+		fmt.Printf("Creating order %s\n", input.OrderID)
 
 		// Get workflow context for transactional event sending
 		wfCtx := romancy.GetWorkflowContext(ctx)
@@ -67,8 +72,8 @@ var createOrder = romancy.DefineActivity("create_order",
 			"order.created",
 			"order-service",
 			map[string]any{
-				"order_id": orderID,
-				"amount":   amount,
+				"order_id": input.OrderID,
+				"amount":   input.Amount,
 				"status":   "pending",
 			},
 		)
@@ -76,7 +81,7 @@ var createOrder = romancy.DefineActivity("create_order",
 			return CreateOrderResult{}, err
 		}
 
-		return CreateOrderResult{OrderID: orderID, Status: "created"}, nil
+		return CreateOrderResult{OrderID: input.OrderID, Status: "created"}, nil
 	},
 )
 ```
@@ -103,13 +108,16 @@ func main() {
 		romancy.WithBrokerURL("http://localhost:8080/events"), // CloudEvents endpoint
 	)
 
+	// Register your workflows before starting the app:
+	// romancy.RegisterWorkflow(app, orderWorkflow)
+
 	ctx := context.Background()
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer app.Shutdown(ctx)
 
-	// Your workflow code here
+	// Start workflows here
 }
 ```
 
@@ -138,7 +146,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/i2y/romancy"
 )
@@ -155,8 +162,13 @@ type ProcessPaymentResult struct {
 	Status  string `json:"status"`
 }
 
+type ProcessPaymentInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (ProcessPaymentResult, error) {
+	func(ctx context.Context, input ProcessPaymentInput) (ProcessPaymentResult, error) {
 		// Get workflow context
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
@@ -165,13 +177,13 @@ var processPayment = romancy.DefineActivity("process_payment",
 
 		// Your business logic (same transaction as Romancy)
 		payment := Payment{
-			OrderID: orderID,
-			Amount:  amount,
+			OrderID: input.OrderID,
+			Amount:  input.Amount,
 			Status:  "completed",
 		}
 
 		// Insert payment record
-		_, err := session.Exec(
+		_, err := session.ExecContext(ctx,
 			"INSERT INTO payments (order_id, amount, status) VALUES (?, ?, ?)",
 			payment.OrderID, payment.Amount, payment.Status,
 		)
@@ -183,7 +195,7 @@ var processPayment = romancy.DefineActivity("process_payment",
 		err = romancy.SendEventTransactional(wfCtx,
 			"payment.processed",
 			"payment-service",
-			map[string]any{"order_id": orderID, "amount": amount},
+			map[string]any{"order_id": input.OrderID, "amount": input.Amount},
 		)
 		if err != nil {
 			return ProcessPaymentResult{}, err
@@ -193,7 +205,7 @@ var processPayment = romancy.DefineActivity("process_payment",
 		// 1. Your payment record (same database)
 		// 2. Romancy's outbox event
 		// 3. Romancy's workflow history
-		return ProcessPaymentResult{OrderID: orderID, Status: "processed"}, nil
+		return ProcessPaymentResult{OrderID: input.OrderID, Status: "processed"}, nil
 	},
 )
 ```
@@ -207,27 +219,36 @@ type PaymentResult struct {
 	OrderID string `json:"order_id"`
 }
 
+type PaymentInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
+	func(ctx context.Context, input PaymentInput) (PaymentResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// Access Romancy-managed session
 		session := wfCtx.Session()
 
 		// Your business logic
-		_, err := session.Exec("INSERT INTO payments ...")
+		_, err := session.ExecContext(ctx, "INSERT INTO payments (order_id, amount) VALUES (?, ?)", input.OrderID, input.Amount)
 		if err != nil {
 			return PaymentResult{}, err // Romancy automatically rolls back
 		}
 
 		// Events in same transaction
-		err = romancy.SendEventTransactional(wfCtx, ...)
+		err = romancy.SendEventTransactional(wfCtx,
+			"payment.processed",
+			"payment-service",
+			map[string]any{"order_id": input.OrderID},
+		)
 		if err != nil {
 			return PaymentResult{}, err // Romancy automatically rolls back
 		}
 
 		// Romancy automatically commits on success
-		return PaymentResult{OrderID: orderID}, nil
+		return PaymentResult{OrderID: input.OrderID}, nil
 	},
 )
 ```
@@ -264,97 +285,95 @@ This results in:
 
 ---
 
-## Advanced Transaction Control
+## Transaction Boundaries
 
-Activities are automatically transactional (see [Automatic Transaction Management](#automatic-transaction-management) above). However, in advanced scenarios, you may need finer control over transaction boundaries using `ctx.Transaction()`.
+Each attempt of an activity runs in one transaction: its writes through `ctx.Session()`, the events it sends with `SendEventTransactional` and its history record commit together, or not at all. A failed attempt is rolled back before the activity is retried, so it leaves no rows and no events behind.
 
-### When to Use Advanced Transaction Control
-
-- **Nested transactions (savepoints)** - Partial rollback within activities
-- **Workflow-level transactions** - Manual control in workflow functions (not activities)
-
-### Nested Transactions (Savepoints) in Activities
-
-Within an activity, you can use `ctx.Transaction()` for savepoints:
+There are no nested transactions or savepoints inside an activity. To commit one step whatever happens to the next, put the steps in separate activities and let the workflow decide what a failure means:
 
 ```go
-type OrderWithPaymentResult struct {
+type OrderStepResult struct {
 	OrderID string `json:"order_id"`
 	Status  string `json:"status"`
 }
 
-var processOrderWithOptionalPayment = romancy.DefineActivity("process_order_with_optional_payment",
-	func(ctx context.Context, orderID string) (OrderWithPaymentResult, error) {
+// Commits the order and its event, whatever happens to the payment
+var createOrderRecord = romancy.DefineActivity("create_order_record",
+	func(ctx context.Context, orderID string) (OrderStepResult, error) {
 		wfCtx := romancy.GetWorkflowContext(ctx)
-		session := wfCtx.Session()
-
-		// Outer transaction (automatic, managed by activity)
-		_, err := session.Exec(
+		_, err := wfCtx.Session().ExecContext(ctx,
 			"INSERT INTO orders (order_id, status) VALUES (?, ?)",
 			orderID, "pending",
 		)
 		if err != nil {
-			return OrderWithPaymentResult{}, err
+			return OrderStepResult{}, err
 		}
-
-		err = romancy.SendEventTransactional(wfCtx,
-			"order.created",
-			"order-service",
+		err = romancy.SendEventTransactional(wfCtx, "order.created", "order-service",
 			map[string]any{"order_id": orderID},
 		)
 		if err != nil {
-			return OrderWithPaymentResult{}, err
+			return OrderStepResult{}, err
 		}
+		return OrderStepResult{OrderID: orderID, Status: "created"}, nil
+	},
+)
 
-		// Nested transaction (savepoint)
-		err = wfCtx.Transaction(func() error {
-			// Risky payment operation
-			err := romancy.SendEventTransactional(wfCtx,
-				"payment.attempted",
-				"payment-service",
-				map[string]any{"order_id": orderID},
-			)
-			if err != nil {
-				return err
-			}
-
-			_, err = session.Exec(
-				"INSERT INTO payments (order_id, amount) VALUES (?, ?)",
-				orderID, 100.0,
-			)
-			if err != nil {
-				return err
-			}
-
-			// Simulate failure
-			return fmt.Errorf("payment gateway unavailable")
-		})
-
+// Its failure rolls back its own payment row and event, nothing else
+var chargeOrder = romancy.DefineActivity("charge_order",
+	func(ctx context.Context, orderID string) (OrderStepResult, error) {
+		wfCtx := romancy.GetWorkflowContext(ctx)
+		_, err := wfCtx.Session().ExecContext(ctx,
+			"INSERT INTO payments (order_id, amount) VALUES (?, ?)",
+			orderID, 100.0,
+		)
 		if err != nil {
-			// Inner transaction rolled back to savepoint
-			// Order creation still succeeds, but payment failed
-			err = romancy.SendEventTransactional(wfCtx,
-				"payment.failed",
-				"payment-service",
-				map[string]any{"order_id": orderID, "reason": "gateway_unavailable"},
-			)
-			if err != nil {
-				return OrderWithPaymentResult{}, err
-			}
+			return OrderStepResult{}, err
+		}
+		err = romancy.SendEventTransactional(wfCtx, "payment.charged", "payment-service",
+			map[string]any{"order_id": orderID},
+		)
+		if err != nil {
+			return OrderStepResult{}, err
 		}
 
-		// Outer transaction commits successfully
-		return OrderWithPaymentResult{OrderID: orderID, Status: "created"}, nil
+		// Simulate failure
+		return OrderStepResult{}, fmt.Errorf("payment gateway unavailable")
+	},
+)
+
+var recordPaymentFailure = romancy.DefineActivity("record_payment_failure",
+	func(ctx context.Context, orderID string) (OrderStepResult, error) {
+		err := romancy.SendEventTransactional(romancy.GetWorkflowContext(ctx),
+			"payment.failed",
+			"payment-service",
+			map[string]any{"order_id": orderID, "reason": "gateway_unavailable"},
+		)
+		if err != nil {
+			return OrderStepResult{}, err
+		}
+		return OrderStepResult{OrderID: orderID, Status: "payment_failed"}, nil
+	},
+)
+
+var orderWithOptionalPayment = romancy.DefineWorkflow("order_with_optional_payment",
+	func(ctx *romancy.WorkflowContext, orderID string) (OrderStepResult, error) {
+		if _, err := createOrderRecord.Execute(ctx, orderID); err != nil {
+			return OrderStepResult{}, err
+		}
+		if _, err := chargeOrder.Execute(ctx, orderID); err != nil {
+			// The order stays created; only the payment attempts were rolled back
+			return recordPaymentFailure.Execute(ctx, orderID)
+		}
+		return OrderStepResult{OrderID: orderID, Status: "paid"}, nil
 	},
 )
 ```
 
 **Key points:**
 
-- Outer transaction is **automatically managed** by the activity
-- Inner `ctx.Transaction()` creates a **savepoint**
-- Inner transaction failure doesn't affect outer transaction
-- Order and payment failure event are both committed
+- The activity is the unit of atomicity: everything one attempt does commits or rolls back together
+- Split work into activities where you need separate commits
+- Here the order and its `order.created` event are committed; the failed payment leaves no `payments` row and no `payment.charged` event
 
 ---
 
@@ -398,18 +417,19 @@ sequenceDiagram
     participant DB as Database
     participant B as Message Broker
 
-    loop Every 1 second (configurable)
-        R->>DB: SELECT * FROM outbox_events WHERE status='pending'
-        DB->>R: Return pending events
+    loop Every poll (1 second by default, longer while idle)
+        R->>DB: Claim pending events (status='processing')
+        DB->>R: Return claimed events
 
         loop For each event
+            R->>DB: UPDATE retry_count++
             R->>B: POST CloudEvent
-            alt Success
-                B->>R: 200 OK
+            alt Delivered
+                B->>R: 2xx
                 R->>DB: UPDATE status='published'
-            else Failure
-                B->>R: 500 Error
-                R->>DB: UPDATE retry_count++
+            else Not delivered
+                B->>R: Error
+                R->>DB: UPDATE status='pending'
             end
         end
     end
@@ -417,9 +437,10 @@ sequenceDiagram
 
 **Key Points:**
 
-- Polls database every 1 second (default)
+- Polls the database every second by default; while there is nothing to send, the interval doubles up to 30 seconds and resets as soon as events show up. On PostgreSQL, LISTEN/NOTIFY wakes the relayer when an event is written
 - Publishes events as CloudEvents (HTTP)
-- Implements fixed-interval retry (retry on every poll until max_retries)
+- Sends a failed event again on a later poll, up to 5 attempts in all
+- Claims events atomically, so the relayers of several workers can share one database
 - At-least-once delivery guarantee
 
 ---
@@ -434,150 +455,121 @@ app := romancy.NewApp(
 	romancy.WithWorkerID("worker-1"),
 	romancy.WithOutbox(true),
 	romancy.WithBrokerURL("http://localhost:8080/events"),
+	romancy.WithOutboxInterval(2*time.Second), // Poll every 2 seconds (default: 1s)
+	romancy.WithOutboxBatchSize(50),           // Claim up to 50 events per poll (default: 100)
 )
 ```
+
+With `WithOutbox(true)`, every worker runs a relayer from `app.Start` until `app.Shutdown`.
 
 ### Advanced Configuration
 
+To run a relayer yourself, for example in a separate process, leave `WithOutbox` off and create one with `outbox.NewRelayer`:
+
 ```go
-// Create custom relayer
-relayer := romancy.NewOutboxRelayer(
-	romancy.WithRelayerStorage(app.Storage()),
-	romancy.WithRelayerBrokerURL("http://localhost:8080/events"),
-	romancy.WithPollInterval(2*time.Second),  // Poll every 2 seconds
-	romancy.WithMaxRetries(5),                 // Retry up to 5 times
-	romancy.WithBatchSize(20),                 // Process 20 events per batch
-	romancy.WithMaxAgeHours(24.0),             // Expire events older than 24 hours
-)
+relayer := outbox.NewRelayer(app.Storage(), outbox.RelayerConfig{
+	TargetURL:    "http://localhost:8080/events",
+	PollInterval: 2 * time.Second, // Poll every 2 seconds
+	MaxRetries:   5,               // Send each event at most 5 times
+	BatchSize:    20,              // Claim up to 20 events per poll
+})
 
 ctx := context.Background()
 
-// Start manually
-if err := relayer.Start(ctx); err != nil {
-	log.Fatal(err)
-}
+// Start runs the relayer in the background until Stop is called or ctx is done
+relayer.Start(ctx)
 
 // Stop gracefully
-relayer.Stop(ctx)
+relayer.Stop()
 ```
 
-**Configuration Options:**
+**Configuration Options (`outbox.RelayerConfig`):**
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `WithRelayerStorage` | `StorageProtocol` | Required | Storage backend for outbox events |
-| `WithRelayerBrokerURL` | `string` | Required | Message Broker URL for publishing CloudEvents |
-| `WithPollInterval` | `time.Duration` | `1s` | Polling interval |
-| `WithMaxRetries` | `int` | `3` | Maximum retry attempts for temporary failures |
-| `WithBatchSize` | `int` | `10` | Number of events to process per batch |
-| `WithMaxAgeHours` | `float64` | `0` (disabled) | Maximum event age in hours before expiration |
-
-**Max Age Timeout:**
-
-Events older than `max_age_hours` are automatically marked as `'expired'` and will not be retried. This is useful for time-sensitive events that become meaningless after a certain period:
-
-```go
-// Example: Expire events older than 1 hour
-relayer := romancy.NewOutboxRelayer(
-	romancy.WithRelayerStorage(app.Storage()),
-	romancy.WithRelayerBrokerURL("http://localhost:8080/events"),
-	romancy.WithMaxAgeHours(1.0), // Events older than 1 hour → 'expired'
-)
-```
-
-**Use Cases for Max Age Timeout:**
-
-- **Real-time notifications**: Push notifications that are only relevant for a short time
-- **Time-sensitive updates**: Stock price updates, sensor readings
-- **Temporary offers**: Flash sale notifications that expire quickly
-- **Session-based events**: Events tied to user sessions that timeout
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `TargetURL` | `string` | Required | CloudEvents endpoint the events are posted to |
+| `PollInterval` | `time.Duration` | `1s` | Polling interval while there are events to send |
+| `BatchSize` | `int` | `100` | Maximum number of events claimed per poll |
+| `MaxRetries` | `int` | `5` | Maximum number of send attempts per event |
+| `MaxBackoff` | `time.Duration` | `30s` | Longest polling interval while there is nothing to send |
+| `ProcessingTimeout` | `time.Duration` | `5m` | How long a claimed event may wait before another relayer claims it again (a relayer that crashed) |
+| `CustomSender` | `outbox.EventSender` | CloudEvents over HTTP | Replaces the HTTP sender |
+| `WakeEvent` | `<-chan struct{}` | `nil` | Wakes the relayer at once (the app connects PostgreSQL NOTIFY here) |
 
 ### Retry Logic and Error Handling
 
-The Outbox Relayer implements **intelligent retry with error classification**:
-
 **How it works:**
 
-1. **Polling**: Every `poll_interval` (default: 1s), the relayer checks for pending events
-2. **Age Check** (Optional): If `max_age_hours` is set, events older than threshold → `'expired'` status
-3. **Retry Check**: Before each send attempt, checks if `retry_count >= max_retries`
-4. **Send Attempt**: If retry limit not exceeded, attempts to publish the event
-5. **Success**: Event status → `'published'`
-6. **Failure**: Error classification determines next action:
-   - **4xx HTTP Error** (400, 401, 403, 404, 422, etc.) → `'invalid'` status (permanent failure, don't retry)
-   - **5xx HTTP Error** (500, 502, 503, 504, etc.) → `'pending'` status, `retry_count` incremented (retry)
-   - **Network Error** (connection timeout, DNS failure) → `'pending'` status, `retry_count` incremented (retry)
-   - **Unknown Error** → `'pending'` status, `retry_count` incremented (retry, safety net)
-7. **Max Retries Exceeded**: Event status → `'failed'` (permanently failed)
+1. **Claim**: every poll claims up to `BatchSize` pending events and marks them `'processing'`, so concurrent relayers take different events
+2. **Retry Check**: an event already sent `MaxRetries` times is marked `'failed'` and not sent again
+3. **Send Attempt**: the relayer increments `retry_count` and posts the event
+4. **Success** (2xx response): status → `'published'`
+5. **Failure** (any error: an HTTP error status, a network error, a timeout): status → `'pending'`, and a later poll sends the event again
 
-**Example with default settings** (`poll_interval=1s`, `max_retries=3`):
+**Example with default settings** (`PollInterval` 1s, `MaxRetries` 5):
 
-| Time | retry_count | Error Type | Action |
-|------|-------------|-----------|--------|
-| T+0s | 0 | First send attempt | |
-| T+0s | 0 | → 400 Bad Request | **Stop**: Marked as `'invalid'` (client error) |
-| T+0s | 0 | → 503 Service Unavailable | Continue: `retry_count` = 1 |
-| T+1s | 1 | → Network timeout | Continue: `retry_count` = 2 |
-| T+2s | 2 | → 500 Internal Server Error | Continue: `retry_count` = 3 |
-| T+3s | 3 | N/A | **Stop**: `retry_count >= max_retries`, marked as `'failed'` |
+| Poll | retry_count | Result | Status afterwards |
+|------|-------------|--------|-------------------|
+| 1 | 0 → 1 | 503 Service Unavailable | `'pending'` |
+| 2 | 1 → 2 | Network timeout | `'pending'` |
+| 3 | 2 → 3 | 400 Bad Request | `'pending'` |
+| 4 | 3 → 4 | 500 Internal Server Error | `'pending'` |
+| 5 | 4 → 5 | 503 Service Unavailable | `'pending'` |
+| 6 | 5 | Not sent | `'failed'` |
 
 **Important Notes:**
 
-- **Fixed Interval**: Events are retried on every poll (no exponential backoff)
-- **Retry Limit**: With `max_retries=3`, events are sent **3 times total** (at retry_count=0, 1, 2)
-- **4xx Errors Don't Retry**: Client errors (malformed event, auth failure) are immediately marked as `'invalid'`
-- **5xx Errors Retry**: Server errors (broker down, temporary failure) are retried up to max_retries
-- **Network Errors Retry**: Connection timeouts, DNS failures are treated as temporary errors
-- **Status Remains 'pending'**: During retries, event status stays `'pending'` (changes to `'published'` on success, `'failed'` after max retries, or `'invalid'` for 4xx errors)
-- **Max Age Timeout**: Events older than `max_age_hours` are marked as `'expired'` and not retried
+- **Every Error Is Retried**: 4xx responses too, so a malformed event is sent `MaxRetries` times before it is marked `'failed'`
+- **Retry Timing**: a failed event is sent again on the next poll, about `PollInterval` later plus up to 30% jitter; there is no per-event backoff
+- **Retry Limit**: with `MaxRetries` 5, an event is sent at most 5 times
+- **Crashed Relayers**: an event claimed by a relayer that stopped is claimed again after `ProcessingTimeout`
+- **Duplicates**: an event sent by a relayer that crashed before marking it `'published'` is sent again, so consumers must be idempotent
 
 ---
 
 ## Event Status Lifecycle
 
-Events in the `outbox_events` table have five statuses:
+Romancy's relayer moves events in the `outbox_events` table through four statuses:
 
 ```
-pending → published  (Success)
-        → failed     (After max_retries exceeded)
-        → invalid    (4xx HTTP error, permanent failure)
-        → expired    (Max age exceeded, too old to retry)
+pending → processing → published  (Delivered)
+                     → pending    (Not delivered, sent again later)
+                     → failed     (Sent MaxRetries times without success)
 ```
 
 **Status Descriptions:**
 
 | Status | Meaning | Retryable | How it happens |
 |--------|---------|-----------|----------------|
-| `pending` | Event waiting to be published | ✅ Yes | Initial status when event is created |
-| `published` | Event successfully published | ❌ No | 2xx HTTP response from broker |
-| `failed` | Event permanently failed after max retries | ❌ No | `retry_count >= max_retries` |
-| `invalid` | Event is malformed or unauthorized | ❌ No | 4xx HTTP error (400, 401, 403, 404, 422) |
-| `expired` | Event too old to be meaningful | ❌ No | `created_at` older than `max_age_hours` |
+| `pending` | Event waiting to be sent | ✅ Yes | Initial status, and the status after a failed send |
+| `processing` | Event claimed by a relayer | ✅ Yes | A poll claimed it; claimed again after `ProcessingTimeout` |
+| `published` | Event delivered | ❌ No | 2xx HTTP response from the broker |
+| `failed` | Event given up | ❌ No | `retry_count` reached `MaxRetries` |
+
+The schema is shared with Edda, whose relayer also uses `invalid` (4xx responses) and `expired` (events past a maximum age). Romancy's relayer does not set them.
 
 **Database Schema:**
 
 ```sql
--- SQLite / PostgreSQL / MySQL compatible schema
+-- SQLite (from durax-io/schema; PostgreSQL and MySQL use equivalent types)
 CREATE TABLE outbox_events (
-    event_id VARCHAR(255) PRIMARY KEY,
-    event_type VARCHAR(255) NOT NULL,
-    event_source VARCHAR(255) NOT NULL,
-    event_data TEXT NOT NULL,              -- JSON (unlimited size)
-    content_type VARCHAR(100) NOT NULL DEFAULT 'application/json',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    published_at TIMESTAMP,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
-    retry_count INTEGER NOT NULL DEFAULT 0,
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    event_source TEXT NOT NULL,
+    data_type TEXT NOT NULL DEFAULT 'json',
+    event_data TEXT,
+    event_data_binary BLOB,
+    content_type TEXT NOT NULL DEFAULT 'application/json',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    published_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER DEFAULT 0,
     last_error TEXT,
-
-    -- Status constraint (enforced by database)
-    CONSTRAINT valid_outbox_status CHECK (
-        status IN ('pending', 'published', 'failed', 'invalid', 'expired')
-    )
+    claimed_at TEXT,  -- when a relayer claimed the event
+    CONSTRAINT valid_outbox_status CHECK (status IN ('pending', 'processing', 'published', 'failed', 'invalid', 'expired'))
 );
 
--- Index for efficient polling by Outbox Relayer
-CREATE INDEX idx_outbox_status_created ON outbox_events(status, created_at);
+CREATE INDEX idx_outbox_status ON outbox_events(status, created_at);
 ```
 
 **Query Outbox Events:**
@@ -620,18 +612,24 @@ type OrderProcessingResult struct {
 	Status  string `json:"status"`
 }
 
+type OrderProcessingInput struct {
+	OrderID string      `json:"order_id"`
+	Items   []OrderItem `json:"items"`
+}
+
 var orderProcessingWorkflow = romancy.DefineWorkflow("process_order",
-	func(ctx *romancy.WorkflowContext, orderID string, items []OrderItem) (OrderProcessingResult, error) {
+	func(ctx *romancy.WorkflowContext, input OrderProcessingInput) (OrderProcessingResult, error) {
+		orderID := input.OrderID
 		// Step 1: Reserve inventory
 		// → Sends "inventory.reserved" event
-		inventory, err := reserveInventory.Execute(ctx, orderID, items)
+		inventory, err := reserveInventory.Execute(ctx, ReserveInput{OrderID: orderID, Items: input.Items})
 		if err != nil {
 			return OrderProcessingResult{}, err
 		}
 
 		// Step 2: Charge payment
 		// → Sends "payment.charged" event
-		_, err = chargePayment.Execute(ctx, orderID, inventory.TotalAmount)
+		_, err = chargePayment.Execute(ctx, ChargeInput{OrderID: orderID, Amount: inventory.TotalAmount})
 		if err != nil {
 			return OrderProcessingResult{}, err
 		}
@@ -643,8 +641,17 @@ var orderProcessingWorkflow = romancy.DefineWorkflow("process_order",
 			return OrderProcessingResult{}, err
 		}
 
-		// Final event
-		err = romancy.SendEventTransactional(ctx,
+		// Step 4: Complete order
+		// → Sends "order.completed" event
+		return completeOrder.Execute(ctx, orderID)
+	},
+)
+
+// Events are sent from activities: workflow code runs again on every
+// replay, and an event it sent would be sent again each time.
+var completeOrder = romancy.DefineActivity("complete_order",
+	func(ctx context.Context, orderID string) (OrderProcessingResult, error) {
+		err := romancy.SendEventTransactional(romancy.GetWorkflowContext(ctx),
 			"order.completed",
 			"order-service",
 			map[string]any{"order_id": orderID, "status": "completed"},
@@ -652,7 +659,6 @@ var orderProcessingWorkflow = romancy.DefineWorkflow("process_order",
 		if err != nil {
 			return OrderProcessingResult{}, err
 		}
-
 		return OrderProcessingResult{OrderID: orderID, Status: "completed"}, nil
 	},
 )
@@ -663,40 +669,36 @@ var orderProcessingWorkflow = romancy.DefineWorkflow("process_order",
 Send events during compensation (rollback):
 
 ```go
-var releaseInventory = romancy.DefineCompensation("release_inventory",
-	func(ctx context.Context, reservationID string) error {
-		fmt.Printf("Releasing inventory: %s\n", reservationID)
+func releaseInventory(ctx context.Context, input ReserveInput) error {
+	fmt.Printf("Releasing inventory for order: %s\n", input.OrderID)
 
-		wfCtx := romancy.GetWorkflowContext(ctx)
+	wfCtx := romancy.GetWorkflowContext(ctx)
 
-		// Send compensation event
-		return romancy.SendEventTransactional(wfCtx,
-			"inventory.released",
-			"order-service",
-			map[string]any{
-				"reservation_id": reservationID,
-				"reason":         "order_failed",
-			},
-		)
-	},
-)
+	// Send compensation event
+	return romancy.SendEventTransactional(wfCtx,
+		"inventory.released",
+		"order-service",
+		map[string]any{
+			"order_id": input.OrderID,
+			"reason":   "order_failed",
+		},
+	)
+}
 ```
 
 ### 3. Saga Pattern Integration
 
 ```go
-var cancelReservation = romancy.DefineCompensation("cancel_hotel_reservation",
-	func(ctx context.Context, reservationID string) error {
-		wfCtx := romancy.GetWorkflowContext(ctx)
+func cancelReservation(ctx context.Context, bookingID string) error {
+	wfCtx := romancy.GetWorkflowContext(ctx)
 
-		// Send cancellation event
-		return romancy.SendEventTransactional(wfCtx,
-			"hotel.cancelled",
-			"booking-service",
-			map[string]any{"reservation_id": reservationID},
-		)
-	},
-)
+	// Send cancellation event
+	return romancy.SendEventTransactional(wfCtx,
+		"hotel.cancelled",
+		"booking-service",
+		map[string]any{"booking_id": bookingID},
+	)
+}
 
 type ReserveHotelResult struct {
 	ReservationID string `json:"reservation_id"`
@@ -721,7 +723,7 @@ var reserveHotel = romancy.DefineActivity("reserve_hotel",
 
 		return ReserveHotelResult{ReservationID: reservationID}, nil
 	},
-	romancy.WithCompensation(cancelReservation),
+	romancy.WithCompensation[string, ReserveHotelResult](cancelReservation),
 )
 ```
 
@@ -746,7 +748,7 @@ var createOrder = romancy.DefineActivity("create_order",
 		// All operations are automatically transactional:
 		// - Workflow history recording
 		// - Event publishing to outbox
-		err := romancy.SendEventTransactional(wfCtx, "order.created", "order-service", ...)
+		err := romancy.SendEventTransactional(wfCtx, "order.created", "order-service", map[string]any{"order_id": orderID})
 		if err != nil {
 			return OrderActivityResult{}, err
 		}
@@ -764,13 +766,13 @@ var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
 		session := wfCtx.Session()
 
 		// Your database operations
-		_, err := session.Exec("INSERT INTO orders (order_id) VALUES (?)", orderID)
+		_, err := session.ExecContext(ctx, "INSERT INTO orders (order_id) VALUES (?)", orderID)
 		if err != nil {
 			return OrderActivityResult{}, err
 		}
 
 		// Events in same transaction
-		err = romancy.SendEventTransactional(wfCtx, "order.created", "order-service", ...)
+		err = romancy.SendEventTransactional(wfCtx, "order.created", "order-service", map[string]any{"order_id": orderID})
 		if err != nil {
 			return OrderActivityResult{}, err
 		}
@@ -818,33 +820,22 @@ statusCounts := make(map[string]int)
 for rows.Next() {
 	var status string
 	var count int
-	rows.Scan(&status, &count)
+	if err := rows.Scan(&status, &count); err != nil {
+		log.Fatal(err)
+	}
 	statusCounts[status] = count
 }
 
 fmt.Println("📊 Outbox Status Summary:")
-fmt.Printf("  - Pending:   %d\n", statusCounts["pending"])
-fmt.Printf("  - Published: %d\n", statusCounts["published"])
-fmt.Printf("  - Failed:    %d\n", statusCounts["failed"])
-fmt.Printf("  - Invalid:   %d\n", statusCounts["invalid"])
-fmt.Printf("  - Expired:   %d\n", statusCounts["expired"])
-
-// Alert on invalid events
-if statusCounts["invalid"] > 0 {
-	fmt.Printf("⚠️ %d events marked as invalid (4xx errors)\n", statusCounts["invalid"])
-	fmt.Println("   → Check event format, broker authentication, or permissions")
-}
-
-// Alert on expired events
-if statusCounts["expired"] > 0 {
-	fmt.Printf("⚠️ %d events expired due to age\n", statusCounts["expired"])
-	fmt.Println("   → Check broker availability or consider increasing max_age_hours")
-}
+fmt.Printf("  - Pending:    %d\n", statusCounts["pending"])
+fmt.Printf("  - Processing: %d\n", statusCounts["processing"])
+fmt.Printf("  - Published:  %d\n", statusCounts["published"])
+fmt.Printf("  - Failed:     %d\n", statusCounts["failed"])
 
 // Alert on permanently failed events
 if statusCounts["failed"] > 0 {
 	fmt.Printf("⚠️ %d events failed permanently\n", statusCounts["failed"])
-	fmt.Println("   → Check broker health or network connectivity")
+	fmt.Println("   → Check broker health, the event format, or network connectivity")
 }
 ```
 
@@ -855,8 +846,10 @@ Since the outbox pattern provides **at-least-once delivery**, consumers must han
 ```go
 // Consumer side (idempotency key)
 func HandleEvent(w http.ResponseWriter, r *http.Request) {
-	var event cloudevents.Event
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+	// The relayer sends in binary mode (ce-* headers, the data as the body);
+	// NewEventFromHTTPRequest reads binary and structured mode.
+	event, err := cloudevents.NewEventFromHTTPRequest(r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -924,15 +917,24 @@ type EcommerceOrderResult struct {
 }
 
 // Activity with custom database operations
+type CreateEcommerceOrderInput struct {
+	OrderID       string  `json:"order_id"`
+	CustomerEmail string  `json:"customer_email"`
+	Amount        float64 `json:"amount"`
+}
+
 var createOrder = romancy.DefineActivity("create_order",
-	func(ctx context.Context, orderID, customerEmail string, amount float64) (EcommerceOrderResult, error) {
+	func(ctx context.Context, input CreateEcommerceOrderInput) (EcommerceOrderResult, error) {
+		orderID := input.OrderID
+		customerEmail := input.CustomerEmail
+		amount := input.Amount
 		wfCtx := romancy.GetWorkflowContext(ctx)
 
 		// Access Romancy-managed session (same database)
 		session := wfCtx.Session()
 
 		// 1. Save order to YOUR table (same database as Romancy)
-		_, err := session.Exec(`
+		_, err := session.ExecContext(ctx, `
 			INSERT INTO orders (order_id, customer_email, amount, status, created_at)
 			VALUES (?, ?, ?, ?, ?)
 		`, orderID, customerEmail, amount, "pending", time.Now())
@@ -965,9 +967,9 @@ var createOrder = romancy.DefineActivity("create_order",
 
 // Workflow
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID, customerEmail string, amount float64) (EcommerceOrderResult, error) {
+	func(ctx *romancy.WorkflowContext, input CreateEcommerceOrderInput) (EcommerceOrderResult, error) {
 		// Create order (atomic with event)
-		result, err := createOrder.Execute(ctx, orderID, customerEmail, amount)
+		result, err := createOrder.Execute(ctx, input)
 		if err != nil {
 			return EcommerceOrderResult{}, err
 		}
@@ -984,6 +986,7 @@ func main() {
 		romancy.WithOutbox(true),
 		romancy.WithBrokerURL("http://localhost:8080/events"),
 	)
+	romancy.RegisterWorkflow(app, orderWorkflow)
 
 	ctx := context.Background()
 
@@ -993,10 +996,10 @@ func main() {
 	defer app.Shutdown(ctx)
 
 	// Start workflow
-	instanceID, err := romancy.StartWorkflow(ctx, app, orderWorkflow, OrderInput{
-		OrderID: "ORD-12345",
-		Email:   "customer@example.com",
-		Amount:  149.99,
+	instanceID, err := romancy.StartWorkflow(ctx, app, orderWorkflow, CreateEcommerceOrderInput{
+		OrderID:       "ORD-12345",
+		CustomerEmail: "customer@example.com",
+		Amount:        149.99,
 	})
 	if err != nil {
 		log.Fatal(err)

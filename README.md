@@ -177,7 +177,9 @@ Romancy **automatically applies database migrations** on startup. Migration file
 app := romancy.NewApp(
     romancy.WithDatabase("postgres://user:pass@localhost/db"),
 )
+```
 
+```go
 // Disable auto-migration (manage with dbmate CLI instead)
 app := romancy.NewApp(
     romancy.WithDatabase("postgres://user:pass@localhost/db"),
@@ -291,7 +293,7 @@ Multiple workers can safely process workflows using database-based exclusive con
 
 ```go
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://localhost/workflows"),  // Shared database
+    romancy.WithDatabase("postgres://localhost/workflows"), // Shared database
     romancy.WithWorkerID("order-service"),
 )
 ```
@@ -329,7 +331,11 @@ var callExternalAPI = romancy.DefineActivity("call_api",
     func(ctx context.Context, url string) (map[string]any, error) {
         // Not transactional - suitable for external calls
         resp, err := http.Get(url)
-        // ...
+        if err != nil {
+            return nil, err
+        }
+        defer resp.Body.Close()
+        return map[string]any{"status": resp.Status}, nil
     },
     romancy.WithTransactional[string, map[string]any](false),
 )
@@ -486,6 +492,11 @@ Workflows can be started as sandboxed actors when they should receive only expli
 
 ```go
 childID, err := romancy.StartWorkflow(ctx, app, untrustedWorkflow, input, romancy.WithSandboxed(true))
+if err != nil {
+    log.Printf("failed to start sandboxed child: %v", err)
+} else {
+    log.Printf("started sandboxed child: %s", childID)
+}
 ```
 
 Sandboxing enforces three rules:
@@ -540,15 +551,16 @@ Romancy provides a `Handler()` method for integration with any Go HTTP router:
 
 ```go
 // Standard library
-http.Handle("/", app.Handler())
+mux := http.NewServeMux()
+mux.Handle("/", app.Handler())
 
-// With chi router
-r := chi.NewRouter()
-r.Mount("/workflows", app.Handler())
-
-// With gorilla/mux
-r := mux.NewRouter()
-r.PathPrefix("/workflows").Handler(app.Handler())
+// Any router that accepts an http.Handler can mount the same handler.
+// Under a prefix, strip it: the handler routes on the request path. For
+// example, mount http.StripPrefix("/workflows", app.Handler()) at
+// /workflows in chi, gorilla/mux, gin, echo, or another router.
+if err := http.ListenAndServe(":8001", mux); err != nil {
+    log.Fatal(err)
+}
 ```
 
 ### CloudEvents Support

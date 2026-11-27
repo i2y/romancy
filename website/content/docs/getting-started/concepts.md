@@ -14,15 +14,20 @@ Romancy separates orchestration logic (**workflows**) from business logic (**act
 **Activity**: A unit of work that performs business logic.
 
 ```go
+type EmailInput struct {
+	Email   string `json:"email"`
+	Message string `json:"message"`
+}
+
 type EmailResult struct {
 	Sent      bool   `json:"sent"`
 	MessageID string `json:"message_id"`
 }
 
 var sendEmail = romancy.DefineActivity("send_email",
-	func(ctx context.Context, email, message string) (EmailResult, error) {
+	func(ctx context.Context, input EmailInput) (EmailResult, error) {
 		// Business logic - sends an actual email
-		response, err := emailService.Send(email, message)
+		response, err := emailService.Send(input.Email, input.Message)
 		if err != nil {
 			return EmailResult{}, err
 		}
@@ -43,8 +48,9 @@ var sendEmail = romancy.DefineActivity("send_email",
 **Workflow**: Orchestration logic that coordinates activities.
 
 ```go
-type UserResult struct {
-	UserID string `json:"user_id"`
+type SignupInput struct {
+	Email string `json:"email"`
+	Name  string `json:"name"`
 }
 
 type SignupResult struct {
@@ -53,15 +59,18 @@ type SignupResult struct {
 }
 
 var userSignup = romancy.DefineWorkflow("user_signup",
-	func(ctx *romancy.WorkflowContext, email, name string) (SignupResult, error) {
+	func(ctx *romancy.WorkflowContext, input SignupInput) (SignupResult, error) {
 		// Step 1: Create user account
-		user, err := createAccount.Execute(ctx, email, name)
+		user, err := createAccount.Execute(ctx, input)
 		if err != nil {
 			return SignupResult{}, err
 		}
 
 		// Step 2: Send welcome email
-		_, err = sendEmail.Execute(ctx, email, fmt.Sprintf("Welcome, %s!", name))
+		_, err = sendEmail.Execute(ctx, EmailInput{
+			Email:   input.Email,
+			Message: fmt.Sprintf("Welcome, %s!", input.Name),
+		})
 		if err != nil {
 			return SignupResult{}, err
 		}
@@ -92,8 +101,10 @@ Romancy ensures workflow progress is never lost through **deterministic replay**
 
 ```go
 type ProcessOrderResult struct {
-	OrderID string `json:"order_id"`
-	Status  string `json:"status"`
+	OrderID       string `json:"order_id"`
+	Status        string `json:"status"`
+	ReservationID string `json:"reservation_id"`
+	PaymentID     string `json:"payment_id"`
 }
 
 var processOrder = romancy.DefineWorkflow("process_order",
@@ -112,7 +123,12 @@ var processOrder = romancy.DefineWorkflow("process_order",
 			return ProcessOrderResult{}, err
 		}
 
-		return ProcessOrderResult{OrderID: orderID, Status: "completed"}, nil
+		return ProcessOrderResult{
+			OrderID:       orderID,
+			Status:        "completed",
+			ReservationID: reservation.ReservationID,
+			PaymentID:     payment.PaymentID,
+		}, nil
 	},
 )
 ```
@@ -161,35 +177,33 @@ type OrderWorkflowResult struct {
 	Status string `json:"status"`
 }
 
-// Compensation function
-var cancelReservation = romancy.DefineCompensation("cancel_reservation",
-	func(ctx context.Context, itemID string) error {
-		log.Printf("Cancelled reservation for %s", itemID)
-		return nil
-	},
-)
-
 // Activity with compensation
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
 	func(ctx context.Context, itemID string) (ReservationResult, error) {
 		log.Printf("Reserved %s", itemID)
 		return ReservationResult{Reserved: true, ItemID: itemID}, nil
 	},
-	romancy.WithCompensation(cancelReservation),
+	romancy.WithCompensation[string, ReservationResult](func(ctx context.Context, itemID string) error {
+		log.Printf("Cancelled reservation for %s", itemID)
+		return nil
+	}),
 )
+
+type OrderItemsInput struct {
+	OrderID string   `json:"order_id"`
+	Items   []string `json:"items"`
+}
 
 // Workflow
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, item1, item2 string) (OrderWorkflowResult, error) {
-		_, err := reserveInventory.Execute(ctx, item1) // Step 1
-		if err != nil {
-			return OrderWorkflowResult{}, err
+	func(ctx *romancy.WorkflowContext, input OrderItemsInput) (OrderWorkflowResult, error) {
+		for _, itemID := range input.Items {
+			_, err := reserveInventory.Execute(ctx, itemID)
+			if err != nil {
+				return OrderWorkflowResult{}, err
+			}
 		}
-		_, err = reserveInventory.Execute(ctx, item2) // Step 2
-		if err != nil {
-			return OrderWorkflowResult{}, err
-		}
-		_, err = chargePayment.Execute(ctx) // Step 3: Fails!
+		_, err := chargePayment.Execute(ctx, input.OrderID) // Fails in this example
 		if err != nil {
 			return OrderWorkflowResult{}, err
 		}
@@ -316,7 +330,7 @@ Multiple workers can safely process workflows.
 // Worker 1, Worker 2, Worker 3 (same code on different machines)
 app := romancy.NewApp(
 	romancy.WithDatabase("postgres://yourdbinstance/workflows"), // Shared database
-	romancy.WithWorkerID("worker-1"), // Unique per worker
+	romancy.WithWorkerID("worker-1"),                            // Unique per worker
 )
 ```
 

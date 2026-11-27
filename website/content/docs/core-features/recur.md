@@ -16,7 +16,7 @@ var longRunningWorkflow = romancy.DefineWorkflow("processor",
         for {
             // Each iteration adds to history
             item, _ := romancy.Receive[Item](ctx, "items")
-            processItem.Execute(ctx, item)  // History grows!
+            processItem.Execute(ctx, item.Data)  // History grows!
 
             // After 1000 iterations, history has 2000+ entries
         }
@@ -45,13 +45,14 @@ var longRunningWorkflow = romancy.DefineWorkflow("processor",
             if err != nil {
                 break // No more items
             }
-            processItem.Execute(ctx, item)
+            processItem.Execute(ctx, item.Data)
             input.ProcessedCount++
         }
 
         // Continue with fresh history (tail recursion)
         if input.ProcessedCount < input.MaxItems {
-            return romancy.Recur(ctx, input) // Archives history, continues
+            _, err := romancy.Recur(ctx, input) // Archives history, continues
+        return ProcessResult{}, err
         }
 
         return ProcessResult{Total: input.ProcessedCount}, nil
@@ -128,7 +129,8 @@ var counterWorkflow = romancy.DefineWorkflow("counter",
         // Check if we should continue
         if input.Count < input.MaxCount {
             // Tail recursion: archive history and continue
-            return romancy.Recur(ctx, input)
+            _, err := romancy.Recur(ctx, input)
+            return CounterResult{}, err
         }
 
         // Done - return final result
@@ -174,7 +176,8 @@ var batchProcessor = romancy.DefineWorkflow("batch_processor",
         input.Offset += input.BatchSize
 
         if input.Offset < input.TotalCount {
-            return romancy.Recur(ctx, input) // Continue with next batch
+            _, err := romancy.Recur(ctx, input) // Continue with next batch
+            return BatchResult{}, err
         }
 
         return BatchResult{
@@ -221,7 +224,8 @@ var daemonWorkflow = romancy.DefineWorkflow("daemon",
 
         // Recur to prevent history buildup
         input.Iteration++
-        return romancy.Recur(ctx, input)
+        _, err := romancy.Recur(ctx, input)
+        return DaemonResult{}, err
     },
 )
 ```
@@ -247,7 +251,8 @@ var scheduledTask = romancy.DefineWorkflow("scheduled_task",
         romancy.Sleep(ctx, 1*time.Hour)
 
         // Recur to keep history bounded
-        return romancy.Recur(ctx, input)
+        _, err := romancy.Recur(ctx, input)
+        return ScheduledResult{}, err
     },
 )
 ```
@@ -258,15 +263,15 @@ var scheduledTask = romancy.DefineWorkflow("scheduled_task",
 
 ```go
 // Too small: Frequent recurs, more overhead
-for i := 0; i < 10; i++ { ... }
+for i := 0; i < 10; i++ { /* process items */ }
 return romancy.Recur(ctx, input) // Every 10 items
 
 // Too large: History grows too much before recur
-for i := 0; i < 10000; i++ { ... }
+for i := 0; i < 10000; i++ { /* process items */ }
 return romancy.Recur(ctx, input) // History has 10000 entries
 
 // Good balance: Recur every ~100-1000 operations
-for i := 0; i < 100; i++ { ... }
+for i := 0; i < 100; i++ { /* process items */ }
 return romancy.Recur(ctx, input)
 ```
 
@@ -302,7 +307,8 @@ var workflow = romancy.DefineWorkflow("bounded_processor",
             return ProcessResult{Status: "timeout"}, nil
         }
 
-        return romancy.Recur(ctx, input)
+        _, err := romancy.Recur(ctx, input)
+        return ProcessResult{}, err
     },
 )
 ```

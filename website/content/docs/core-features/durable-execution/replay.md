@@ -23,7 +23,7 @@ When an activity is called during replay:
 2. **Cache Check**: If replaying, check if result is cached for this `activity_id`
 3. **Return Cached**: If found, return cached result **without executing the function**
 4. **Execute**: If not cached, run the function and record the result
-5. **Error Handling**: The final failure of a transactional activity (the default) is not written to history, so a replay runs that activity again; a non-transactional activity's failure is recorded with its message only (see [Automatic Retry](/docs/core-features/retry#retryexhaustederror))
+5. **Error Handling**: When an activity gives up (a `TerminalError`, or its retry policy is exhausted), its failure is recorded, for transactional activities too; a replay returns the recorded failure without running the function (see [Failures are recorded](/docs/core-features/retry#failures-are-recorded))
 
 ### Activity ID Patterns
 
@@ -68,10 +68,9 @@ for _, item := range items {
 }
 ```
 
-**Concurrent Execution (Manual IDs Required):**
+**Concurrent Execution (Explicit IDs Required):**
 
 ```go
-// Execution order is non-deterministic, so manual IDs are required
 import "golang.org/x/sync/errgroup"
 
 type ProcessResult struct {
@@ -79,31 +78,40 @@ type ProcessResult struct {
     Data   string `json:"data"`
 }
 
-var eg errgroup.Group
-var results [3]ProcessResult
+// The goroutines run in any order, so each activity gets an explicit ID
+func processConcurrently(ctx *romancy.WorkflowContext, data string) ([3]ProcessResult, error) {
+    var eg errgroup.Group
+    var results [3]ProcessResult
 
-eg.Go(func() error {
-    r, err := processA.Execute(ctx, data, romancy.WithActivityID("process_a:1"))
-    results[0] = r
-    return err
-})
+    eg.Go(func() error {
+        r, err := processA.Execute(ctx, data, romancy.WithActivityID("process_a:parallel"))
+        results[0] = r
+        return err
+    })
 
-eg.Go(func() error {
-    r, err := processB.Execute(ctx, data, romancy.WithActivityID("process_b:1"))
-    results[1] = r
-    return err
-})
+    eg.Go(func() error {
+        r, err := processB.Execute(ctx, data, romancy.WithActivityID("process_b:parallel"))
+        results[1] = r
+        return err
+    })
 
-eg.Go(func() error {
-    r, err := processC.Execute(ctx, data, romancy.WithActivityID("process_c:1"))
-    results[2] = r
-    return err
-})
+    eg.Go(func() error {
+        r, err := processC.Execute(ctx, data, romancy.WithActivityID("process_c:parallel"))
+        results[2] = r
+        return err
+    })
 
-if err := eg.Wait(); err != nil {
-    return ConcurrentResult{}, err
+    if err := eg.Wait(); err != nil {
+        return [3]ProcessResult{}, err
+    }
+    return results, nil
 }
 ```
+
+- Give each activity call that runs concurrently its own ID with `romancy.WithActivityID`. Auto-generated IDs follow the order of the calls, which goroutines do not keep.
+- Choose IDs that an auto-generated one can never be. Auto IDs are `{activity name}:{n}`, and an explicit ID does not advance the count: with `process_a:1` as the explicit ID, the next `processA.Execute(ctx, data)` without one would also be `process_a:1`, and would return this call's result without running. An ID is used once per instance, so a helper called more than once needs a part that differs per call, such as a batch number.
+- Run only activities from the goroutines. Call `Sleep`, `WaitEvent`, `Receive`, `Publish` and the other workflow APIs from the workflow function itself: their history IDs also follow the order of the calls.
+- Each activity runs in its own transaction. SQLite lets one transaction write at a time, so activities that write take turns there.
 
 ### How Replay Works Internally
 
@@ -338,7 +346,7 @@ Events received via `WaitEvent()` are automatically reconstructed from stored da
 
 ```go
 var getCurrentTime = romancy.DefineActivity("get_current_time",
-	func(ctx context.Context) (string, error) {
+	func(ctx context.Context, _ struct{}) (string, error) {
 		return time.Now().Format(time.RFC3339), nil
 	},
 )
@@ -348,9 +356,9 @@ type TimestampResult struct {
 }
 
 var myWorkflow = romancy.DefineWorkflow("my_workflow",
-	func(ctx *romancy.WorkflowContext) (TimestampResult, error) {
+	func(ctx *romancy.WorkflowContext, _ struct{}) (TimestampResult, error) {
 		// Replay will use the same timestamp
-		timestamp, err := getCurrentTime.Execute(ctx)
+		timestamp, err := getCurrentTime.Execute(ctx, struct{}{})
 		if err != nil {
 			return TimestampResult{}, err
 		}
@@ -363,7 +371,7 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
 
 ```go
 var generateID = romancy.DefineActivity("generate_id",
-	func(ctx context.Context) (string, error) {
+	func(ctx context.Context, _ struct{}) (string, error) {
 		return uuid.New().String(), nil
 	},
 )
@@ -379,7 +387,7 @@ type APIData struct {
 }
 
 var callExternalAPI = romancy.DefineActivity("call_external_api",
-	func(ctx context.Context) (APIData, error) {
+	func(ctx context.Context, _ struct{}) (APIData, error) {
 		resp, err := http.Get("https://api.example.com/data")
 		if err != nil {
 			return APIData{}, err
@@ -393,13 +401,13 @@ var callExternalAPI = romancy.DefineActivity("call_external_api",
 )
 
 var myWorkflow = romancy.DefineWorkflow("my_workflow",
-	func(ctx *romancy.WorkflowContext) (APIData, error) {
+	func(ctx *romancy.WorkflowContext, _ struct{}) (APIData, error) {
 		// Benefits of making it an activity:
 		// - Not re-executed on replay (definitely from cache)
 		// - Easy to test (can be mocked)
 		// - Recorded in history
 		// - Better performance (network cost reduced)
-		data, err := callExternalAPI.Execute(ctx)
+		data, err := callExternalAPI.Execute(ctx, struct{}{})
 		if err != nil {
 			return APIData{}, err
 		}
@@ -416,7 +424,7 @@ type SomeActivityResult struct {
 }
 
 var badWorkflow = romancy.DefineWorkflow("bad_workflow",
-	func(ctx *romancy.WorkflowContext) (SomeActivityResult, error) {
+	func(ctx *romancy.WorkflowContext, _ struct{}) (SomeActivityResult, error) {
 		// ❌ Direct time access in workflow (different on replay)
 		timestamp := time.Now()
 		// First run: 2025-01-01 10:00:00
@@ -433,7 +441,7 @@ var badWorkflow = romancy.DefineWorkflow("bad_workflow",
 		f.Close()
 		// Logs appended on every replay
 
-		result, err := someActivity.Execute(ctx, timestamp.String(), requestID)
+		result, err := someActivity.Execute(ctx, SomeActivityInput{Timestamp: timestamp.String(), RequestID: requestID})
 		return result, err
 	},
 )
@@ -466,10 +474,10 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 		}
 
 		// Step 2: Wait for payment completion event
-		// Workflow pauses here (status="waiting_for_event")
-		event, err := romancy.WaitEvent(ctx,
-			romancy.WithEventType("payment.completed"),
-			romancy.WithTimeout(5*time.Minute),
+		// Workflow pauses here (status="waiting_for_message")
+		event, err := romancy.WaitEvent[map[string]any](ctx,
+			"payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return CompleteOrderResult{}, err
@@ -477,7 +485,8 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 
 		// After event received, resume from here (replay happens)
 		// Step 3: Complete order
-		result, err := completeOrder.Execute(ctx, orderID, event)
+		paymentID, _ := event.Data["payment_id"].(string)
+		result, err := completeOrder.Execute(ctx, CompleteOrderInput{OrderID: orderID, PaymentID: paymentID})
 		if err != nil {
 			return CompleteOrderResult{}, err
 		}
@@ -489,8 +498,8 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 
 **Replay behavior:**
 
-1. `resume_workflow()` creates context with `ctx.IsReplaying()=true`
-2. `loadHistory()` loads execution history
+1. The event resumes the instance: a worker runs it again, with `ctx.IsReplaying()` true
+2. The run loads the instance's history
 3. Workflow function runs from start
 4. `startPayment` - **Skipped** (cached result)
 5. `WaitEvent()` - **Skipped** (cached event data)
@@ -498,33 +507,29 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 
 ### 2. Explicit Resume Call
 
-Developers can manually resume workflows:
+Workers resume interrupted workflows automatically; an admin endpoint only needs to inspect state:
 
 ```go
-// Admin API endpoint
-func ResumeWorkflowHandler(w http.ResponseWriter, r *http.Request) {
-	instanceID := chi.URLParam(r, "instance_id")
+// Admin API endpoint: inspect a workflow instance.
+// Recovery itself is automatic: when a worker restarts, Romancy resumes
+// instances whose locks went stale, so no manual resume call is needed.
+func InspectWorkflowHandler(w http.ResponseWriter, r *http.Request) {
+	instanceID := r.PathValue("instance_id")
 
-	ctx := context.Background()
-	instance, err := app.Storage().GetInstance(ctx, instanceID)
+	ctx := r.Context()
+	instance, err := app.GetInstance(ctx, instanceID)
+	var notFound *romancy.WorkflowNotFoundError
+	if errors.As(err, &notFound) {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	workflowName := instance["workflow_name"].(string)
-
-	// Get corresponding workflow
-	workflow := romancy.GetWorkflow(workflowName)
-
-	// Start replay
-	if err := workflow.Resume(ctx, app, instanceID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":      "resumed",
+		"status":      string(instance.Status),
 		"instance_id": instanceID,
 	})
 }
@@ -532,138 +537,26 @@ func ResumeWorkflowHandler(w http.ResponseWriter, r *http.Request) {
 
 ### 3. Crash Recovery (Automatic)
 
-Romancy automatically recovers from crashes in two stages:
+A run holds its instance's lock: a 5-minute lease that the run renews every minute. When a worker crashes, its leases stop being renewed and expire. Recovery needs no code of yours:
 
-#### 3-1. Stale Lock Cleanup (Implemented)
-
-When a worker process crashes, its locks become "stale." Romancy automatically cleans these up:
-
-```go
-func cleanupStaleLocksPeriodically(storage StorageProtocol, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		// Clean up stale locks (uses lock_expires_at column)
-		workflowsToResume, err := storage.CleanupStaleLocks(context.Background())
-		if err != nil {
-			log.Printf("Failed to cleanup stale locks: %v", err)
-			continue
-		}
-
-		if len(workflowsToResume) > 0 {
-			log.Printf("Cleaned up %d stale locks", len(workflowsToResume))
-		}
-	}
-}
-```
-
-This background task starts automatically when `romancy.App` launches.
-
-**How it works:**
-
-1. **Every 60 seconds**, check for stale locks
-2. **Expired locks** are detected (based on `lock_expires_at` column set at lock acquisition)
-3. Release those locks (`locked_by=NULL`)
-4. Return list of workflows that need to be resumed
-
-**Return value structure:**
-
-```go
-[]map[string]string{
-    {
-        "instance_id":   "...",
-        "workflow_name": "...",
-        "source_hash":   "...",  // Hash of workflow definition
-        "status":        "...",  // "running" or "compensating"
-    },
-    // ...
-}
-```
-
-The `status` field indicates whether the workflow was running normally (`"running"`) or executing compensations (`"compensating"`) when it crashed.
-
-#### 3-2. Automatic Workflow Resume (Implemented)
-
-After cleaning stale locks, Romancy automatically resumes workflows with `status="running"` or `status="compensating"`:
-
-```go
-func autoResumeStaleworkflowsPeriodically(storage StorageProtocol, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		ctx := context.Background()
-
-		// Clean up stale locks and get workflows to resume
-		workflowsToResume, err := storage.CleanupStaleLocks(ctx)
-		if err != nil {
-			log.Printf("Failed to cleanup stale locks: %v", err)
-			continue
-		}
-
-		if len(workflowsToResume) > 0 {
-			// Auto-resume workflows
-			for _, wf := range workflowsToResume {
-				instanceID := wf["instance_id"]
-				workflowName := wf["workflow_name"]
-
-				log.Printf("Auto-resuming: %s (%s)", workflowName, instanceID)
-
-				workflow := romancy.GetWorkflow(workflowName)
-				if err := workflow.Resume(ctx, app, instanceID); err != nil {
-					log.Printf("Failed to resume %s: %v", instanceID, err)
-				}
-			}
-		}
-	}
-}
-```
-
-**Special handling for different workflow states:**
-
-1. **Running workflows** (`status="running"`):
-   - Resume normally via `workflow.Resume()`
-   - Full workflow function execution with replay
-
-2. **Compensating workflows** (`status="compensating"`):
-   - Resume via `workflow.ResumeCompensating()`
-   - Only re-execute incomplete compensations (not the workflow function)
-   - Ensures compensation transactions complete even after crashes
+- **Claiming expired leases**: every worker polls for `running` instances that are unlocked or whose lease expired (every second by default, `WithWorkflowResumptionInterval`, backing off while there are none), claims a batch of them and resumes them by replay
+- **Stale lock cleanup**: the leader's cleanup tick (every 60 seconds by default, `WithStaleLockInterval`) also clears the expired locks of instances that wait for an event or a timer, so the event or the timer can resume them
+- **Crash during compensation**: Romancy runs compensations while the instance is still `running`, so a worker that crashes in the middle of them leaves it `running`. The next run replays the workflow, which fails the same way again (the activity's failure is in the history), and runs only the compensations not yet recorded as executed
 
 **Source hash verification (Safety mechanism):**
 
-Before auto-resuming, Romancy verifies that the workflow definition hasn't changed:
+A worker resumes only instances whose code it has. Register each workflow with a hash of its source (the code, or the definition it was generated from):
 
 ```go
-// Check if workflow definition matches current registry
-currentHash := workflow.SourceHash()
-storedHash := wf["source_hash"]
-
-if currentHash != storedHash {
-    // Workflow code has changed - skip auto-resume
-    log.Printf("Source hash mismatch for %s", workflowName)
-    continue
-}
+romancy.RegisterWorkflow(app, orderWorkflow, romancy.WithWorkflowSourceHash("order-v2"))
 ```
 
+- An instance records the hash it was started with: the registered one, or the one given to `StartWorkflow` with `romancy.WithSourceHash`
+- A worker claims only instances of workflows it registered, with the same hash; an instance started under another hash waits for a worker that has its version of the code
+- A resume that reaches a worker with another hash returns `romancy.ErrSourceHashMismatch` and leaves the instance for another worker
+- An empty hash on either side (the default) means no check
+
 This prevents incompatible code from executing and ensures crash recovery is safe.
-
-**Why this works:**
-
-When a worker crashes, workflows with `status="running"` **always** hold a stale lock:
-
-| Workflow Status | Lock Held | On Crash | Auto-Resume Strategy |
-|----------------|-----------|----------|---------------------|
-| `status="running"` | YES (inside `workflow_lock`) | Becomes stale | ✅ Normal resume |
-| `status="compensating"` | YES (inside compensation execution) | Becomes stale | ✅ Compensation resume |
-| `status="waiting_for_event"` | NO (after lock released) | No stale lock | ❌ Event-driven resume |
-| `status="waiting_for_timer"` | NO (after lock released) | No stale lock | ❌ Timer-driven resume |
-| `status="completed"` | NO | No stale lock | N/A |
-| `status="failed"` | NO | No stale lock | N/A |
-| `status="cancelled"` | NO | No stale lock | N/A |
-
-Therefore, cleaning stale locks and resuming `status="running"` and `status="compensating"` workflows ensures **no resume leakage**.
 
 ### 4. Deployment & Scale-Out
 
@@ -678,41 +571,32 @@ Romancy supports distributed execution, so workflows continue during deployment:
 
 **Database-based exclusive control guarantee:**
 
-Romancy's database-based exclusive control prevents multiple workers from executing the same workflow instance simultaneously:
-
-```go
-err := app.WithWorkflowLock(ctx, instanceID, workerID, func() error {
-    // Only execute while lock held
-    wfCtx := romancy.NewWorkflowContext(instanceID, true, ...)
-    wfCtx.LoadHistory()
-    return workflowFunc(wfCtx, inputData)
-})
-```
+Romancy's database-based exclusive control prevents multiple workers from executing the same workflow instance simultaneously: a run executes only while it holds the instance's lock (see [Exclusive Control Guarantees](#exclusive-control-guarantees)).
 
 ## Complete Replay Flow
 
-### Initial Execution (Completed Steps 1-2, Crashed at Step 3)
+### Initial Execution (Completed Steps 1-2, Crashed During Step 3)
 
 ```go
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 	func(ctx *romancy.WorkflowContext, orderID string) (OrderWorkflowResult, error) {
 		// Activity 1 (auto-generated ID: "reserve_inventory:1")
-		inventory, err := reserveInventory.Execute(ctx, orderID)
+		_, err := reserveInventory.Execute(ctx, orderID)
 		// → DB saved: activity_id="reserve_inventory:1", result={"reservation_id": "R123"}
 		if err != nil {
 			return OrderWorkflowResult{}, err
 		}
 
 		// Activity 2 (auto-generated ID: "process_payment:1")
-		payment, err := processPayment.Execute(ctx, orderID)
+		_, err = processPayment.Execute(ctx, orderID)
 		// → DB saved: activity_id="process_payment:1", result={"transaction_id": "T456"}
 		if err != nil {
 			return OrderWorkflowResult{}, err
 		}
 
-		// Activity 3: Error occurs (e.g., network error)
-		shipping, err := arrangeShipping.Execute(ctx, orderID)
-		// → Error, workflow interrupted
+		// Activity 3: the worker crashes while it runs
+		_, err = arrangeShipping.Execute(ctx, orderID)
+		// → Nothing recorded for arrange_shipping:1
 		if err != nil {
 			return OrderWorkflowResult{}, err
 		}
@@ -730,43 +614,14 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 
 ### Replay Execution (Resume)
 
-```go
-// 1. workflow.Resume() called
-err := orderWorkflow.Resume(ctx, app, instanceID)
+Once the crashed worker's lease expires, a worker claims the instance and runs it again:
 
-// 2. Create WorkflowContext (isReplaying=true)
-wfCtx := romancy.NewWorkflowContext(
-    instanceID,
-    true,  // Replay mode
-    ...
-)
-
-// 3. Load history
-wfCtx.LoadHistory()
-// → historyCache = {"reserve_inventory:1": {...}, "process_payment:1": {...}}
-
-// 4. Execute workflow function from start
-result, err := orderWorkflow.Execute(wfCtx, orderID)
-
-// 5. Activity: reserve_inventory:1
-//    - ctx.IsReplaying() == true
-//    - Cache has activity_id="reserve_inventory:1"
-//    - Don't execute function, return {"reservation_id": "R123"} from cache
-
-// 6. Activity: process_payment:1
-//    - ctx.IsReplaying() == true
-//    - Cache has activity_id="process_payment:1"
-//    - Don't execute function, return {"transaction_id": "T456"} from cache
-
-// 7. Activity: arrange_shipping:1
-//    - ctx.IsReplaying() == true
-//    - No cache for activity_id="arrange_shipping:1"
-//    - Execute function (new processing)
-//    - Save result to DB on success
-
-// 8. Workflow complete
-wfCtx.UpdateStatus("completed", result)
-```
+1. The worker takes the instance's lock and loads its history: `reserve_inventory:1` → `{"reservation_id": "R123"}`, `process_payment:1` → `{"transaction_id": "T456"}`
+2. The workflow function runs from the start, with `ctx.IsReplaying()` true
+3. `reserveInventory.Execute` finds `reserve_inventory:1` in the history and returns its result without running the activity
+4. `processPayment.Execute` does the same for `process_payment:1`
+5. `arrangeShipping.Execute` finds nothing for `arrange_shipping:1`, so the activity runs, and its result is recorded
+6. The workflow returns, and the instance is marked `completed` with its output
 
 ## Safety Mechanisms
 
@@ -776,10 +631,10 @@ Romancy includes several safety mechanisms to ensure reliable execution:
 
 Before auto-resuming crashed workflows, Romancy verifies workflow definition hasn't changed:
 
-- Each workflow has a source code hash (`source_hash`)
-- Stored in database when workflow starts
-- Compared with current registry during auto-resume
-- Incompatible code is skipped (prevents unsafe execution)
+- Each workflow can be registered with a source hash (`WithWorkflowSourceHash`)
+- Stored in database when workflow starts (`source_hash`)
+- Compared with the worker's registered hash when it claims or resumes an instance
+- Instances of another version are left for a worker that has that version (prevents unsafe execution)
 
 This prevents:
 
@@ -789,22 +644,11 @@ This prevents:
 
 ### Exclusive Control Guarantees
 
-Romancy's database-based exclusive control prevents concurrent execution:
+Romancy's database-based exclusive control prevents concurrent execution. Each run takes the instance's lock in the database, and the workflow engine does this for you:
 
-```go
-err := app.WithWorkflowLock(ctx, instanceID, workerID,
-    romancy.WithLockTimeout(5*time.Minute),
-    func() error {
-        // Only one worker can hold this lock
-        // Other workers wait or skip
-        return nil
-    },
-)
-```
-
-Features:
-- **5-minute timeout** by default (prevents indefinite locks)
-- **Worker ID tracking** (know which worker holds the lock)
+- **5-minute lease**, renewed every minute while the run lasts (a crashed worker's lease expires)
+- **Fenced writes**: every write of a run checks that the run still holds the lock, so a run that lost its lease cannot record anything
+- **Worker ID tracking** (`locked_by` shows which worker holds the lock)
 - **Stale lock cleanup** (automatic recovery after crashes)
 
 ### Transactional History Recording
@@ -828,12 +672,12 @@ A run that loses its lock, or whose worker shuts down, ends the same way: nothin
 
 ### Compensating Workflow Recovery
 
-Special handling for workflows that crash during compensation:
+Romancy runs a failed workflow's compensations while the instance is still `running`:
 
-- `status="compensating"` detected during cleanup
-- Only incomplete compensations are re-executed
-- Workflow function is NOT re-executed
-- Ensures compensation transactions complete even after multiple crashes
+- A worker that crashes during compensation leaves the instance `running`, and its lease expires
+- The next run replays the workflow, which fails again with the recorded error
+- Only the compensations not yet recorded as executed run again
+- Compensations complete even after multiple crashes, so make them idempotent
 
 ## Summary
 

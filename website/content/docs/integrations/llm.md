@@ -74,6 +74,9 @@ response, err := llm.Call(ctx, "What is Go?",
 	llm.WithSystemMessage("You are a helpful assistant"),
 	llm.WithMaxTokens(500),
 )
+if err != nil {
+	return nil, err
+}
 fmt.Println(response.Text)
 ```
 
@@ -91,6 +94,9 @@ type BookRecommendation struct {
 book, err := llm.CallParse[BookRecommendation](ctx,
 	"Recommend a science fiction book. Respond with JSON.",
 )
+if err != nil {
+	return nil, err
+}
 fmt.Printf("Title: %s by %s\n", book.Title, book.Author)
 ```
 
@@ -107,6 +113,10 @@ messages := []llm.Message{
 }
 
 response, err := llm.CallMessages(ctx, messages)
+if err != nil {
+	return nil, err
+}
+fmt.Println(response.Text)
 ```
 
 #### llm.CallMessagesParse
@@ -115,6 +125,10 @@ Parses response from a message-based call.
 
 ```go
 result, err := llm.CallMessagesParse[MyStruct](ctx, messages)
+if err != nil {
+	return nil, err
+}
+fmt.Println(result)
 ```
 
 ### Reusable Definitions
@@ -215,7 +229,7 @@ llm.WithModel("claude-sonnet-4-5-20250929")
 llm.WithMaxTokens(1024)
 llm.WithTemperature(0.7)
 llm.WithTopP(0.9)
-llm.WithStopSequences([]string{"\n\n"})
+llm.WithStopSequences("\n\n")
 ```
 
 ### System Message
@@ -255,6 +269,10 @@ Per-call options override app defaults:
 response, err := llm.Call(ctx, "Hello",
 	llm.WithMaxTokens(100),  // Overrides app default
 )
+if err != nil {
+	return nil, err
+}
+fmt.Println(response.Text)
 ```
 
 ## DurableResponse

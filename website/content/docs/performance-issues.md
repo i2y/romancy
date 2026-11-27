@@ -60,7 +60,7 @@ func addJitter(d time.Duration, percent float64) time.Duration {
 }
 
 // 使用例: 25%ジッター → 0.75〜1.25倍の範囲でランダム化
-ticker := time.NewTicker(addJitter(interval, 0.25))
+var ticker = time.NewTicker(addJitter(interval, 0.25))
 ```
 
 **影響を受ける関数**:
@@ -240,7 +240,7 @@ inputData, err := json.Marshal(input)
 resultData, err := json.Marshal(result)
 
 // 3回目: Output (同じresultを再度)
-resultData, err := json.Marshal(result)
+resultData, err = json.Marshal(result)
 ```
 
 **修正案**: 最初のシリアライズ結果をキャッシュして再利用

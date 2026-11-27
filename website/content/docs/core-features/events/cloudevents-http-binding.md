@@ -53,22 +53,24 @@ http.ListenAndServe(":8080", nil)
 
 ### Integration with Popular Routers
 
+The handler routes on the request path (`/`, `/health/live`, `/cancel/{instanceID}`, ...), so strip the prefix you mount it under. Without `http.StripPrefix`, a request for `/events/health/live` reaches the CloudEvents route and gets `405`.
+
 **Gin:**
 ```go
 r := gin.Default()
-r.Any("/events/*path", gin.WrapH(app.Handler()))
+r.Any("/events/*path", gin.WrapH(http.StripPrefix("/events", app.Handler())))
 ```
 
 **Chi:**
 ```go
 r := chi.NewRouter()
-r.Mount("/events", app.Handler())
+r.Mount("/events", http.StripPrefix("/events", app.Handler()))
 ```
 
 **Echo:**
 ```go
 e := echo.New()
-e.Any("/events/*", echo.WrapHandler(app.Handler()))
+e.Any("/events/*", echo.WrapHandler(http.StripPrefix("/events", app.Handler())))
 ```
 
 ### Handler Endpoints
@@ -410,7 +412,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 )
@@ -610,6 +611,10 @@ defer cancel()
 
 req = req.WithContext(ctx)
 resp, err := client.Do(req)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
 ```
 
 ## Related Documentation

@@ -183,7 +183,7 @@ Workflows registered with MCP must implement the `romancy.Workflow` interface:
 ```go
 type Workflow[I, O any] interface {
 	Name() string
-	Execute(ctx *WorkflowContext, input I) (O, error)
+	Execute(ctx *romancy.WorkflowContext, input I) (O, error)
 }
 ```
 
@@ -234,7 +234,7 @@ mcp.WithTransportMode(mcp.TransportHTTP)
 Sets the main description for the workflow tools.
 
 ```go
-mcp.RegisterWorkflow[I, O](server, workflow,
+mcp.RegisterWorkflow[OrderInput, OrderResult](server, workflow,
 	mcp.WithDescription("Process customer orders with payment"),
 )
 ```
@@ -244,7 +244,7 @@ mcp.RegisterWorkflow[I, O](server, workflow,
 Sets a custom prefix for the generated tool names.
 
 ```go
-mcp.RegisterWorkflow[I, O](server, workflow,
+mcp.RegisterWorkflow[OrderInput, OrderResult](server, workflow,
 	mcp.WithNamePrefix("custom_prefix"), // generates custom_prefix_start, etc.
 )
 ```

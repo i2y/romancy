@@ -73,11 +73,16 @@ var validateOrder = romancy.DefineActivity("validate_order",
 	},
 )
 
+type PaymentInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
-		fmt.Printf("Processing payment of $%.2f for order %s\n", amount, orderID)
+	func(ctx context.Context, input PaymentInput) (PaymentResult, error) {
+		fmt.Printf("Processing payment of $%.2f for order %s\n", input.Amount, input.OrderID)
 		return PaymentResult{
-			TransactionID: fmt.Sprintf("TXN-%s", orderID),
+			TransactionID: fmt.Sprintf("TXN-%s", input.OrderID),
 			Status:        "completed",
 		}, nil
 	},
@@ -94,7 +99,7 @@ var processOrder = romancy.DefineWorkflow("process_order",
 		}
 
 		// Process payment
-		_, err = processPayment.Execute(ctx, order.OrderID, order.Amount)
+		_, err = processPayment.Execute(ctx, PaymentInput{OrderID: order.OrderID, Amount: order.Amount})
 		if err != nil {
 			return OrderResult{}, err
 		}
@@ -133,11 +138,12 @@ func main() {
 		romancy.WithDatabase("orders.db"),
 		romancy.WithWorkerID("http-server"),
 	)
+	romancy.RegisterWorkflow(app, processOrder)
 
 	ctx := context.Background()
 
-	// Initialize the app
-	if err := app.Initialize(ctx); err != nil {
+	// Start the app
+	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 
@@ -153,7 +159,7 @@ func main() {
 		}
 
 		// Start workflow (non-blocking)
-		instanceID, err := processOrder.Start(r.Context(), app, order)
+		instanceID, err := romancy.StartWorkflow(r.Context(), app, processOrder, order)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -232,9 +238,10 @@ func main() {
 		romancy.WithDatabase("events.db"),
 		romancy.WithWorkerID("cloudevents-server"),
 	)
+	romancy.RegisterWorkflow(app, processOrder)
 
 	ctx := context.Background()
-	if err := app.Initialize(ctx); err != nil {
+	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer app.Shutdown(ctx)
@@ -246,7 +253,7 @@ func main() {
 	mux.HandleFunc("GET /orders/{id}", handleGetOrder(app))
 
 	// Mount CloudEvents handler at root
-	mux.HandleFunc("POST /", app.HandleCloudEvent)
+	mux.Handle("POST /", app.Handler())
 
 	fmt.Println("Server running on http://localhost:8001")
 	log.Fatal(http.ListenAndServe(":8001", mux))
@@ -260,7 +267,7 @@ func handleCreateOrder(app *romancy.App) http.HandlerFunc {
 			return
 		}
 
-		instanceID, err := processOrder.Start(r.Context(), app, order)
+		instanceID, err := romancy.StartWorkflow(r.Context(), app, processOrder, order)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -337,19 +344,16 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 			return PaymentWorkflowResult{}, err
 		}
 
-		// Wait for payment confirmation event (with timeout)
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		// Wait for payment confirmation event (with timeout).
+		// The type parameter decodes the event data.
+		event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return PaymentWorkflowResult{}, fmt.Errorf("payment timeout: %w", err)
 		}
 
-		// Parse event data
-		var payment PaymentCompleted
-		if err := romancy.DecodeEventData(event.Data, &payment); err != nil {
-			return PaymentWorkflowResult{}, err
-		}
+		payment := event.Data
 
 		return PaymentWorkflowResult{
 			Status:        "completed",
@@ -389,7 +393,11 @@ Best for synchronous request-response patterns:
 // POST /orders {"order_id": "123", "amount": 99.99}
 
 // Handler starts workflow directly
-instanceID, err := processOrder.Start(r.Context(), app, order)
+instanceID, err := romancy.StartWorkflow(r.Context(), app, processOrder, order)
+if err != nil {
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+	return
+}
 
 // Return instance ID immediately (non-blocking)
 // {"instance_id": "wf-abc123", "status": "accepted"}
@@ -411,7 +419,7 @@ Best for event-driven and async patterns:
 // 2. If event resumes a waiting workflow → resume it
 
 // Workflow waits for events
-event, err := romancy.WaitEvent(ctx, "payment.completed")
+event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed")
 ```
 
 ## Database Configuration
@@ -452,7 +460,7 @@ Don't wait for workflow completion in HTTP handlers:
 ```go
 // ✅ Good: Non-blocking, returns immediately
 mux.HandleFunc("POST /orders", func(w http.ResponseWriter, r *http.Request) {
-	instanceID, err := workflow.Start(r.Context(), app, input)
+	instanceID, err := romancy.StartWorkflow(r.Context(), app, workflow, input)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -466,8 +474,20 @@ mux.HandleFunc("POST /orders", func(w http.ResponseWriter, r *http.Request) {
 
 // ❌ Bad: Blocks until workflow completes
 mux.HandleFunc("POST /orders", func(w http.ResponseWriter, r *http.Request) {
-	result, err := workflow.StartAndWait(r.Context(), app, input) // Don't do this!
-	// ... HTTP timeout risk
+	instanceID, err := romancy.StartWorkflow(r.Context(), app, workflow, input)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Don't do this! The request waits as long as the workflow runs
+	// (days, for a workflow that waits for events): HTTP timeout risk
+	for {
+		result, err := romancy.GetWorkflowResult[OrderResult](r.Context(), app, instanceID)
+		if err != nil || result.Status == "completed" || result.Status == "failed" {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 })
 ```
 
@@ -481,7 +501,7 @@ app := romancy.NewApp(
 )
 
 // ⚠️ Development only: SQLite
-app := romancy.NewApp(
+devApp := romancy.NewApp(
 	romancy.WithDatabase("dev.db"),
 	romancy.WithWorkerID("dev-worker"),
 )
@@ -491,11 +511,15 @@ app := romancy.NewApp(
 
 ```go
 func main() {
-	app := romancy.NewApp(...)
+	app := romancy.NewApp(
+		romancy.WithDatabase("orders.db"),
+		romancy.WithWorkerID("http-server"),
+	)
+	romancy.RegisterWorkflow(app, processOrder)
 	ctx := context.Background()
 
-	// Initialize before serving
-	if err := app.Initialize(ctx); err != nil {
+	// Start before serving
+	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 
@@ -525,15 +549,15 @@ type OrderInput struct {
 	Amount  float64 `json:"amount"`
 }
 
-var processOrder = romancy.DefineWorkflow("process_order",
+var processOrderTyped = romancy.DefineWorkflow("process_order",
 	func(ctx *romancy.WorkflowContext, order OrderInput) (OrderResult, error) {
 		// Type-safe access
-		return OrderResult{...}, nil
+		return OrderResult{OrderID: order.OrderID}, nil
 	},
 )
 
 // ❌ Avoid: map[string]any for complex data
-var processOrder = romancy.DefineWorkflow("process_order",
+var processOrderUntyped = romancy.DefineWorkflow("process_order",
 	func(ctx *romancy.WorkflowContext, data map[string]any) (map[string]any, error) {
 		// Type assertions required
 		return nil, nil
@@ -598,10 +622,15 @@ var validateOrder = romancy.DefineActivity("validate_order",
 	},
 )
 
+type PaymentInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
-		fmt.Printf("Processing $%.2f for %s\n", amount, orderID)
-		return PaymentResult{TransactionID: fmt.Sprintf("TXN-%s", orderID)}, nil
+	func(ctx context.Context, input PaymentInput) (PaymentResult, error) {
+		fmt.Printf("Processing $%.2f for %s\n", input.Amount, input.OrderID)
+		return PaymentResult{TransactionID: fmt.Sprintf("TXN-%s", input.OrderID)}, nil
 	},
 )
 
@@ -614,7 +643,7 @@ var processOrder = romancy.DefineWorkflow("process_order",
 			return OrderResult{}, err
 		}
 
-		_, err = processPayment.Execute(ctx, order.OrderID, order.Amount)
+		_, err = processPayment.Execute(ctx, PaymentInput{OrderID: order.OrderID, Amount: order.Amount})
 		if err != nil {
 			return OrderResult{}, err
 		}
@@ -637,10 +666,11 @@ func main() {
 		romancy.WithDatabase("http_demo.db"),
 		romancy.WithWorkerID("http-server"),
 	)
+	romancy.RegisterWorkflow(app, processOrder)
 
 	ctx := context.Background()
 
-	if err := app.Initialize(ctx); err != nil {
+	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 
@@ -654,7 +684,7 @@ func main() {
 			return
 		}
 
-		instanceID, err := processOrder.Start(r.Context(), app, order)
+		instanceID, err := romancy.StartWorkflow(r.Context(), app, processOrder, order)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -681,7 +711,7 @@ func main() {
 	})
 
 	// CloudEvents handler
-	mux.HandleFunc("POST /", app.HandleCloudEvent)
+	mux.Handle("POST /", app.Handler())
 
 	// Graceful shutdown
 	server := &http.Server{Addr: ":8001", Handler: mux}

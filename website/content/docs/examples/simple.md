@@ -155,6 +155,8 @@ func main() {
 
 	ctx := context.Background()
 
+	romancy.RegisterWorkflow(app, simpleWorkflow)
+
 	// Start the app
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -329,8 +331,10 @@ func main() {
 
 	ctx := context.Background()
 
-	// Initialize the app
-	if err := app.Initialize(ctx); err != nil {
+	romancy.RegisterWorkflow(app, simpleWorkflow)
+
+	// Start the app
+	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer app.Shutdown(ctx)
@@ -339,7 +343,7 @@ func main() {
 	fmt.Println()
 
 	// Start the workflow
-	instanceID, err := simpleWorkflow.Start(ctx, app, SimpleInput{
+	instanceID, err := romancy.StartWorkflow(ctx, app, simpleWorkflow, SimpleInput{
 		Name: "Alice",
 		Data: "hello world from romancy",
 	})
@@ -380,7 +384,7 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 			i, item := i, item // Capture loop variables
 			g.Go(func() error {
 				result, err := processItem.Execute(ctx, item,
-					romancy.WithActivityID(fmt.Sprintf("process_item:%d", i+1)))
+					romancy.WithActivityID(fmt.Sprintf("process_item:item-%d", i+1)))
 				if err != nil {
 					return err
 				}
@@ -403,6 +407,7 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 - Concurrent execution order is non-deterministic
 - Romancy needs explicit IDs to match activities during replay
 - Explicit IDs ensure deterministic replay even with concurrent execution
+- An explicit ID must not be one an auto-generated ID can take: auto IDs are `{activity name}:{n}` (`process_item:1`, ...), so the sample adds `item-`
 
 ## What You Learned
 

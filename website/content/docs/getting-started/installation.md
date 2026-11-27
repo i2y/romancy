@@ -72,6 +72,8 @@ func main() {
 
 	ctx := context.Background()
 
+	romancy.RegisterWorkflow(app, helloWorkflow)
+
 	// Start the app before starting workflows
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -126,7 +128,9 @@ No additional setup required! SQLite databases are created automatically:
 app := romancy.NewApp(
 	romancy.WithDatabase("workflow.db"),
 )
+```
 
+```go
 // In-memory (testing only)
 app := romancy.NewApp(
 	romancy.WithDatabase(":memory:"),
@@ -230,8 +234,8 @@ If you prefer to manage migrations externally (e.g., in CI/CD), disable auto-mig
 
 ```go
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://..."),
-    romancy.WithAutoMigrate(false),  // Disable auto-migration
+	romancy.WithDatabase("postgres://..."),
+	romancy.WithAutoMigrate(false), // Disable auto-migration
 )
 ```
 

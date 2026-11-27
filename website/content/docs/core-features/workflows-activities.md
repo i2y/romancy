@@ -48,12 +48,21 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
 
 ### Starting Workflows
 
+A workflow runs only on apps that registered it. Register it before `app.Start`; an instance started on an app that did not register its workflow stays `running` until a worker that registered it picks it up.
+
 ```go
+// Register the workflow with the app (before app.Start)
+romancy.RegisterWorkflow(app, myWorkflow)
+
 // Start a workflow programmatically
 instanceID, err := romancy.StartWorkflow(ctx, app, myWorkflow, MyInput{
 	Param1: "hello",
 	Param2: 42,
 })
+if err != nil {
+	panic(err)
+}
+fmt.Println("started", instanceID)
 ```
 
 ### CloudEvents Auto-Registration (Opt-in)
@@ -74,8 +83,12 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 		// with type="order_workflow"
 		return OrderResult{Status: "completed", OrderID: orderID}, nil
 	},
-	romancy.WithEventHandler(true), // Enable CloudEvents auto-registration
 )
+
+// Enable CloudEvents auto-registration when registering the workflow.
+func registerOrderWorkflow(app *romancy.App) {
+	romancy.RegisterWorkflow(app, orderWorkflow, romancy.WithEventHandler(true))
+}
 ```
 
 **How it works:**
@@ -94,15 +107,20 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 ### Basic Usage
 
 ```go
+type EmailInput struct {
+	Email   string `json:"email"`
+	Subject string `json:"subject"`
+}
+
 type EmailResult struct {
 	Sent      bool   `json:"sent"`
 	MessageID string `json:"message_id"`
 }
 
 var sendEmail = romancy.DefineActivity("send_email",
-	func(ctx context.Context, email, subject string) (EmailResult, error) {
+	func(ctx context.Context, input EmailInput) (EmailResult, error) {
 		// Call external service
-		response, err := emailService.Send(email, subject)
+		response, err := emailService.Send(input.Email, input.Subject)
 		if err != nil {
 			return EmailResult{}, err
 		}
@@ -145,9 +163,8 @@ var createOrderWithDB = romancy.DefineActivity("create_order_with_db",
 		wfCtx := romancy.GetWorkflowContext(ctx)
 		session := wfCtx.Session()
 
-		// Your database operations
-		order := &Order{OrderID: orderID}
-		if err := session.Create(order).Error; err != nil {
+		// Your database operations run in the activity transaction.
+		if _, err := session.ExecContext(ctx, "INSERT INTO orders (order_id) VALUES (?)", orderID); err != nil {
 			return OrderResult{}, err
 		}
 
@@ -163,7 +180,7 @@ Activities automatically retry on failure with exponential backoff. This provide
 
 ### Default Retry Behavior
 
-By default, activities retry **5 times** with exponential backoff:
+By default (`retry.DefaultPolicy()`), an activity makes up to **3 attempts** with exponential backoff:
 
 ```go
 type PaymentResult struct {
@@ -172,7 +189,7 @@ type PaymentResult struct {
 
 var callPaymentAPI = romancy.DefineActivity("call_payment_api",
 	func(ctx context.Context, amount float64) (PaymentResult, error) {
-		// Default: 5 attempts with exponential backoff
+		// Default: 3 attempts with exponential backoff
 		response, err := paymentService.Charge(amount)
 		if err != nil {
 			return PaymentResult{}, err
@@ -185,12 +202,10 @@ var callPaymentAPI = romancy.DefineActivity("call_payment_api",
 **Default schedule:**
 
 - Attempt 1: Immediate execution
-- Attempt 2: 1 second delay
-- Attempt 3: 2 seconds delay
-- Attempt 4: 4 seconds delay
-- Attempt 5: 8 seconds delay
+- Attempt 2: after about 100 ms
+- Attempt 3: after about 200 ms
 
-If all 5 attempts fail, a retry exhausted error is returned.
+Each delay varies by ±50%. If all 3 attempts fail, a retry exhausted error is returned.
 
 ### Custom Retry Policies
 
@@ -209,7 +224,7 @@ var criticalPayment = romancy.DefineActivity("critical_payment",
 		}
 		return PaymentStatusResult{Status: response.Status}, nil
 	},
-	romancy.WithRetryPolicy(&retry.Policy{
+	romancy.WithRetryPolicy[string, PaymentStatusResult](&retry.Policy{
 		MaxAttempts:     10,                      // More attempts for critical operations
 		InitialInterval: 500 * time.Millisecond, // Faster initial retry
 		Multiplier:      1.5,                    // Slower exponential growth
@@ -220,33 +235,39 @@ var criticalPayment = romancy.DefineActivity("critical_payment",
 
 **retry.Policy fields:**
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `MaxAttempts` | `int` | `5` | Maximum retry attempts (0 = infinite) |
-| `InitialInterval` | `time.Duration` | `1s` | First retry delay |
+| Field | Type | When zero | Description |
+|-------|------|-----------|-------------|
+| `MaxAttempts` | `int` | No limit | Maximum attempts, including the first |
+| `InitialInterval` | `time.Duration` | Retry at once | Delay before the first retry |
 | `Multiplier` | `float64` | `2.0` | Exponential backoff multiplier |
-| `MaxInterval` | `time.Duration` | `60s` | Maximum retry delay |
+| `MaxInterval` | `time.Duration` | No maximum | Maximum retry delay |
+| `RandomizationFactor` | `float64` | No jitter | `0.5` varies each delay by ±50% |
+| `NonRetryableErrors` | `[]error` | Every error is retried | Errors (matched with `errors.Is`) that end the retries |
 
-### Application-Level Default Policy
+### Shared Retry Policy
 
-Set a default retry policy for all activities in your application:
+Romancy does not have an application-level retry default. Define a shared policy and pass it to each activity:
 
 ```go
-app := romancy.NewApp(
-	romancy.WithDatabase("postgres://localhost/workflows"),
-	romancy.WithDefaultRetryPolicy(&retry.Policy{
-		MaxAttempts:     10,
-		InitialInterval: 2 * time.Second,
-		MaxInterval:     2 * time.Minute,
-	}),
+// One policy for the activities that call the payment provider
+var paymentRetry = &retry.Policy{
+	MaxAttempts:     10,
+	InitialInterval: 2 * time.Second,
+	MaxInterval:     2 * time.Minute,
+}
+
+var chargeCard = romancy.DefineActivity("charge_card",
+	func(ctx context.Context, orderID string) (ProcessResult, error) {
+		return ProcessResult{Processed: true}, nil
+	},
+	romancy.WithRetryPolicy[string, ProcessResult](paymentRetry),
 )
 ```
 
 **Policy resolution order:**
 
-1. Activity-level policy (highest priority)
-2. Application-level policy
-3. Framework default (5 attempts)
+1. The activity's own policy (`WithRetryPolicy`)
+2. Otherwise `retry.DefaultPolicy()` (3 attempts)
 
 ### Non-Retryable Errors
 
@@ -267,12 +288,12 @@ var validateOrder = romancy.DefineActivity("validate_order",
 
 		if order == nil {
 			// Don't retry - order doesn't exist
-			return ValidationResult{}, romancy.TerminalError(fmt.Errorf("order %s not found", orderID))
+			return ValidationResult{}, romancy.NewTerminalError(fmt.Errorf("order %s not found", orderID))
 		}
 
 		if order.Status == "cancelled" {
 			// Business rule violation - don't retry
-			return ValidationResult{}, romancy.TerminalError(fmt.Errorf("order %s is cancelled", orderID))
+			return ValidationResult{}, romancy.NewTerminalError(fmt.Errorf("order %s is cancelled", orderID))
 		}
 
 		return ValidationResult{OrderID: orderID, Valid: true}, nil
@@ -298,12 +319,12 @@ type ProcessResult struct {
 	Processed bool `json:"processed"`
 }
 
-// Default policy (5 attempts, exponential backoff)
+// Default policy (3 attempts, exponential backoff)
 var defaultActivity = romancy.DefineActivity("default_activity",
 	func(ctx context.Context, data string) (ProcessResult, error) {
 		return ProcessResult{Processed: true}, nil
 	},
-	romancy.WithRetryPolicy(retry.DefaultPolicy()),
+	romancy.WithRetryPolicy[string, ProcessResult](retry.DefaultPolicy()),
 )
 
 // No retries - fail immediately
@@ -311,7 +332,7 @@ var noRetryActivity = romancy.DefineActivity("no_retry_activity",
 	func(ctx context.Context, data string) (ProcessResult, error) {
 		return ProcessResult{Processed: true}, nil
 	},
-	romancy.WithRetryPolicy(retry.NoRetry()),
+	romancy.WithRetryPolicy[string, ProcessResult](retry.NoRetry()),
 )
 
 // Fixed interval retries
@@ -319,7 +340,7 @@ var fixedRetryActivity = romancy.DefineActivity("fixed_retry_activity",
 	func(ctx context.Context, data string) (ProcessResult, error) {
 		return ProcessResult{Processed: true}, nil
 	},
-	romancy.WithRetryPolicy(retry.Fixed(5, 2*time.Second)), // 5 attempts, 2s interval
+	romancy.WithRetryPolicy[string, ProcessResult](retry.Fixed(5, 2*time.Second)), // 5 attempts, 2s interval
 )
 
 // Exponential backoff
@@ -327,7 +348,7 @@ var exponentialActivity = romancy.DefineActivity("exponential_activity",
 	func(ctx context.Context, data string) (ProcessResult, error) {
 		return ProcessResult{Processed: true}, nil
 	},
-	romancy.WithRetryPolicy(retry.Exponential(10, 100*time.Millisecond, 30*time.Second)),
+	romancy.WithRetryPolicy[string, ProcessResult](retry.Exponential(10, 100*time.Millisecond, 30*time.Second, 2.0)),
 )
 ```
 
@@ -407,19 +428,24 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 		// Manual IDs required for concurrent execution
 		var wg sync.WaitGroup
 		results := make([]FetchResult, len(urls))
+		errs := make([]error, len(urls))
 
 		for i, url := range urls {
 			wg.Add(1)
 			go func(idx int, u string) {
 				defer wg.Done()
-				// Use WithActivityID for concurrent execution
-				result, _ := fetchData.Execute(ctx, u,
-					romancy.WithActivityID(fmt.Sprintf("fetch_data:%d", idx+1)))
-				results[idx] = result
+				// An explicit ID that no auto-generated one ("fetch_data:1", ...) can take
+				results[idx], errs[idx] = fetchData.Execute(ctx, u,
+					romancy.WithActivityID(fmt.Sprintf("fetch_data:url-%d", idx+1)))
 			}(i, url)
 		}
 
 		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				return ConcurrentResult{}, err
+			}
+		}
 		return ConcurrentResult{Results: results}, nil
 	},
 )
@@ -429,6 +455,8 @@ var concurrentWorkflow = romancy.DefineWorkflow("concurrent_workflow",
 
 - Goroutine-based concurrent execution
 - Any scenario where execution order is non-deterministic
+
+**Choosing manual IDs:** auto-generated IDs are `{activity name}:{n}`, and a manual ID does not advance the count. A manual `fetch_data:1` would therefore also be the ID of the next `fetchData.Execute(ctx, url)` without one, which would return the earlier call's result without running. Use IDs an auto-generated one cannot be, such as `fetch_data:url-1`, unique within the instance. Run only activities from goroutines: call `Sleep`, `WaitEvent`, `Receive`, `Publish` and the other workflow APIs from the workflow function itself (see [Deterministic Replay](/docs/core-features/durable-execution/replay)).
 
 ### Best Practices
 
@@ -554,31 +582,41 @@ type UserProfileResult struct {
 
 // Activities
 var createDatabaseRecord = romancy.DefineActivity("create_database_record",
-	func(ctx context.Context, userID, email, name string) (DatabaseRecordResult, error) {
-		fmt.Printf("Creating user %s in database\n", userID)
+	func(ctx context.Context, input UserInput) (DatabaseRecordResult, error) {
+		fmt.Printf("Creating user %s in database\n", input.UserID)
 		// Simulate database write
 		return DatabaseRecordResult{
-			AccountID: fmt.Sprintf("ACC-%s", userID),
-			Email:     email,
-			Name:      name,
+			AccountID: fmt.Sprintf("ACC-%s", input.UserID),
+			Email:     input.Email,
+			Name:      input.Name,
 		}, nil
 	},
 )
 
+type WelcomeEmailInput struct {
+	Email string `json:"email"`
+	Name  string `json:"name"`
+}
+
 var sendWelcomeEmail = romancy.DefineActivity("send_welcome_email",
-	func(ctx context.Context, email, name string) (WelcomeEmailResult, error) {
-		fmt.Printf("Sending welcome email to %s\n", email)
+	func(ctx context.Context, input WelcomeEmailInput) (WelcomeEmailResult, error) {
+		fmt.Printf("Sending welcome email to %s\n", input.Email)
 		// Simulate email service
-		return WelcomeEmailResult{Sent: true, Email: email}, nil
+		return WelcomeEmailResult{Sent: true, Email: input.Email}, nil
 	},
 )
 
+type CreateProfileInput struct {
+	AccountID string `json:"account_id"`
+	Name      string `json:"name"`
+}
+
 var createUserProfile = romancy.DefineActivity("create_user_profile",
-	func(ctx context.Context, accountID, name string) (UserProfileResult, error) {
-		fmt.Printf("Creating profile for %s\n", accountID)
+	func(ctx context.Context, input CreateProfileInput) (UserProfileResult, error) {
+		fmt.Printf("Creating profile for %s\n", input.AccountID)
 		// Simulate profile creation
 		return UserProfileResult{
-			ProfileID: fmt.Sprintf("PROF-%s", accountID),
+			ProfileID: fmt.Sprintf("PROF-%s", input.AccountID),
 			Settings:  ProfileSettings{Theme: "light", Notifications: true},
 		}, nil
 	},
@@ -588,19 +626,19 @@ var createUserProfile = romancy.DefineActivity("create_user_profile",
 var userRegistrationWorkflow = romancy.DefineWorkflow("user_registration",
 	func(ctx *romancy.WorkflowContext, input UserInput) (UserResult, error) {
 		// Step 1: Database record
-		account, err := createDatabaseRecord.Execute(ctx, input.UserID, input.Email, input.Name)
+		account, err := createDatabaseRecord.Execute(ctx, input)
 		if err != nil {
 			return UserResult{}, err
 		}
 
 		// Step 2: Welcome email
-		_, err = sendWelcomeEmail.Execute(ctx, account.Email, account.Name)
+		_, err = sendWelcomeEmail.Execute(ctx, WelcomeEmailInput{Email: account.Email, Name: account.Name})
 		if err != nil {
 			return UserResult{}, err
 		}
 
 		// Step 3: User profile
-		_, err = createUserProfile.Execute(ctx, account.AccountID, account.Name)
+		_, err = createUserProfile.Execute(ctx, CreateProfileInput{AccountID: account.AccountID, Name: account.Name})
 		if err != nil {
 			return UserResult{}, err
 		}
@@ -620,6 +658,8 @@ func main() {
 	)
 
 	ctx := context.Background()
+
+	romancy.RegisterWorkflow(app, userRegistrationWorkflow)
 
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -657,9 +697,16 @@ type InventoryResult struct {
 
 var processOrder = romancy.DefineWorkflow("process_order",
 	func(ctx *romancy.WorkflowContext, orderID string) (OrderProcessResult, error) {
-		inventory, _ := reserveInventory.Execute(ctx, orderID)
-		_, _ = processPayment.Execute(ctx, inventory.Total)
-		_, _ = shipOrder.Execute(ctx, orderID)
+		inventory, err := reserveInventory.Execute(ctx, orderID)
+		if err != nil {
+			return OrderProcessResult{}, err
+		}
+		if _, err := processPayment.Execute(ctx, inventory.Total); err != nil {
+			return OrderProcessResult{}, err
+		}
+		if _, err := shipOrder.Execute(ctx, orderID); err != nil {
+			return OrderProcessResult{}, err
+		}
 		return OrderProcessResult{Status: "completed"}, nil
 	},
 )
@@ -671,9 +718,10 @@ var processOrder = romancy.DefineWorkflow("process_order",
 var processOrder = romancy.DefineWorkflow("process_order",
 	func(ctx *romancy.WorkflowContext, orderID string) (OrderProcessResult, error) {
 		// Don't put business logic in workflows!
-		inventoryData := db.Query("SELECT ...")  // ❌
-		total := calculateTotal(inventoryData)    // ❌
-		externalAPI.Call(...)                     // ❌
+		inventoryData, _ := db.QueryContext(ctx.Context(), "SELECT quantity FROM inventory") // ❌
+		if calculateTotal(inventoryData) > 0 {                                                // ❌
+			externalAPI.Call("reserve") // ❌
+		}
 		return OrderProcessResult{Status: "completed"}, nil
 	},
 )
@@ -689,9 +737,9 @@ type SendEmailResult struct {
 }
 
 var sendEmail = romancy.DefineActivity("send_email",
-	func(ctx context.Context, email, subject string) (SendEmailResult, error) {
+	func(ctx context.Context, input EmailInput) (SendEmailResult, error) {
 		// Single responsibility: send email
-		_, err := emailService.Send(email, subject)
+		_, err := emailService.Send(input.Email, input.Subject)
 		if err != nil {
 			return SendEmailResult{}, err
 		}
@@ -704,13 +752,13 @@ var sendEmail = romancy.DefineActivity("send_email",
 
 ```go
 var sendEmailAndUpdateDBAndLog = romancy.DefineActivity("send_email_and_update_db_and_log",
-	func(ctx context.Context, ...) (SendEmailResult, error) {
+	func(ctx context.Context, input EmailInput) (SendEmailResult, error) {
 		// Too many responsibilities!
-		emailService.Send(...)
-		db.Update(...)
-		logger.Log(...)
+		emailService.Send(input.Email, input.Subject)
+		db.ExecContext(ctx, "UPDATE users SET welcomed = true")
+		logger.Println("sent")
 		// Break this into 3 separate activities!
-		return SendEmailResult{}, nil
+		return SendEmailResult{Sent: true}, nil
 	},
 )
 ```
@@ -741,10 +789,11 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 ❌ **Bad:**
 
 ```go
+// Romancy workflows take one input value. Use a struct rather than
+// multiple positional parameters; positional parameters are not supported.
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string, amount float64) (OrderWorkflowResult, error) {
-		// Multiple parameters - harder to extend, no validation
-		return OrderWorkflowResult{}, nil
+	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderWorkflowResult, error) {
+		return OrderWorkflowResult{Status: "completed", OrderID: input.OrderID}, nil
 	},
 )
 ```
@@ -757,41 +806,55 @@ Romancy provides several methods for querying and managing workflow instances.
 
 ```go
 instance, err := app.GetInstance(ctx, "wf_abc123")
-if err != nil {
-    // Handle error
-}
-if instance == nil {
+var notFound *romancy.WorkflowNotFoundError
+if errors.As(err, &notFound) {
     // Instance not found
+} else if err != nil {
+    // Handle error
+} else {
+    fmt.Println(instance.Status, instance.WorkflowName)
 }
-fmt.Println(instance.Status, instance.WorkflowName)
 ```
 
 ### List Instances with Filters
 
 ```go
-import "github.com/i2y/romancy/internal/storage"
-
-result, err := app.ListInstances(ctx, storage.ListInstancesOptions{
-    WorkflowNameFilter: "order",      // Partial match
-    StatusFilter:       "running",    // Exact match
-    InstanceIDFilter:   "order_",     // Partial match
-    Limit:             50,            // Page size (default: 50)
+instances, err := app.FindInstancesWithOptions(ctx, romancy.ListInstancesOptions{
+    WorkflowNameFilter: "order",               // Partial match
+    StatusFilter:       romancy.StatusRunning, // Exact match
+    InstanceIDFilter:   "order_",              // Partial match
+    Limit:              50,                    // Page size (default: 50)
 })
 if err != nil {
     // Handle error
 }
-
-for _, inst := range result.Instances {
+for _, inst := range instances {
     fmt.Println(inst.InstanceID, inst.Status)
 }
+```
 
-// Paginate
-if result.HasMore {
-    nextResult, _ := app.ListInstances(ctx, storage.ListInstancesOptions{
-        PageToken: result.NextPageToken,
+To page through more instances, list them from the storage, which returns a token for the next page:
+
+```go
+page, err := app.Storage().ListInstances(ctx, romancy.ListInstancesOptions{Limit: 50})
+for err == nil {
+    for _, inst := range page.Instances {
+        fmt.Println(inst.InstanceID, inst.Status)
+    }
+    if !page.HasMore {
+        break
+    }
+    page, err = app.Storage().ListInstances(ctx, romancy.ListInstancesOptions{
+        Limit:     50,
+        PageToken: page.NextPageToken,
     })
 }
+if err != nil {
+    // Handle error
+}
 ```
+
+From a shell, the CLI lists instances the same way: `romancy list --db workflow.db --status running`, with `--page-token` for the next page.
 
 ### Find Instances by Input Data
 
@@ -804,10 +867,14 @@ instances, err := app.FindInstances(ctx, map[string]any{
 })
 
 // Find orders with specific status in input
-instances, err := app.FindInstances(ctx, map[string]any{
+instances, err = app.FindInstances(ctx, map[string]any{
     "order.status": "pending",
     "order.priority": "high",
 })
+if err != nil {
+    panic(err)
+}
+fmt.Println(len(instances))
 ```
 
 #### JSON Path Syntax
@@ -822,16 +889,24 @@ Input filters support dot-notation for nested fields:
 
 #### Full Options
 
+Combine input filters with the other filters:
+
 ```go
-result, err := app.FindInstancesWithOptions(ctx, storage.ListInstancesOptions{
+instances, err := app.FindInstancesWithOptions(ctx, romancy.ListInstancesOptions{
     InputFilters: map[string]any{
         "customer.id": "cust_123",
-        "order.type": "subscription",
+        "order.type":  "subscription",
     },
-    StatusFilter:       storage.StatusRunning,  // Optional: filter by status
-    WorkflowNameFilter: "order",                // Optional: filter by workflow name
+    StatusFilter:       romancy.StatusRunning, // Optional: filter by status
+    WorkflowNameFilter: "order",               // Optional: filter by workflow name
     Limit:              100,
 })
+if err != nil {
+    // Handle error
+}
+for _, inst := range instances {
+    fmt.Println(inst.InstanceID, inst.Status)
+}
 ```
 
 #### Supported Value Types

@@ -100,6 +100,8 @@ policy := retry.NewBuilder().
     WithJitter(0.2).
     WithNonRetryableErrors(ErrInvalidCard).
     Build()
+
+// Pass it to activities with romancy.WithRetryPolicy[In, Out](policy)
 ```
 
 `retry.NewBuilder()` starts from 3 attempts, 100 ms, ×2 and 10 s, without jitter.
@@ -110,8 +112,8 @@ policy := retry.NewBuilder().
 |---|---|
 | `MaxAttempts` | Attempts including the first; 0 means no limit |
 | `InitialInterval` | Delay before the first retry |
-| `Multiplier` | Factor applied to the delay for each further retry |
-| `MaxInterval` | Upper bound on the delay, applied before jitter |
+| `Multiplier` | Factor applied to the delay for each further retry; 0 means 2.0 |
+| `MaxInterval` | Upper bound on the delay, applied before jitter; 0 means no bound |
 | `RandomizationFactor` | Jitter: 0.5 puts each delay within [0.5×, 1.5×] |
 | `NonRetryableErrors` | Errors, matched with `errors.Is`, that end the retries |
 
@@ -123,7 +125,7 @@ Return a `TerminalError` for a failure that no retry can fix:
 var validateOrder = romancy.DefineActivity("validate_order",
     func(ctx context.Context, order Order) (Order, error) {
         if order.Amount <= 0 {
-            return Order{}, romancy.NewTerminalErrorf("invalid amount: %d", order.Amount)
+            return Order{}, romancy.NewTerminalErrorf("invalid amount: %f", order.Amount)
         }
         return order, nil
     },
@@ -137,7 +139,7 @@ The activity returns a `TerminalError` (or an error that wraps one) at once, as 
 When the policy gives up, the activity returns a `*romancy.RetryExhaustedError`. It wraps the last attempt's error, so `errors.Is` and `errors.As` see through it:
 
 ```go
-receipt, err := chargeCard.Execute(ctx, req)
+_, err := chargeCard.Execute(ctx, req)
 if err != nil {
     var exhausted *romancy.RetryExhaustedError
     if errors.As(err, &exhausted) {

@@ -99,6 +99,8 @@ func main() {
 		romancy.WithWorkerID("worker-1"),
 	)
 
+	romancy.RegisterWorkflow(app, userOnboarding)
+
 	ctx := context.Background()
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -180,7 +182,7 @@ In production (use PostgreSQL or MySQL 8.0+ for distributed systems):
 
 ```go
 // For distributed systems (K8s, Docker Compose with multiple replicas)
-// Use PostgreSQL or MySQL 8.0+ (NOT SQLite)
+// use PostgreSQL or MySQL 8.0+ (NOT SQLite).
 app := romancy.NewApp(
 	romancy.WithDatabase("postgres://user:password@localhost/workflows"),
 	// or: romancy.WithDatabase("mysql://user:password@localhost:3306/workflows"),
@@ -263,8 +265,18 @@ var userOnboarding = romancy.DefineWorkflow("user_onboarding",
 	func(ctx *romancy.WorkflowContext, input OnboardingInput) (OnboardingResult, error) {
 		// Orchestration logic here
 		result1, err := activity1.Execute(ctx, input)
+		if err != nil {
+			return OnboardingResult{}, err
+		}
 		result2, err := activity2.Execute(ctx, input.Email)
-		return OnboardingResult{Status: "completed", ...}, nil
+		if err != nil {
+			return OnboardingResult{}, err
+		}
+		return OnboardingResult{
+			Status:    "completed",
+			UserID:    result1.UserID,
+			EmailSent: result2.Sent,
+		}, nil
 	},
 )
 ```
@@ -277,10 +289,13 @@ var userOnboarding = romancy.DefineWorkflow("user_onboarding",
 ### WorkflowContext
 
 ```go
-func(ctx *romancy.WorkflowContext, input MyInput) (MyResult, error) {
-	// ctx provides workflow operations
-	// Automatically manages history and replay
-}
+var exampleWorkflow = romancy.DefineWorkflow("example",
+	func(ctx *romancy.WorkflowContext, input MyInput) (MyResult, error) {
+		// ctx provides workflow operations
+		// and automatically manages history and replay.
+		return MyResult{}, nil
+	},
+)
 ```
 
 - `ctx` provides workflow operations

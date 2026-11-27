@@ -22,12 +22,11 @@ PostgreSQL LISTEN/NOTIFY provides:
 LISTEN/NOTIFY is automatically enabled when using PostgreSQL. You can explicitly configure it:
 
 ```go
+enabled := true
 app := romancy.NewApp(
     romancy.WithDatabase("postgres://user:password@localhost:5432/dbname"),
     // Explicitly enable/disable (nil = auto-detect, enabled for PostgreSQL)
-    romancy.WithListenNotify(romancy.BoolPtr(true)),
-    // Fallback polling interval when LISTEN/NOTIFY is unavailable
-    romancy.WithNotifyFallbackInterval(30 * time.Second),
+    romancy.WithListenNotify(&enabled),
     // Delay before reconnecting after connection failure
     romancy.WithNotifyReconnectDelay(60 * time.Second),
 )

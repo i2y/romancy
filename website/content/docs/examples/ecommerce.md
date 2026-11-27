@@ -212,6 +212,8 @@ func main() {
 
 	ctx := context.Background()
 
+	romancy.RegisterWorkflow(app, processOrder)
+
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
@@ -283,7 +285,8 @@ var processOrder = romancy.DefineWorkflow("process_order",
 		// IDE autocomplete works!
 		customerName := order.Customer.Name  // ✅ Type-safe
 		total := order.TotalAmount()         // ✅ Type-safe
-		return OrderResult{...}, nil         // ✅ Return type checked
+		log.Printf("order for %s: %.2f", customerName, total)
+		return OrderResult{Status: "completed"}, nil // ✅ Return type checked
 	},
 )
 ```
@@ -503,6 +506,8 @@ func main() {
 	)
 
 	ctx := context.Background()
+
+	romancy.RegisterWorkflow(app, processOrder)
 
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)

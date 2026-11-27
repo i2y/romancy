@@ -7,7 +7,7 @@ This example demonstrates automatic compensation (rollback) when a workflow fail
 
 ## What This Example Shows
 
-- ✅ `DefineCompensation` for compensation functions
+- ✅ Compensation functions that take the activity's input
 - ✅ `WithCompensation` to link compensation to activities
 - ✅ Automatic reverse-order compensation
 - ✅ Saga pattern for distributed transactions
@@ -27,25 +27,30 @@ package main
 import (
 	"context"
 	"fmt"
-
-	"github.com/i2y/romancy"
 )
+
+// Input types shared by activities and their compensations
+type ReserveInput struct {
+	OrderID string `json:"order_id"`
+	ItemID  string `json:"item_id"`
+}
+
+type ChargeInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
 
 // Compensation: Release reserved inventory
-var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_reservation",
-	func(ctx context.Context, orderID, itemID string) error {
-		fmt.Printf("❌ Cancelled reservation for %s\n", itemID)
-		return nil
-	},
-)
+func cancelInventoryReservation(ctx context.Context, input ReserveInput) error {
+	fmt.Printf("❌ Cancelled reservation for %s\n", input.ItemID)
+	return nil
+}
 
 // Compensation: Refund payment
-var refundPayment = romancy.DefineCompensation("refund_payment",
-	func(ctx context.Context, orderID string, amount float64) error {
-		fmt.Printf("❌ Refunded $%.2f\n", amount)
-		return nil
-	},
-)
+func refundPayment(ctx context.Context, input ChargeInput) error {
+	fmt.Printf("❌ Refunded $%.2f\n", input.Amount)
+	return nil
+}
 ```
 
 ### Define Activities with Compensation Links
@@ -76,28 +81,39 @@ type ShipmentResult struct {
 	ShipmentID string `json:"shipment_id"`
 }
 
+// Input types shared by activities and their compensations
+type ReserveInput struct {
+	OrderID string `json:"order_id"`
+	ItemID  string `json:"item_id"`
+}
+
+type ChargeInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 // Reserve inventory (linked to cancelInventoryReservation)
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID, itemID string) (ReservationResult, error) {
-		fmt.Printf("✅ Reserved %s for order %s\n", itemID, orderID)
+	func(ctx context.Context, input ReserveInput) (ReservationResult, error) {
+		fmt.Printf("✅ Reserved %s for order %s\n", input.ItemID, input.OrderID)
 		return ReservationResult{
-			ReservationID: fmt.Sprintf("RES-%s", itemID),
-			ItemID:        itemID,
+			ReservationID: fmt.Sprintf("RES-%s", input.ItemID),
+			ItemID:        input.ItemID,
 		}, nil
 	},
-	romancy.WithCompensation(cancelInventoryReservation), // Link compensation
+	romancy.WithCompensation[ReserveInput, ReservationResult](cancelInventoryReservation), // Link compensation
 )
 
 // Charge payment (linked to refundPayment)
 var chargePayment = romancy.DefineActivity("charge_payment",
-	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
-		fmt.Printf("✅ Charged $%.2f for order %s\n", amount, orderID)
+	func(ctx context.Context, input ChargeInput) (PaymentResult, error) {
+		fmt.Printf("✅ Charged $%.2f for order %s\n", input.Amount, input.OrderID)
 		return PaymentResult{
-			TransactionID: fmt.Sprintf("TXN-%s", orderID),
-			Amount:        amount,
+			TransactionID: fmt.Sprintf("TXN-%s", input.OrderID),
+			Amount:        input.Amount,
 		}, nil
 	},
-	romancy.WithCompensation(refundPayment), // Link compensation
+	romancy.WithCompensation[ChargeInput, PaymentResult](refundPayment), // Link compensation
 )
 
 // Ship order (no compensation - this will fail)
@@ -129,13 +145,13 @@ type OrderSagaResult struct {
 var orderSaga = romancy.DefineWorkflow("order_saga",
 	func(ctx *romancy.WorkflowContext, orderID string) (OrderSagaResult, error) {
 		// Step 1: Reserve inventory
-		_, err := reserveInventory.Execute(ctx, orderID, "ITEM-123")
+		_, err := reserveInventory.Execute(ctx, ReserveInput{OrderID: orderID, ItemID: "ITEM-123"})
 		if err != nil {
 			return OrderSagaResult{}, err
 		}
 
 		// Step 2: Charge payment
-		_, err = chargePayment.Execute(ctx, orderID, 99.99)
+		_, err = chargePayment.Execute(ctx, ChargeInput{OrderID: orderID, Amount: 99.99})
 		if err != nil {
 			return OrderSagaResult{}, err
 		}
@@ -191,9 +207,9 @@ Compensations:   cancel ← refund
 Only **successfully completed** activities are compensated:
 
 ```go
-reserveInventory.Execute(ctx, ...)  // ✅ Completed → Will be compensated
-chargePayment.Execute(ctx, ...)     // ✅ Completed → Will be compensated
-shipOrder.Execute(ctx, ...)         // ❌ Failed → No compensation needed
+reserveInventory.Execute(ctx, ReserveInput{OrderID: "ORD-1", ItemID: "ITEM-123"}) // ✅ Completed → Will be compensated
+chargePayment.Execute(ctx, ChargeInput{OrderID: "ORD-1", Amount: 99.99})            // ✅ Completed → Will be compensated
+shipOrder.Execute(ctx, "ORD-1")                                                     // ❌ Failed → No compensation needed
 ```
 
 ### 3. Automatic Trigger
@@ -253,44 +269,52 @@ type OrderSagaResult struct {
 	Status string `json:"status"`
 }
 
+// Input types shared by activities and their compensations
+
+type ReserveInput struct {
+	OrderID string `json:"order_id"`
+	ItemID  string `json:"item_id"`
+}
+
+type ChargeInput struct {
+	OrderID string  `json:"order_id"`
+	Amount  float64 `json:"amount"`
+}
+
 // Compensation functions
 
-var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_reservation",
-	func(ctx context.Context, orderID, itemID string) error {
-		fmt.Printf("❌ Cancelled reservation for %s\n", itemID)
-		return nil
-	},
-)
+func cancelInventoryReservation(ctx context.Context, input ReserveInput) error {
+	fmt.Printf("❌ Cancelled reservation for %s\n", input.ItemID)
+	return nil
+}
 
-var refundPayment = romancy.DefineCompensation("refund_payment",
-	func(ctx context.Context, orderID string, amount float64) error {
-		fmt.Printf("❌ Refunded $%.2f\n", amount)
-		return nil
-	},
-)
+func refundPayment(ctx context.Context, input ChargeInput) error {
+	fmt.Printf("❌ Refunded $%.2f\n", input.Amount)
+	return nil
+}
 
 // Activities with compensation links
 
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID, itemID string) (ReservationResult, error) {
-		fmt.Printf("✅ Reserved %s for order %s\n", itemID, orderID)
+	func(ctx context.Context, input ReserveInput) (ReservationResult, error) {
+		fmt.Printf("✅ Reserved %s for order %s\n", input.ItemID, input.OrderID)
 		return ReservationResult{
-			ReservationID: fmt.Sprintf("RES-%s", itemID),
-			ItemID:        itemID,
+			ReservationID: fmt.Sprintf("RES-%s", input.ItemID),
+			ItemID:        input.ItemID,
 		}, nil
 	},
-	romancy.WithCompensation(cancelInventoryReservation),
+	romancy.WithCompensation[ReserveInput, ReservationResult](cancelInventoryReservation),
 )
 
 var chargePayment = romancy.DefineActivity("charge_payment",
-	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
-		fmt.Printf("✅ Charged $%.2f for order %s\n", amount, orderID)
+	func(ctx context.Context, input ChargeInput) (PaymentResult, error) {
+		fmt.Printf("✅ Charged $%.2f for order %s\n", input.Amount, input.OrderID)
 		return PaymentResult{
-			TransactionID: fmt.Sprintf("TXN-%s", orderID),
-			Amount:        amount,
+			TransactionID: fmt.Sprintf("TXN-%s", input.OrderID),
+			Amount:        input.Amount,
 		}, nil
 	},
-	romancy.WithCompensation(refundPayment),
+	romancy.WithCompensation[ChargeInput, PaymentResult](refundPayment),
 )
 
 var shipOrder = romancy.DefineActivity("ship_order",
@@ -305,13 +329,13 @@ var shipOrder = romancy.DefineActivity("ship_order",
 var orderSaga = romancy.DefineWorkflow("order_saga",
 	func(ctx *romancy.WorkflowContext, orderID string) (OrderSagaResult, error) {
 		// Step 1: Reserve inventory
-		_, err := reserveInventory.Execute(ctx, orderID, "ITEM-123")
+		_, err := reserveInventory.Execute(ctx, ReserveInput{OrderID: orderID, ItemID: "ITEM-123"})
 		if err != nil {
 			return OrderSagaResult{}, err
 		}
 
 		// Step 2: Charge payment
-		_, err = chargePayment.Execute(ctx, orderID, 99.99)
+		_, err = chargePayment.Execute(ctx, ChargeInput{OrderID: orderID, Amount: 99.99})
 		if err != nil {
 			return OrderSagaResult{}, err
 		}
@@ -340,6 +364,8 @@ func main() {
 
 	ctx := context.Background()
 
+	romancy.RegisterWorkflow(app, orderSaga)
+
 	// Start the app
 	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
@@ -361,7 +387,7 @@ func main() {
 
 ## What You Learned
 
-- ✅ **`DefineCompensation`**: Define compensation functions
+- ✅ **Compensation functions**: Undo an activity, given its input
 - ✅ **`WithCompensation`**: Link compensation to activities
 - ✅ **Automatic Execution**: Romancy handles compensation automatically
 - ✅ **Reverse Order**: Compensations run in reverse order

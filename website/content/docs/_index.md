@@ -143,7 +143,12 @@ import (
     "github.com/i2y/romancy"
 )
 
-// Result types
+// Input and result types
+type OrderInput struct {
+    OrderID string  `json:"order_id"`
+    Amount  float64 `json:"amount"`
+}
+
 type PaymentResult struct {
     Status string  `json:"status"`
     Amount float64 `json:"amount"`
@@ -164,12 +169,12 @@ var processPayment = romancy.DefineActivity("process_payment",
 
 // Define a workflow
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-    func(ctx *romancy.WorkflowContext, orderID string, amount float64) (OrderResult, error) {
-        result, err := processPayment.Execute(ctx, amount)
+    func(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
+        result, err := processPayment.Execute(ctx, input.Amount)
         if err != nil {
             return OrderResult{}, err
         }
-        return OrderResult{OrderID: orderID, Payment: result}, nil
+        return OrderResult{OrderID: input.OrderID, Payment: result}, nil
     },
 )
 
@@ -180,6 +185,8 @@ func main() {
         romancy.WithWorkerID("worker-1"),
     )
 
+    romancy.RegisterWorkflow(app, orderWorkflow)
+
     ctx := context.Background()
     if err := app.Start(ctx); err != nil {
         log.Fatal(err)
@@ -187,7 +194,10 @@ func main() {
     defer app.Shutdown(ctx)
 
     // Start workflow
-    instanceID, err := orderWorkflow.Start(ctx, app, "ORD-123", 99.99)
+    instanceID, err := romancy.StartWorkflow(ctx, app, orderWorkflow, OrderInput{
+        OrderID: "ORD-123",
+        Amount:  99.99,
+    })
     if err != nil {
         log.Fatal(err)
     }

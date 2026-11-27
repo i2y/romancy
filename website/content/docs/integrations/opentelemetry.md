@@ -3,25 +3,26 @@ title: "OpenTelemetry Integration"
 weight: 2
 ---
 
-Romancy provides official integration with [OpenTelemetry](https://opentelemetry.io/), enabling distributed tracing and optional metrics for your durable workflows.
+Romancy ships [OpenTelemetry](https://opentelemetry.io/) tracing hooks in the `github.com/i2y/romancy/hooks/otel` package. They turn the lifecycle events of workflows, activities, event waits, timers and replays into spans.
 
 ## Overview
 
-OpenTelemetry is an industry-standard observability framework. Romancy's OpenTelemetry integration provides:
+`NewOTelHooks` returns an implementation of `hooks.WorkflowHooks` that records:
 
-- **Distributed Tracing**: Workflow and activity spans with parent-child relationships
-- **Optional Metrics**: Counters for workflow/activity execution, histograms for duration
-- **W3C Trace Context**: Propagate traces across service boundaries via CloudEvents
-- **Automatic Context Inheritance**: Inherit from HTTP middleware or CloudEvents headers
+- **Workflow spans** for each run of a workflow, with **activity spans** as their children
+- **Spans for waits and timers**: event waits, received events, timers, replays and activity cache hits
+- **Errors and retries**: a failed workflow or activity sets its span status to error, and every retry adds a span event to the activity span
+
+The hooks record traces only. To export metrics, implement the hook methods you need yourself (see [Lifecycle Hooks](/docs/core-features/hooks)).
 
 ## Installation
 
-Install the OpenTelemetry integration package:
+The hooks are part of the Romancy module. Add the OpenTelemetry SDK and an exporter:
 
 ```bash
-go get github.com/i2y/romancy/integrations/opentelemetry
-go get go.opentelemetry.io/otel
-go get go.opentelemetry.io/otel/exporters/otlp/otlptrace
+go get github.com/i2y/romancy
+go get go.opentelemetry.io/otel/sdk
+go get go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc
 ```
 
 ## Quick Start
@@ -32,13 +33,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/i2y/romancy"
-	otelromancy "github.com/i2y/romancy/integrations/opentelemetry"
-	"go.opentelemetry.io/otel"
+	otelromancy "github.com/i2y/romancy/hooks/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
-
-// Result types
 
 type ReservationResult struct {
 	Reserved bool `json:"reserved"`
@@ -48,20 +49,15 @@ type OrderResult struct {
 	Status string `json:"status"`
 }
 
-// Activities
-
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
 	func(ctx context.Context, orderID string) (ReservationResult, error) {
 		return ReservationResult{Reserved: true}, nil
 	},
 )
 
-// Workflow
-
 var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 	func(ctx *romancy.WorkflowContext, orderID string) (OrderResult, error) {
-		_, err := reserveInventory.Execute(ctx, orderID)
-		if err != nil {
+		if _, err := reserveInventory.Execute(ctx, orderID); err != nil {
 			return OrderResult{}, err
 		}
 		return OrderResult{Status: "completed"}, nil
@@ -69,105 +65,65 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 )
 
 func main() {
-	// Create OpenTelemetry hooks (console exporter for development)
-	hooks := otelromancy.NewHooks(
-		otelromancy.WithServiceName("order-service"),
-		otelromancy.WithConsoleExporter(), // For development
-		otelromancy.WithMetrics(false),
-	)
-	defer hooks.Shutdown(context.Background())
+	ctx := context.Background()
 
-	// Or with OTLP exporter for production (Jaeger, Tempo, etc.)
-	// hooks := otelromancy.NewHooks(
-	//     otelromancy.WithServiceName("order-service"),
-	//     otelromancy.WithOTLPEndpoint("http://localhost:4317"),
-	//     otelromancy.WithMetrics(true),
-	// )
+	// Export spans with OTLP over gRPC (localhost:4317 by default):
+	// an OpenTelemetry Collector, Jaeger, Tempo, ...
+	exporter, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	provider := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter))
+	defer func() { _ = provider.Shutdown(ctx) }()
 
-	// Create Romancy app with hooks
 	app := romancy.NewApp(
 		romancy.WithDatabase("workflow.db"),
 		romancy.WithWorkerID("worker-1"),
-		romancy.WithHooks(hooks),
+		romancy.WithHooks(otelromancy.NewOTelHooks(provider)),
 	)
+	romancy.RegisterWorkflow(app, orderWorkflow)
 
-	ctx := context.Background()
 	if err := app.Start(ctx); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer app.Shutdown(ctx)
 
-	// Start workflow
 	instanceID, err := romancy.StartWorkflow(ctx, app, orderWorkflow, "ORD-123")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-
 	fmt.Printf("Workflow started: %s\n", instanceID)
 }
 ```
 
-## Span Hierarchy
+`NewOTelHooks(nil)` uses the global tracer provider (`otel.SetTracerProvider`) instead of an explicit one. The tracer is named `romancy`.
 
-Romancy creates a hierarchical span structure:
+## Spans
 
 ```
-workflow:order_workflow (parent)
-├── activity:reserve_inventory:1 (child)
-├── activity:process_payment:1 (child)
-└── activity:ship_order:1 (child)
+workflow/order_workflow
+├── activity/reserve_inventory
+├── activity/process_payment
+└── activity/ship_order
 ```
 
-## Span Attributes
+| Span | Started by | Attributes |
+|------|------------|------------|
+| `workflow/<workflow name>` | a run of the workflow | `romancy.instance_id`, `romancy.workflow_name`, `romancy.start_time`; at the end `romancy.duration_ms`, and `romancy.cancel_reason` when cancelled |
+| `activity/<activity name>` | an activity call (a child of the workflow span) | `romancy.instance_id`, `romancy.workflow_name`, `romancy.activity_id`, `romancy.activity_name`, `romancy.is_replay`; at the end `romancy.duration_ms`, and `romancy.attempt` when it failed |
+| `activity_cache_hit/<activity name>` | an activity call answered from history during replay (the activity span, renamed) | those of the activity span |
+| `event_wait/<event type>` | `WaitEvent` / `Receive` | `romancy.instance_id`, `romancy.workflow_name`, `romancy.event_type`, `romancy.timeout_ms` (with a timeout); `romancy.duration_ms` when the wait ends |
+| `event_received/<event type>` | a delivered event | `romancy.event_type`, `romancy.event_id`, `romancy.event_source`, `romancy.instance_id` |
+| `timer/<timer id>` | `Sleep` / `SleepUntil` | `romancy.instance_id`, `romancy.workflow_name`, `romancy.timer_id`, `romancy.expires_at`; `romancy.fired_at` when it fires |
+| `replay/<workflow name>` | a run that replays history | `romancy.instance_id`, `romancy.workflow_name`, `romancy.history_events`; at the end `romancy.cache_hits`, `romancy.new_activities`, `romancy.duration_ms` |
 
-**Workflow Spans**:
+A retry adds an `activity_retry` event to the activity span, with `romancy.attempt`, `romancy.max_attempts`, `romancy.next_delay_ms` and `romancy.error`. A failed workflow, a failed activity, a cancelled workflow and an event timeout set the span status to error.
 
-- `romancy.workflow.instance_id`
-- `romancy.workflow.name`
-- `romancy.workflow.cancelled` (when cancelled)
+## Trace Context
 
-**Activity Spans**:
+The hooks keep the open spans of a run in memory, so an activity span becomes a child of its workflow span within one run. Workflow runs execute in the background, often after a wait and on another worker, so each run starts its own trace: a span in the context passed to `StartWorkflow` (for example one created by HTTP middleware) is not the parent of the workflow's spans.
 
-- `romancy.activity.id` (e.g., "reserve_inventory:1")
-- `romancy.activity.name`
-- `romancy.activity.is_replaying`
-- `romancy.activity.cache_hit`
-
-## Metrics (Optional)
-
-When `WithMetrics(true)`:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `romancy.workflow.started` | Counter | Workflows started |
-| `romancy.workflow.completed` | Counter | Workflows completed |
-| `romancy.workflow.failed` | Counter | Workflows failed |
-| `romancy.workflow.duration` | Histogram | Workflow execution time |
-| `romancy.activity.executed` | Counter | Activities executed |
-| `romancy.activity.cache_hit` | Counter | Activity cache hits |
-| `romancy.activity.duration` | Histogram | Activity execution time |
-
-## Trace Context Propagation
-
-### Automatic Context Inheritance
-
-OpenTelemetry hooks automatically inherit trace context from multiple sources, with the following priority:
-
-1. **Explicit trace context in input data** (highest priority)
-
-   - Extracted from CloudEvents extension attributes
-   - Useful for cross-service trace propagation
-
-2. **Current active span** (e.g., from HTTP middleware)
-
-   - Automatically detected using `otel.GetTracerProvider()`
-   - Works with OpenTelemetry instrumentation middleware
-
-3. **New root span** (if no parent context is found)
-
-### CloudEvents Integration
-
-Inject trace context when sending events:
+The hooks do not put their spans into the context your code receives, and Romancy does not read `traceparent` from incoming CloudEvents. To continue a trace across services, start a span of your own in an activity and put its trace context into the event you send:
 
 ```go
 package main
@@ -176,64 +132,39 @@ import (
 	"context"
 
 	"github.com/i2y/romancy"
-	otelromancy "github.com/i2y/romancy/integrations/opentelemetry"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
-func sendEventWithTrace(ctx *romancy.WorkflowContext, hooks *otelromancy.Hooks) error {
-	eventData := map[string]any{
-		"order_id": "ORD-123",
-	}
+var notifyShipped = romancy.DefineActivity("notify_shipped",
+	func(ctx context.Context, orderID string) (struct{}, error) {
+		ctx, span := otel.Tracer("orders").Start(ctx, "notify_shipped")
+		defer span.End()
 
-	// Inject trace context
-	eventData = otelromancy.InjectTraceContext(hooks, ctx.InstanceID(), eventData)
+		// Inject the span's trace context into the event payload so
+		// consumers can continue the trace.
+		carrier := propagation.MapCarrier{}
+		otel.GetTextMapPropagator().Inject(ctx, carrier)
+		eventData := map[string]any{"order_id": orderID}
+		for k, v := range carrier {
+			eventData["trace_"+k] = v
+		}
 
-	return romancy.SendEventTransactional(ctx,
-		"order.shipped",
-		"orders",
-		eventData,
-	)
-}
-```
-
-When a CloudEvent contains W3C Trace Context extension attributes (`traceparent`, `tracestate`), they are automatically extracted and used as the parent context:
-
-```bash
-# CloudEvent with trace context
-curl -X POST http://localhost:8001/ \
-  -H "Content-Type: application/json" \
-  -H "ce-specversion: 1.0" \
-  -H "ce-type: order.created" \
-  -H "ce-source: external-service" \
-  -H "ce-id: event-123" \
-  -H "ce-traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01" \
-  -d '{"order_id": "ORD-123"}'
-```
-
-### HTTP Middleware
-
-OpenTelemetry hooks automatically inherit from the current active span:
-
-```go
-package main
-
-import (
-	"net/http"
-
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+		err := romancy.SendEventTransactional(romancy.GetWorkflowContext(ctx),
+			"order.shipped",
+			"orders",
+			eventData,
+		)
+		return struct{}{}, err
+	},
 )
-
-func main() {
-	// Middleware creates parent span for each HTTP request
-	handler := otelhttp.NewHandler(yourHandler, "server")
-
-	// Workflow spans automatically inherit from the request span
-	http.ListenAndServe(":8001", handler)
-}
 ```
 
-### Existing TracerProvider Reuse
+The receiving service extracts it with the same propagator (a `propagation.MapCarrier` over the received fields). With the default `otel.GetTextMapPropagator()`, set a propagator first, for example `otel.SetTextMapPropagator(propagation.TraceContext{})`.
 
-If a TracerProvider is already configured (e.g., by HTTP middleware or your application), OpenTelemetry hooks will reuse it instead of creating a new one:
+## Using an Existing TracerProvider
+
+If your application already configures a TracerProvider, pass it to the hooks, or register it globally and pass `nil`:
 
 ```go
 package main
@@ -242,7 +173,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
 
-	otelromancy "github.com/i2y/romancy/integrations/opentelemetry"
+	"github.com/i2y/romancy"
+	otelromancy "github.com/i2y/romancy/hooks/otel"
 )
 
 func main() {
@@ -252,152 +184,41 @@ func main() {
 	)
 	otel.SetTracerProvider(provider)
 
-	// OpenTelemetry hooks will use the existing provider
-	hooks := otelromancy.NewHooks(
-		otelromancy.WithServiceName("my-service"),
+	app := romancy.NewApp(
+		romancy.WithDatabase("workflow.db"),
+		// otelromancy.NewOTelHooks(nil) would use the same, global provider
+		romancy.WithHooks(otelromancy.NewOTelHooks(provider)),
 	)
-	// No new provider is created!
+	_ = app
 }
 ```
 
-## Complete Example
+## Combining with Other Hooks
+
+`WithHooks` takes one `hooks.WorkflowHooks`. To run your own hooks next to the tracing hooks, embed `*otel.OTelHooks` in your type and override the methods you need, calling the embedded method first:
 
 ```go
 package main
 
 import (
 	"context"
-	"fmt"
 	"log"
-	"net/http"
-	"time"
 
-	"github.com/i2y/romancy"
-	otelromancy "github.com/i2y/romancy/integrations/opentelemetry"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"github.com/i2y/romancy/hooks"
+	otelromancy "github.com/i2y/romancy/hooks/otel"
 )
 
-// Result types
-
-type ValidationResult struct {
-	Valid bool `json:"valid"`
+type TracingAndLogging struct {
+	*otelromancy.OTelHooks
 }
 
-type PaymentResult struct {
-	TransactionID string `json:"transaction_id"`
-}
-
-type OrderInput struct {
-	OrderID string  `json:"order_id"`
-	Amount  float64 `json:"amount"`
-}
-
-type OrderWorkflowResult struct {
-	Status        string `json:"status"`
-	TransactionID string `json:"transaction_id"`
-}
-
-// Activities
-
-var validateOrder = romancy.DefineActivity("validate_order",
-	func(ctx context.Context, orderID string) (ValidationResult, error) {
-		time.Sleep(100 * time.Millisecond)
-		return ValidationResult{Valid: true}, nil
-	},
-)
-
-var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, amount float64) (PaymentResult, error) {
-		time.Sleep(500 * time.Millisecond)
-		return PaymentResult{TransactionID: "TXN-123"}, nil
-	},
-)
-
-// Workflow
-
-var orderWorkflow = romancy.DefineWorkflow("order_workflow",
-	func(ctx *romancy.WorkflowContext, orderID string, amount float64) (OrderWorkflowResult, error) {
-		_, err := validateOrder.Execute(ctx, orderID)
-		if err != nil {
-			return OrderWorkflowResult{}, err
-		}
-
-		paymentResult, err := processPayment.Execute(ctx, amount)
-		if err != nil {
-			return OrderWorkflowResult{}, err
-		}
-
-		return OrderWorkflowResult{
-			Status:        "completed",
-			TransactionID: paymentResult.TransactionID,
-		}, nil
-	},
-)
-
-func main() {
-	// Create OpenTelemetry hooks
-	hooks := otelromancy.NewHooks(
-		otelromancy.WithServiceName("order-service"),
-		otelromancy.WithOTLPEndpoint("http://localhost:4317"),
-		otelromancy.WithMetrics(true),
-	)
-	defer hooks.Shutdown(context.Background())
-
-	// Create Romancy app
-	app := romancy.NewApp(
-		romancy.WithDatabase("orders.db"),
-		romancy.WithWorkerID("worker-1"),
-		romancy.WithHooks(hooks),
-	)
-
-	ctx := context.Background()
-	if err := app.Start(ctx); err != nil {
-		log.Fatal(err)
-	}
-	defer app.Shutdown(ctx)
-
-	// HTTP handler with OpenTelemetry middleware
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		instanceID, err := romancy.StartWorkflow(r.Context(), app, orderWorkflow, OrderInput{OrderID: "ORD-123", Amount: 99.99})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "Workflow started: %s\n", instanceID)
-	})
-
-	// Wrap with OpenTelemetry HTTP middleware
-	wrappedHandler := otelhttp.NewHandler(handler, "order-endpoint")
-
-	fmt.Println("Server running on http://localhost:8001")
-	fmt.Println("Traces exported to http://localhost:4317")
-	log.Fatal(http.ListenAndServe(":8001", wrappedHandler))
+func (h TracingAndLogging) OnWorkflowFailed(ctx context.Context, info hooks.WorkflowFailedInfo) {
+	h.OTelHooks.OnWorkflowFailed(ctx, info)
+	log.Printf("workflow %s (%s) failed: %v", info.WorkflowName, info.InstanceID, info.Error)
 }
 ```
 
-## Configuration Options
-
-```go
-hooks := otelromancy.NewHooks(
-	// Service name (required)
-	otelromancy.WithServiceName("my-service"),
-
-	// OTLP endpoint (production)
-	otelromancy.WithOTLPEndpoint("http://localhost:4317"),
-
-	// Console exporter (development)
-	otelromancy.WithConsoleExporter(),
-
-	// Enable/disable metrics
-	otelromancy.WithMetrics(true),
-
-	// Custom resource attributes
-	otelromancy.WithResourceAttributes(map[string]string{
-		"environment": "production",
-		"version":     "1.0.0",
-	}),
-)
-```
+Pass `TracingAndLogging{otelromancy.NewOTelHooks(provider)}` to `romancy.WithHooks`.
 
 ## Related Documentation
 

@@ -41,7 +41,7 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"regexp"
+	"time"
 
 	"github.com/i2y/romancy"
 )
@@ -83,20 +83,22 @@ type OrderResult struct {
 Add the three main activities with compensation:
 
 ```go
-// Compensation functions
-var cancelInventoryReservation = romancy.DefineCompensation("cancel_inventory_reservation",
-	func(ctx context.Context, orderID string) error {
-		fmt.Printf("❌ Cancelling inventory reservation for %s\n", orderID)
-		return nil
-	},
-)
+// Activity input types
+type ReserveInventoryInput struct {
+	OrderID string      `json:"order_id"`
+	Items   []OrderItem `json:"items"`
+}
 
-var refundPayment = romancy.DefineCompensation("refund_payment",
-	func(ctx context.Context, orderID string, amount float64) error {
-		fmt.Printf("❌ Refunding payment for %s: $%.2f\n", orderID, amount)
-		return nil
-	},
-)
+type ProcessPaymentInput struct {
+	OrderID       string  `json:"order_id"`
+	Amount        float64 `json:"amount"`
+	CustomerEmail string  `json:"customer_email"`
+}
+
+type ShipOrderInput struct {
+	OrderID string          `json:"order_id"`
+	Address ShippingAddress `json:"address"`
+}
 
 // Activity result types
 type ReservationResult struct {
@@ -117,42 +119,48 @@ type ShipmentResult struct {
 
 // Activities with compensation links
 var reserveInventory = romancy.DefineActivity("reserve_inventory",
-	func(ctx context.Context, orderID string, items []OrderItem) (ReservationResult, error) {
+	func(ctx context.Context, input ReserveInventoryInput) (ReservationResult, error) {
 		var total float64
-		for _, item := range items {
+		for _, item := range input.Items {
 			total += float64(item.Quantity) * item.UnitPrice
 		}
 
-		fmt.Printf("📦 Reserving inventory for %s: $%.2f\n", orderID, total)
+		fmt.Printf("📦 Reserving inventory for %s: $%.2f\n", input.OrderID, total)
 
 		return ReservationResult{
-			ReservationID: fmt.Sprintf("RES-%s", orderID),
+			ReservationID: fmt.Sprintf("RES-%s", input.OrderID),
 			TotalAmount:   total,
 		}, nil
 	},
-	romancy.WithCompensation(cancelInventoryReservation),
+	romancy.WithCompensation[ReserveInventoryInput, ReservationResult](func(ctx context.Context, input ReserveInventoryInput) error {
+		fmt.Printf("❌ Cancelling inventory reservation for %s\n", input.OrderID)
+		return nil
+	}),
 )
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64, customerEmail string) (PaymentResult, error) {
-		fmt.Printf("💳 Processing payment for %s: $%.2f\n", orderID, amount)
+	func(ctx context.Context, input ProcessPaymentInput) (PaymentResult, error) {
+		fmt.Printf("💳 Processing payment for %s: $%.2f\n", input.OrderID, input.Amount)
 
 		return PaymentResult{
-			TransactionID: fmt.Sprintf("TXN-%s", orderID),
-			Amount:        amount,
+			TransactionID: fmt.Sprintf("TXN-%s", input.OrderID),
+			Amount:        input.Amount,
 			Status:        "completed",
 		}, nil
 	},
-	romancy.WithCompensation(refundPayment),
+	romancy.WithCompensation[ProcessPaymentInput, PaymentResult](func(ctx context.Context, input ProcessPaymentInput) error {
+		fmt.Printf("❌ Refunding payment for %s: $%.2f\n", input.OrderID, input.Amount)
+		return nil
+	}),
 )
 
 // Activity 3: Ship Order (no compensation - final step)
 var shipOrder = romancy.DefineActivity("ship_order",
-	func(ctx context.Context, orderID string, address ShippingAddress) (ShipmentResult, error) {
-		fmt.Printf("🚚 Shipping %s to %s, %s\n", orderID, address.City, address.Country)
+	func(ctx context.Context, input ShipOrderInput) (ShipmentResult, error) {
+		fmt.Printf("🚚 Shipping %s to %s, %s\n", input.OrderID, input.Address.City, input.Address.Country)
 
 		return ShipmentResult{
-			TrackingNumber: fmt.Sprintf("TRACK-%s", orderID),
+			TrackingNumber: fmt.Sprintf("TRACK-%s", input.OrderID),
 			Status:         "shipped",
 		}, nil
 	},
@@ -167,19 +175,19 @@ Now orchestrate the activities:
 var orderProcessingWorkflow = romancy.DefineWorkflow("order_processing",
 	func(ctx *romancy.WorkflowContext, input OrderInput) (OrderResult, error) {
 		// Step 1: Reserve inventory
-		reservation, err := reserveInventory.Execute(ctx, input.OrderID, input.Items)
+		reservation, err := reserveInventory.Execute(ctx, ReserveInventoryInput{OrderID: input.OrderID, Items: input.Items})
 		if err != nil {
 			return OrderResult{}, err
 		}
 
 		// Step 2: Process payment
-		payment, err := processPayment.Execute(ctx, input.OrderID, reservation.TotalAmount, input.CustomerEmail)
+		payment, err := processPayment.Execute(ctx, ProcessPaymentInput{OrderID: input.OrderID, Amount: reservation.TotalAmount, CustomerEmail: input.CustomerEmail})
 		if err != nil {
 			return OrderResult{}, err
 		}
 
 		// Step 3: Ship order
-		shipment, err := shipOrder.Execute(ctx, input.OrderID, input.ShippingAddress)
+		shipment, err := shipOrder.Execute(ctx, ShipOrderInput{OrderID: input.OrderID, Address: input.ShippingAddress})
 		if err != nil {
 			return OrderResult{}, err
 		}
@@ -208,6 +216,8 @@ func main() {
 	)
 
 	ctx := context.Background()
+
+	romancy.RegisterWorkflow(app, orderProcessingWorkflow)
 
 	// Start the app (required before starting workflows)
 	if err := app.Start(ctx); err != nil {
@@ -238,21 +248,29 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("\n✅ Workflow started: %s\n", instanceID)
+	fmt.Printf("✅ Workflow started: %s\n\n", instanceID)
 
-	// Get result
-	instance, err := app.Storage().GetInstance(ctx, instanceID)
-	if err != nil {
-		log.Fatal(err)
+	// The workflow runs in the background: wait until it finishes
+	var result *romancy.WorkflowResult[OrderResult]
+	for {
+		result, err = romancy.GetWorkflowResult[OrderResult](ctx, app, instanceID)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if result.Status == "completed" || result.Status == "failed" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	if instance.Status == "completed" {
-		result := instance.OutputData
-		fmt.Println("📊 Order completed:")
-		fmt.Printf("   - Order ID: %s\n", result["order_id"])
-		fmt.Printf("   - Total: $%.2f\n", result["total_amount"])
-		fmt.Printf("   - Tracking: %s\n", result["confirmation_number"])
+	if result.Status == "failed" {
+		fmt.Printf("\nError: %v\n", result.Error)
+		return
 	}
+	fmt.Println("\n📊 Order completed:")
+	fmt.Printf("   - Order ID: %s\n", result.Output.OrderID)
+	fmt.Printf("   - Total: $%.2f\n", result.Output.TotalAmount)
+	fmt.Printf("   - Tracking: %s\n", result.Output.ConfirmationNumber)
 }
 ```
 
@@ -264,21 +282,23 @@ Run the workflow:
 go run main.go
 ```
 
-**Expected output:**
+**Expected output** (Romancy's own log lines, such as the migrations it applies, are left out):
 
 ```
 Starting order processing workflow...
+✅ Workflow started: <instance_id>
 
 📦 Reserving inventory for ORD-12345: $109.97
 💳 Processing payment for ORD-12345: $109.97
 🚚 Shipping ORD-12345 to Shibuya, Japan
 
-✅ Workflow started: <instance_id>
 📊 Order completed:
    - Order ID: ORD-12345
    - Total: $109.97
    - Tracking: TRACK-ORD-12345
 ```
+
+`StartWorkflow` returns as soon as the instance is stored; the workflow runs in the background, and `main` waits for its result.
 
 ## Step 6: Test Failure & Compensation
 
@@ -288,8 +308,8 @@ Modify `shipOrder` to fail:
 
 ```go
 var shipOrder = romancy.DefineActivity("ship_order",
-	func(ctx context.Context, orderID string, address ShippingAddress) (ShipmentResult, error) {
-		fmt.Printf("🚚 Shipping %s to %s, %s\n", orderID, address.City, address.Country)
+	func(ctx context.Context, input ShipOrderInput) (ShipmentResult, error) {
+		fmt.Printf("🚚 Shipping %s to %s, %s\n", input.OrderID, input.Address.City, input.Address.Country)
 
 		// Simulate shipping failure
 		return ShipmentResult{}, fmt.Errorf("shipping service unavailable")
@@ -306,22 +326,27 @@ go run main.go
 **Expected output:**
 
 ```
+Starting order processing workflow...
+✅ Workflow started: <instance_id>
+
 📦 Reserving inventory for ORD-12345: $109.97
 💳 Processing payment for ORD-12345: $109.97
 🚚 Shipping ORD-12345 to Shibuya, Japan
-💥 Error: shipping service unavailable
-
+🚚 Shipping ORD-12345 to Shibuya, Japan
+🚚 Shipping ORD-12345 to Shibuya, Japan
 ❌ Refunding payment for ORD-12345: $109.97
 ❌ Cancelling inventory reservation for ORD-12345
 
-Error: shipping service unavailable
+Error: retry exhausted for activity "ship_order" after 3 attempts: shipping service unavailable
 ```
+
+Romancy also logs the failure (`ERROR workflow failed ...`).
 
 **What happened:**
 
 1. Inventory reserved ✅
 2. Payment processed ✅
-3. Shipping failed ❌
+3. Shipping failed ❌, three times: the default retry policy makes 3 attempts before the activity gives up (see [Automatic Retry](/docs/core-features/retry))
 4. **Automatic compensation in reverse order:**
    - Refund payment ✅
    - Cancel inventory reservation ✅
@@ -366,10 +391,12 @@ app := romancy.NewApp(
 	romancy.WithDatabase("postgres://user:password@localhost/orders"),
 	romancy.WithWorkerID("worker-1"),
 )
+romancy.RegisterWorkflow(app, orderProcessingWorkflow)
 app.Start(ctx)
 
 // Workflow starts executing
 instanceID, _ := romancy.StartWorkflow(ctx, app, orderProcessingWorkflow, order)
+fmt.Printf("workflow started: %s\n", instanceID)
 
 // Server crashes after payment step
 // → inventory reservation: ✅ saved
@@ -403,23 +430,26 @@ type PaymentResult struct {
 }
 
 var processPayment = romancy.DefineActivity("process_payment",
-	func(ctx context.Context, orderID string, amount float64) (PaymentResult, error) {
+	func(ctx context.Context, input ProcessPaymentInput) (PaymentResult, error) {
 		// This code executes ONCE per workflow instance
 		// On crash recovery, cached result is returned
-		fmt.Printf("💳 Processing payment for %s: $%.2f\n", orderID, amount)
+		fmt.Printf("💳 Processing payment for %s: $%.2f\n", input.OrderID, input.Amount)
 
-		paymentResult, err := externalPaymentAPI.Charge(amount)
+		paymentResult, err := externalPaymentAPI.Charge(input.Amount)
 		if err != nil {
 			return PaymentResult{}, err
 		}
 
 		return PaymentResult{
 			TransactionID: paymentResult.ID,
-			Amount:        amount,
+			Amount:        input.Amount,
 			Status:        "completed",
 		}, nil
 	},
-	romancy.WithCompensation(refundPayment),
+	romancy.WithCompensation[ProcessPaymentInput, PaymentResult](func(ctx context.Context, input ProcessPaymentInput) error {
+		fmt.Printf("❌ Refunding payment for %s: $%.2f\n", input.OrderID, input.Amount)
+		return nil
+	}),
 )
 ```
 

@@ -9,9 +9,9 @@ This page provides a comprehensive reference for all configuration options avail
 
 ```go
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:password@localhost/workflows"),
-    romancy.WithWorkerID("worker-1"),
-    romancy.WithServiceName("my-service"),
+	romancy.WithDatabase("postgres://user:password@localhost/workflows"),
+	romancy.WithWorkerID("worker-1"),
+	romancy.WithServiceName("my-service"),
 )
 ```
 
@@ -50,13 +50,15 @@ Enables or disables automatic database migration on startup.
 ```go
 // Default: auto-migration enabled
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:password@localhost/db"),
+	romancy.WithDatabase("postgres://user:password@localhost/db"),
 )
+```
 
+```go
 // Disable auto-migration
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:password@localhost/db"),
-    romancy.WithAutoMigrate(false),
+	romancy.WithDatabase("postgres://user:password@localhost/db"),
+	romancy.WithAutoMigrate(false),
 )
 ```
 
@@ -71,12 +73,14 @@ See [Database Migrations](#database-migrations) section below for details.
 Sets a custom filesystem for database migrations.
 
 ```go
+import "embed"
+
 //go:embed custom_migrations
 var customMigrations embed.FS
 
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://..."),
-    romancy.WithMigrationsFS(customMigrations),
+	romancy.WithDatabase("postgres://..."),
+	romancy.WithMigrationsFS(customMigrations),
 )
 ```
 
@@ -222,9 +226,9 @@ Control how frequently background tasks run.
 
 ```go
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://..."),
-    romancy.WithStaleLockInterval(30 * time.Second),
-    romancy.WithTimerCheckInterval(5 * time.Second),
+	romancy.WithDatabase("postgres://..."),
+	romancy.WithStaleLockInterval(30*time.Second),
+	romancy.WithTimerCheckInterval(5*time.Second),
 )
 ```
 
@@ -244,15 +248,15 @@ app := romancy.NewApp(
 
 Control which background tasks run as singletons (only one worker executes at a time).
 
-```go
-romancy.WithSingletonStaleLockCleanup(true)   // Only one worker cleans locks
-romancy.WithSingletonChannelCleanup(true)     // Only one worker cleans channels
-```
+Singleton execution is automatic: workers elect a leader with the database, and only the leader runs these background tasks. There are no per-task singleton options in the current API; tune the election with the leader options below.
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `WithSingletonStaleLockCleanup(enabled)` | Stale lock cleanup as singleton | `true` |
-| `WithSingletonChannelCleanup(enabled)` | Channel cleanup as singleton | `true` |
+```go
+app := romancy.NewApp(
+	romancy.WithDatabase("postgres://..."),
+	romancy.WithLeaderHeartbeatInterval(10*time.Second),
+	romancy.WithLeaderLeaseDuration(30*time.Second),
+)
+```
 
 ## Leader Election
 
@@ -314,8 +318,9 @@ Sets workflow lifecycle hooks for observability. See [Lifecycle Hooks](/docs/cor
 import "github.com/i2y/romancy/hooks/otel"
 
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://..."),
-    romancy.WithHooks(otel.NewOTelHooks(tracerProvider)),
+	romancy.WithDatabase("postgres://..."),
+	// Pass your tracer provider, or nil to use the global provider.
+	romancy.WithHooks(otel.NewOTelHooks(nil)),
 )
 ```
 
@@ -339,6 +344,8 @@ romancy.WithShutdownTimeout(60 * time.Second)
 package main
 
 import (
+    "context"
+    "log"
     "time"
 
     "github.com/i2y/romancy"
@@ -370,13 +377,17 @@ func main() {
         romancy.WithBrokerURL("http://broker/events"),
 
         // Observability
-        romancy.WithHooks(otel.NewOTelHooks(tracerProvider)),
+        romancy.WithHooks(otel.NewOTelHooks(nil)), // or pass your tracer provider
 
         // Lifecycle
         romancy.WithShutdownTimeout(60 * time.Second),
     )
 
-    // ...
+    ctx := context.Background()
+    if err := app.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+    defer app.Shutdown(ctx)
 }
 ```
 
@@ -396,13 +407,15 @@ Romancy **automatically applies database migrations** on startup. Migration file
 ```go
 // Default: auto-migration enabled
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:password@localhost/db"),
+	romancy.WithDatabase("postgres://user:password@localhost/db"),
 )
+```
 
+```go
 // Disable auto-migration (manage manually with dbmate CLI)
 app := romancy.NewApp(
-    romancy.WithDatabase("postgres://user:password@localhost/db"),
-    romancy.WithAutoMigrate(false),
+	romancy.WithDatabase("postgres://user:password@localhost/db"),
+	romancy.WithAutoMigrate(false),
 )
 ```
 

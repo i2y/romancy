@@ -73,18 +73,15 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 		// Step 2: Wait for payment completion event
 		// Workflow pauses here, worker process is released
 		fmt.Println("⏸️  Waiting for payment.completed event...")
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute), // 5-minute timeout
+		event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute), // 5-minute timeout
 		)
 		if err != nil {
 			return PaymentWorkflowResult{}, err
 		}
 
-		// Step 3: Parse and process payment result
-		var paymentResult PaymentCompleted
-		if err := romancy.DecodeEventData(event.Data, &paymentResult); err != nil {
-			return PaymentWorkflowResult{}, fmt.Errorf("invalid payment event: %w", err)
-		}
+		// Step 3: Process the typed payment result
+		paymentResult := event.Data
 
 		fmt.Printf("✅ Payment completed: %v\n", event.Data)
 		return PaymentWorkflowResult{
@@ -197,7 +194,7 @@ var orderWithTimeout = romancy.DefineWorkflow("order_with_timeout",
 ```
 1. Workflow executes: startPaymentProcessing.Execute()
 2. Workflow hits: WaitEvent()
-3. Workflow pauses (status="waiting_for_event")
+3. Workflow pauses (status="waiting_for_message")
 4. Worker process is RELEASED (can handle other workflows)
 5. External event arrives (e.g., CloudEvent)
 6. Workflow RESUMES from WaitEvent()
@@ -207,7 +204,7 @@ var orderWithTimeout = romancy.DefineWorkflow("order_with_timeout",
 ### ReceivedEvent Structure
 
 ```go
-event, err := romancy.WaitEvent(ctx, "payment.completed")
+event, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed")
 if err != nil {
 	return nil, err
 }
@@ -248,18 +245,15 @@ type PaymentTypedResult struct {
 var paymentWorkflowTyped = romancy.DefineWorkflow("payment_workflow_typed",
 	func(ctx *romancy.WorkflowContext, orderID string) (PaymentTypedResult, error) {
 		// Wait for event
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return PaymentTypedResult{}, err
 		}
 
-		// Parse event data into struct
-		var payment PaymentCompleted
-		if err := romancy.DecodeEventData(event.Data, &payment); err != nil {
-			return PaymentTypedResult{}, fmt.Errorf("invalid payment event: %w", err)
-		}
+		// Event data is already decoded into the struct
+		payment := event.Data
 
 		// Type-safe access
 		amount := payment.Amount              // float64
@@ -286,15 +280,16 @@ var paymentWorkflowTyped = romancy.DefineWorkflow("payment_workflow_typed",
 
 **Without struct (map access):**
 ```go
-event, _ := romancy.WaitEvent(ctx, "payment.completed")
+event, _ := romancy.WaitEvent[map[string]any](ctx, "payment.completed")
 amount := event.Data["amount"]  // interface{}, needs type assertion
+fmt.Println(amount)
 ```
 
 **With struct:**
 ```go
-var payment PaymentCompleted
-romancy.DecodeEventData(event.Data, &payment)
-amount := payment.Amount  // float64, type-safe
+event, _ := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed")
+amount := event.Data.Amount  // float64, type-safe
+fmt.Println(amount)
 ```
 
 ## Benefits
@@ -344,8 +339,8 @@ var loanApprovalWorkflow = romancy.DefineWorkflow("loan_approval_workflow",
 		}
 
 		// Wait up to 48 hours for approval
-		event, err := romancy.WaitEvent(ctx, "loan.approved",
-			romancy.WithTimeout(48*time.Hour),
+		event, err := romancy.WaitEvent[map[string]any](ctx, "loan.approved",
+			romancy.WithEventTimeout(48*time.Hour),
 		)
 		if err != nil {
 			return LoanApprovalResult{}, err
@@ -374,19 +369,19 @@ type FulfillmentResult struct {
 var orderFulfillment = romancy.DefineWorkflow("order_fulfillment",
 	func(ctx *romancy.WorkflowContext, orderID string) (FulfillmentResult, error) {
 		// Wait for warehouse to pack the order
-		_, err := romancy.WaitEvent(ctx, "order.packed")
+		_, err := romancy.WaitEvent[map[string]any](ctx, "order.packed")
 		if err != nil {
 			return FulfillmentResult{}, err
 		}
 
 		// Wait for carrier to pick up
-		_, err = romancy.WaitEvent(ctx, "order.picked_up")
+		_, err = romancy.WaitEvent[map[string]any](ctx, "order.picked_up")
 		if err != nil {
 			return FulfillmentResult{}, err
 		}
 
 		// Wait for delivery confirmation
-		_, err = romancy.WaitEvent(ctx, "order.delivered")
+		_, err = romancy.WaitEvent[map[string]any](ctx, "order.delivered")
 		if err != nil {
 			return FulfillmentResult{}, err
 		}
@@ -554,18 +549,15 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 
 		// Step 2: Wait for payment completion event
 		fmt.Println("⏸️  Waiting for payment.completed event...")
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return PaymentWorkflowResult{}, err
 		}
 
-		// Step 3: Parse and process payment result
-		var paymentResult PaymentCompleted
-		if err := romancy.DecodeEventData(event.Data, &paymentResult); err != nil {
-			return PaymentWorkflowResult{}, fmt.Errorf("invalid payment event: %w", err)
-		}
+		// Step 3: Process the typed payment result
+		paymentResult := event.Data
 
 		fmt.Printf("✅ Payment completed: $%.2f for order %s\n",
 			paymentResult.Amount, paymentResult.OrderID)
@@ -592,8 +584,10 @@ func main() {
 
 	ctx := context.Background()
 
-	// Initialize the app
-	if err := app.Initialize(ctx); err != nil {
+	romancy.RegisterWorkflow(app, paymentWorkflow)
+
+	// Start the app
+	if err := app.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer app.Shutdown(ctx)
@@ -602,7 +596,7 @@ func main() {
 	fmt.Println()
 
 	// Start the workflow
-	instanceID, err := paymentWorkflow.Start(ctx, app, "ORD-123")
+	instanceID, err := romancy.StartWorkflow(ctx, app, paymentWorkflow, "ORD-123")
 	if err != nil {
 		log.Fatal(err)
 	}

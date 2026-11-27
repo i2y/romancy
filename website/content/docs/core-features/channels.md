@@ -43,7 +43,7 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
             return MyResult{}, err
         }
 
-        // ... rest of workflow
+        return MyResult{Status: "subscribed"}, nil
     },
 )
 ```
@@ -93,6 +93,8 @@ if err != nil {
     }
     return ChatResult{}, err
 }
+
+fmt.Println("received:", msg.Data)
 ```
 
 ### Publish Messages
@@ -120,12 +122,14 @@ var publisherWorkflow = romancy.DefineWorkflow("publisher",
 
 ```go
 // Attach metadata to messages
-err := romancy.Publish(ctx, "events", eventData,
+if err := romancy.Publish(ctx, "events", eventData,
     romancy.WithMetadata(map[string]any{
         "priority": "high",
         "source":   "order-service",
     }),
-)
+); err != nil {
+    return MyResult{}, err
+}
 ```
 
 ### Send to Specific Instance (SendTo)
@@ -142,11 +146,17 @@ if err := romancy.Subscribe(ctx, "notifications", romancy.ModeDirect); err != ni
 
 // Receive works normally - ModeDirect handles the channel name internally
 msg, err := romancy.Receive[MyMessage](ctx, "notifications")
+if err != nil {
+    return MyResult{}, err
+}
+fmt.Println("received:", msg.Data)
 
 // === Sender Workflow ===
 // Send directly to a specific workflow instance
 targetInstanceID := "wf-12345"
-err := romancy.SendTo(ctx, targetInstanceID, "notifications", message)
+if err := romancy.SendTo(ctx, targetInstanceID, "notifications", message); err != nil {
+    return MyResult{}, err
+}
 ```
 
 This design matches Erlang/Elixir's mailbox semantics where each process has its own mailbox identified by its PID.
@@ -227,13 +237,22 @@ Inside an activity, `Publish` and `SendTo` run directly, in the activity's trans
 A channel is open until a capability grant exists for it. Once `IssueCapability` has issued a `channel_pub` grant for a channel, publishing to it requires a token. The same applies to `channel_sub` and receiving:
 
 ```go
-token, capID, err := romancy.IssueCapability(ctx, "channel_pub", "orders")
+token, _, err := romancy.IssueCapability(ctx, "channel_pub", "orders")
+if err != nil {
+    return MyResult{}, err
+}
 
 // Without the token, Publish and SendTo on "orders" fail with ErrChannelForbidden
-err = romancy.Publish(ctx, "orders", order, romancy.WithPublishCapability(token))
+if err := romancy.Publish(ctx, "orders", order, romancy.WithPublishCapability(token)); err != nil {
+    return MyResult{}, err
+}
 
 // A channel sealed for channel_sub requires the token on Receive (and ReadChannelSince)
 msg, err := romancy.Receive[Order](ctx, "orders", romancy.WithReceiveCapability(subToken))
+if err != nil {
+    return MyResult{}, err
+}
+fmt.Println("received order:", msg.Data)
 ```
 
 The seal also covers the direct channels derived from the name: `SendTo(ctx, target, "orders", ...)` and a `Publish` to the physical name `"orders:<instanceID>"` need the same token.
@@ -356,6 +375,9 @@ func main() {
         romancy.WithWorkerID("worker-1"),
     )
 
+    romancy.RegisterWorkflow(app, taskConsumer)
+    romancy.RegisterWorkflow(app, taskProducer)
+
     ctx := context.Background()
     if err := app.Start(ctx); err != nil {
         log.Fatal(err)
@@ -389,7 +411,9 @@ Send notifications to all interested workflows:
 ```go
 // All subscribers receive the notification
 romancy.Subscribe(ctx, "system-alerts", romancy.ModeBroadcast)
-romancy.Publish(ctx, "system-alerts", AlertMessage{...})
+if err := romancy.Publish(ctx, "system-alerts", AlertMessage{Text: "deploy finished"}); err != nil {
+    return MyResult{}, err
+}
 ```
 
 ### Work Queue (Competing)
@@ -400,6 +424,7 @@ Distribute work across multiple workers:
 // Only one subscriber receives each task
 romancy.Subscribe(ctx, "work-queue", romancy.ModeCompeting)
 msg, _ := romancy.Receive[WorkItem](ctx, "work-queue")
+fmt.Println("received task:", msg.Data)
 ```
 
 ### Direct Messaging (SendTo)

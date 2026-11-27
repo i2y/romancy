@@ -25,7 +25,6 @@ Wait for an external event with optional timeout:
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -40,8 +39,8 @@ type PaymentResult struct {
 var myWorkflow = romancy.DefineWorkflow("my_workflow",
 	func(ctx *romancy.WorkflowContext, input string) (PaymentResult, error) {
 		// Wait for an event (with 5-minute timeout)
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		event, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return PaymentResult{}, err
@@ -67,7 +66,6 @@ Sleep for a specific duration:
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -96,11 +94,11 @@ var myWorkflow = romancy.DefineWorkflow("my_workflow",
 ### WaitEvent()
 
 ```go
-func WaitEvent(
-	ctx *WorkflowContext,
+func WaitEvent[T any](
+	ctx *romancy.WorkflowContext,
 	eventType string,
-	opts ...WaitEventOption,
-) (*ReceivedEvent, error)
+	opts ...romancy.WaitEventOption,
+) (*romancy.ReceivedEvent[T], error)
 ```
 
 #### Parameters
@@ -111,32 +109,35 @@ func WaitEvent(
 
 #### Options
 
-- `WithTimeout(d time.Duration)`: Set timeout duration
-- `WithEventID(id string)`: Set custom event wait ID (auto-generated if not provided)
+- `WithEventTimeout(d time.Duration)`: Set timeout duration
 
 #### Returns
 
 `*ReceivedEvent` containing:
 
-- `Data`: Event data (`map[string]any`)
+- `Data`: Event data deserialized into the type parameter `T`
 - `Type`: CloudEvents type
 - `Source`: Event source
-- `Subject`: Optional event subject
 - `Time`: Event timestamp
 - `ID`: Event ID
 
 #### Error Handling
 
 ```go
-event, err := romancy.WaitEvent(ctx, "payment.completed",
-	romancy.WithTimeout(5*time.Minute),
-)
-if err != nil {
-	if errors.Is(err, romancy.ErrTimeout) {
-		// Handle timeout
-		return nil, fmt.Errorf("payment timed out")
+func waitForPaymentCompletion(ctx *romancy.WorkflowContext) error {
+	event, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed",
+		romancy.WithEventTimeout(5*time.Minute),
+	)
+	if err != nil {
+		var timeoutErr *romancy.ChannelMessageTimeoutError
+		if errors.As(err, &timeoutErr) {
+			// Handle timeout
+			return fmt.Errorf("payment timed out")
+		}
+		return err
 	}
-	return nil, err
+	log.Printf("payment received: %v", event.Data)
+	return nil
 }
 ```
 
@@ -146,8 +147,7 @@ if err != nil {
 package main
 
 import (
-	"context"
-	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -168,20 +168,15 @@ type PaymentWorkflowResult struct {
 
 var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 	func(ctx *romancy.WorkflowContext, orderID string) (PaymentWorkflowResult, error) {
-		// Wait for event
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		// Wait for event and decode its data as PaymentCompleted
+		event, err := romancy.WaitEvent[PaymentCompleted](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return PaymentWorkflowResult{}, err
 		}
 
-		// Parse event data into struct
-		var payment PaymentCompleted
-		if err := parseEventData(event.Data, &payment); err != nil {
-			return PaymentWorkflowResult{}, err
-		}
-
+		payment := event.Data
 		if payment.Status == "success" {
 			return PaymentWorkflowResult{
 				OrderID:   orderID,
@@ -192,24 +187,15 @@ var paymentWorkflow = romancy.DefineWorkflow("payment_workflow",
 		return PaymentWorkflowResult{}, fmt.Errorf("payment failed: %s", payment.Status)
 	},
 )
-
-// parseEventData converts map to struct
-func parseEventData(data map[string]any, target any) error {
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(bytes, target)
-}
 ```
 
 ### Sleep()
 
 ```go
 func Sleep(
-	ctx *WorkflowContext,
+	ctx *romancy.WorkflowContext,
 	duration time.Duration,
-	opts ...SleepOption,
+	opts ...romancy.SleepOption,
 ) error
 ```
 
@@ -229,7 +215,6 @@ func Sleep(
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -266,9 +251,7 @@ var scheduledTask = romancy.DefineWorkflow("scheduled_task",
 package main
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -292,11 +275,12 @@ var paymentWithTimeout = romancy.DefineWorkflow("payment_with_timeout",
 		paymentID := paymentResult.PaymentID
 
 		// Wait for payment completion (5-minute timeout)
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		event, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
-			if errors.Is(err, romancy.ErrTimeout) {
+			var timeoutErr *romancy.ChannelMessageTimeoutError
+			if errors.As(err, &timeoutErr) {
 				// Timeout occurred - cancel payment and order
 				if _, err := cancelPayment.Execute(ctx, paymentID); err != nil {
 					return PaymentTimeoutResult{}, err
@@ -332,12 +316,16 @@ var paymentWithTimeout = romancy.DefineWorkflow("payment_with_timeout",
 package main
 
 import (
-	"context"
 	"errors"
 	"time"
 
 	"github.com/i2y/romancy"
 )
+
+type ApprovalRequest struct {
+	RequestID string `json:"request_id"`
+	Role      string `json:"role"`
+}
 
 type ApprovalResult struct {
 	Approved  bool   `json:"approved"`
@@ -348,24 +336,25 @@ type ApprovalResult struct {
 var approvalWorkflow = romancy.DefineWorkflow("approval_workflow",
 	func(ctx *romancy.WorkflowContext, requestID string) (ApprovalResult, error) {
 		// Send approval request to manager
-		if _, err := sendApprovalRequest.Execute(ctx, requestID, "manager"); err != nil {
+		if _, err := sendApprovalRequest.Execute(ctx, ApprovalRequest{RequestID: requestID, Role: "manager"}); err != nil {
 			return ApprovalResult{}, err
 		}
 
 		// Wait for manager approval (24 hours)
-		event, err := romancy.WaitEvent(ctx, "approval.decision",
-			romancy.WithTimeout(24*time.Hour),
+		event, err := romancy.WaitEvent[map[string]any](ctx, "approval.decision",
+			romancy.WithEventTimeout(24*time.Hour),
 		)
 		if err != nil {
-			if errors.Is(err, romancy.ErrTimeout) {
+			var timeoutErr *romancy.ChannelMessageTimeoutError
+			if errors.As(err, &timeoutErr) {
 				// Escalate to director
-				if _, err := sendApprovalRequest.Execute(ctx, requestID, "director"); err != nil {
+				if _, err := sendApprovalRequest.Execute(ctx, ApprovalRequest{RequestID: requestID, Role: "director"}); err != nil {
 					return ApprovalResult{}, err
 				}
 
 				// Wait for director approval (24 hours)
-				event, err = romancy.WaitEvent(ctx, "approval.decision",
-					romancy.WithTimeout(24*time.Hour),
+				event, err = romancy.WaitEvent[map[string]any](ctx, "approval.decision",
+					romancy.WithEventTimeout(24*time.Hour),
 				)
 				if err != nil {
 					return ApprovalResult{}, err
@@ -394,7 +383,6 @@ var approvalWorkflow = romancy.DefineWorkflow("approval_workflow",
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -461,7 +449,6 @@ type BatchInput struct {
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -494,8 +481,8 @@ var multiServiceOrchestration = romancy.DefineWorkflow("multi_service_orchestrat
 		var result OrchestrationResult
 
 		// Wait for Service A
-		eventA, err := romancy.WaitEvent(ctx, "service.a.completed",
-			romancy.WithTimeout(10*time.Minute),
+		eventA, err := romancy.WaitEvent[map[string]any](ctx, "service.a.completed",
+			romancy.WithEventTimeout(10*time.Minute),
 		)
 		if err != nil {
 			return OrchestrationResult{}, err
@@ -506,8 +493,8 @@ var multiServiceOrchestration = romancy.DefineWorkflow("multi_service_orchestrat
 		}
 
 		// Wait for Service B
-		eventB, err := romancy.WaitEvent(ctx, "service.b.completed",
-			romancy.WithTimeout(10*time.Minute),
+		eventB, err := romancy.WaitEvent[map[string]any](ctx, "service.b.completed",
+			romancy.WithEventTimeout(10*time.Minute),
 		)
 		if err != nil {
 			return OrchestrationResult{}, err
@@ -518,8 +505,8 @@ var multiServiceOrchestration = romancy.DefineWorkflow("multi_service_orchestrat
 		}
 
 		// Wait for Service C
-		eventC, err := romancy.WaitEvent(ctx, "service.c.completed",
-			romancy.WithTimeout(10*time.Minute),
+		eventC, err := romancy.WaitEvent[map[string]any](ctx, "service.c.completed",
+			romancy.WithEventTimeout(10*time.Minute),
 		)
 		if err != nil {
 			return OrchestrationResult{}, err
@@ -661,28 +648,33 @@ Prevent workflows from waiting indefinitely:
 
 ```go
 // Good: Has timeout
-event, err := romancy.WaitEvent(ctx, "payment.completed",
-	romancy.WithTimeout(5*time.Minute),
+eventWithTimeout, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed",
+	romancy.WithEventTimeout(5*time.Minute),
 )
 
 // Bad: No timeout (could wait forever)
-event, err := romancy.WaitEvent(ctx, "payment.completed")
+eventWithoutTimeout, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed")
 ```
 
 ### 2. Handle Timeout Gracefully
 
 ```go
-event, err := romancy.WaitEvent(ctx, "approval.decision",
-	romancy.WithTimeout(1*time.Hour),
-)
-if err != nil {
-	if errors.Is(err, romancy.ErrTimeout) {
-		// Handle timeout scenario
-		return handleTimeoutScenario(ctx)
+func waitForApproval(ctx *romancy.WorkflowContext) error {
+	event, err := romancy.WaitEvent[map[string]any](ctx, "approval.decision",
+		romancy.WithEventTimeout(1*time.Hour),
+	)
+	if err != nil {
+		var timeoutErr *romancy.ChannelMessageTimeoutError
+		if errors.As(err, &timeoutErr) {
+			// Handle timeout scenario
+			return handleTimeoutScenario(ctx)
+		}
+		return err
 	}
-	return nil, err
+	// Process approval
+	log.Printf("approval decision: %v", event.Data)
+	return nil
 }
-// Process approval
 ```
 
 ### 3. Use Unique Event Types
@@ -691,16 +683,16 @@ Avoid event type collisions:
 
 ```go
 // Good: Specific event types
-event, _ := romancy.WaitEvent(ctx, "order.payment.completed",
-	romancy.WithTimeout(5*time.Minute),
+orderEvent, _ := romancy.WaitEvent[map[string]any](ctx, "order.payment.completed",
+	romancy.WithEventTimeout(5*time.Minute),
 )
-event, _ := romancy.WaitEvent(ctx, "subscription.payment.completed",
-	romancy.WithTimeout(5*time.Minute),
+subscriptionEvent, _ := romancy.WaitEvent[map[string]any](ctx, "subscription.payment.completed",
+	romancy.WithEventTimeout(5*time.Minute),
 )
 
 // Bad: Generic event type
-event, _ := romancy.WaitEvent(ctx, "completed",
-	romancy.WithTimeout(5*time.Minute),
+genericEvent, _ := romancy.WaitEvent[map[string]any](ctx, "completed",
+	romancy.WithEventTimeout(5*time.Minute),
 ) // Too generic
 ```
 
@@ -722,9 +714,9 @@ var orderWorkflow = romancy.DefineWorkflow("order_workflow",
 		}
 
 		// Wait for event with matching order_id
-		event, err := romancy.WaitEvent(ctx,
+		event, err := romancy.WaitEvent[map[string]any](ctx,
 			fmt.Sprintf("payment.completed.%s", orderID),
-			romancy.WithTimeout(5*time.Minute),
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return OrderWorkflowResult{}, err
@@ -764,9 +756,9 @@ var idempotentWorkflow = romancy.DefineWorkflow("idempotent_workflow",
 		}
 
 		// Wait for event
-		event, err := romancy.WaitEvent(ctx,
+		event, err := romancy.WaitEvent[map[string]any](ctx,
 			fmt.Sprintf("process.%s", requestID),
-			romancy.WithTimeout(10*time.Minute),
+			romancy.WithEventTimeout(10*time.Minute),
 		)
 		if err != nil {
 			return IdempotentResult{}, err
@@ -792,14 +784,15 @@ type MultiEventResult struct {
 var multiEventWorkflow = romancy.DefineWorkflow("multi_event_workflow",
 	func(ctx *romancy.WorkflowContext, orderID string) (MultiEventResult, error) {
 		// Option 1: Sequential checks with short timeouts
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(1*time.Minute),
+		event, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed",
+			romancy.WithEventTimeout(1*time.Minute),
 		)
 		if err != nil {
-			if errors.Is(err, romancy.ErrTimeout) {
+			var timeoutErr *romancy.ChannelMessageTimeoutError
+			if errors.As(err, &timeoutErr) {
 				// Try waiting for failure event
-				event, err = romancy.WaitEvent(ctx, "payment.failed",
-					romancy.WithTimeout(1*time.Minute),
+				event, err = romancy.WaitEvent[map[string]any](ctx, "payment.failed",
+					romancy.WithEventTimeout(1*time.Minute),
 				)
 				if err != nil {
 					return MultiEventResult{}, err
@@ -831,9 +824,9 @@ type FilteredEventResult struct {
 var filteredEventWorkflow = romancy.DefineWorkflow("filtered_event_workflow",
 	func(ctx *romancy.WorkflowContext, userID string) (FilteredEventResult, error) {
 		// Wait for event specific to this user
-		event, err := romancy.WaitEvent(ctx,
+		event, err := romancy.WaitEvent[map[string]any](ctx,
 			fmt.Sprintf("user.action.%s", userID),
-			romancy.WithTimeout(5*time.Minute),
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			return FilteredEventResult{}, err
@@ -858,7 +851,6 @@ package main
 
 import (
 	"context"
-	"net/http"
 
 	"github.com/i2y/romancy"
 )
@@ -868,20 +860,21 @@ import (
 
 // Or programmatically
 func cancelWaitingWorkflow(ctx context.Context, app *romancy.App, instanceID string) error {
-	return app.CancelWorkflow(ctx, instanceID)
+	return romancy.CancelWorkflow(ctx, app, instanceID, "cancelled by user")
 }
 ```
 
 ## Monitoring and Debugging
 
-### Viewer UI
+### Inspecting Waiting Workflows
 
-The Romancy Viewer shows waiting workflows:
+List the waiting workflows with the CLI, and look at one of them:
 
-- Status: `waiting_for_event` or `waiting_for_timer`
-- Event type being waited for
-- Timeout information
-- Time elapsed
+```bash
+romancy list --db workflow.db --status waiting_for_message   # event waits
+romancy list --db workflow.db --status waiting_for_timer     # sleeps
+romancy get <instance_id> --db workflow.db
+```
 
 ### Logging
 
@@ -891,7 +884,6 @@ Add logging for debugging:
 package main
 
 import (
-	"context"
 	"log"
 	"time"
 
@@ -906,8 +898,8 @@ var loggedWorkflow = romancy.DefineWorkflow("logged_workflow",
 	func(ctx *romancy.WorkflowContext, input string) (LoggedResult, error) {
 		log.Printf("Waiting for payment event, instance: %s", ctx.InstanceID())
 
-		event, err := romancy.WaitEvent(ctx, "payment.completed",
-			romancy.WithTimeout(5*time.Minute),
+		event, err := romancy.WaitEvent[map[string]any](ctx, "payment.completed",
+			romancy.WithEventTimeout(5*time.Minute),
 		)
 		if err != nil {
 			log.Printf("Wait event error: %v", err)
@@ -931,14 +923,15 @@ import (
 	"log"
 
 	"github.com/i2y/romancy"
+	"github.com/i2y/romancy/hooks"
 )
 
 type DebugHooks struct {
-	romancy.HooksBase
+	hooks.NoOpHooks
 }
 
-func (h *DebugHooks) OnEventReceived(ctx context.Context, instanceID, eventType string, eventData any) {
-	log.Printf("Event received for workflow %s: type=%s", instanceID, eventType)
+func (h *DebugHooks) OnEventReceived(ctx context.Context, info hooks.EventReceivedInfo) {
+	log.Printf("Event received for workflow %s: type=%s", info.InstanceID, info.EventType)
 }
 
 func main() {
@@ -946,7 +939,10 @@ func main() {
 		romancy.WithDatabase("workflow.db"),
 		romancy.WithHooks(&DebugHooks{}),
 	)
-	// ...
+	if err := app.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	defer app.Shutdown(ctx)
 }
 ```
 
