@@ -377,6 +377,7 @@ func (s *PostgresStorage) UpdateInstanceOutputIfLocked(ctx context.Context, inst
 		UPDATE workflow_instances
 		SET output_data = $1, status = 'completed', updated_at = NOW()
 		WHERE instance_id = $2 AND locked_by = $3
+		AND (status = 'completed' OR status NOT IN `+terminalStatusList+`)
 	`, string(outputData), instanceID, workerID)
 	if err != nil {
 		return err
@@ -386,7 +387,7 @@ func (s *PostgresStorage) UpdateInstanceOutputIfLocked(ctx context.Context, inst
 		return err
 	}
 	if affected == 0 {
-		return s.lockLost(ctx, instanceID, workerID)
+		return s.statusWriteRefused(ctx, instanceID, workerID)
 	}
 	return nil
 }

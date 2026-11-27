@@ -406,6 +406,14 @@ func TestStorage_TerminalStatusAbsorbing(t *testing.T) {
 		if err := s.UpdateInstanceStatusIfLocked(ctx, "inst-ab", StatusCancelled, "", run); err != nil {
 			t.Fatalf("holder rewrite of the same terminal status = %v; want nil", err)
 		}
+		// Completing writes the output and the status in one statement: over
+		// a cancelled instance it is refused, and no output is written.
+		if err := s.UpdateInstanceOutputIfLocked(ctx, "inst-ab", []byte(`"late"`), run); !errors.Is(err, ErrInstanceTerminated) {
+			t.Fatalf("holder output write over cancelled = %v; want ErrInstanceTerminated", err)
+		}
+		if inst, _ := s.GetInstance(ctx, "inst-ab"); len(inst.OutputData) != 0 {
+			t.Fatalf("output over cancelled = %s; want none", inst.OutputData)
+		}
 		if _, err := s.RegisterChannelReceiveAndReleaseLock(ctx, "inst-ab", "ab", run, "receive_ab:2", nil); !errors.Is(err, ErrInstanceTerminated) {
 			t.Fatalf("wait registration over cancelled = %v; want ErrInstanceTerminated", err)
 		}

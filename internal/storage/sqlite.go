@@ -487,6 +487,7 @@ func (s *SQLiteStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instan
 		UPDATE workflow_instances
 		SET output_data = ?, status = 'completed', updated_at = datetime('now')
 		WHERE instance_id = ? AND locked_by = ?
+		AND (status = 'completed' OR status NOT IN `+terminalStatusList+`)
 	`, string(outputData), instanceID, workerID)
 	if err != nil {
 		return err
@@ -496,7 +497,7 @@ func (s *SQLiteStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instan
 		return err
 	}
 	if affected == 0 {
-		return s.lockLost(ctx, instanceID, workerID)
+		return s.statusWriteRefused(ctx, instanceID, workerID)
 	}
 	return nil
 }

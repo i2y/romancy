@@ -471,6 +471,7 @@ func (s *MySQLStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instanc
 		UPDATE workflow_instances
 		SET output_data = ?, status = 'completed', updated_at = NOW()
 		WHERE instance_id = ? AND locked_by = ?
+		AND (status = 'completed' OR status NOT IN `+terminalStatusList+`)
 	`, string(outputData), instanceID, workerID)
 	if err != nil {
 		return err
@@ -480,7 +481,7 @@ func (s *MySQLStorage) UpdateInstanceOutputIfLocked(ctx context.Context, instanc
 		return err
 	}
 	if affected == 0 {
-		return s.lockLost(ctx, instanceID, workerID)
+		return s.statusWriteRefused(ctx, instanceID, workerID)
 	}
 	return nil
 }
