@@ -18,9 +18,11 @@ type Policy struct {
 	InitialInterval time.Duration
 
 	// MaxInterval is the maximum delay between retries.
+	// 0 means no maximum.
 	MaxInterval time.Duration
 
 	// Multiplier is the factor by which the interval increases.
+	// 0 means 2.0, as in DefaultPolicy; use 1.0 for a fixed interval.
 	Multiplier float64
 
 	// RandomizationFactor adds jitter to the delay.
@@ -87,18 +89,32 @@ func (p *Policy) ShouldRetry(attempts int, err error) bool {
 	return true
 }
 
-// GetDelay calculates the delay before the next retry.
+// maxDelay bounds a computed delay so that it, and its jitter, stay within
+// a time.Duration.
+const maxDelay = float64(time.Duration(1) << 61)
+
+// GetDelay calculates the delay before the next retry. A policy that leaves
+// Multiplier or MaxInterval zero still backs off: the multiplier is 2.0 and
+// the delay has no maximum.
 func (p *Policy) GetDelay(attempts int) time.Duration {
 	if attempts <= 1 {
 		return p.addJitter(p.InitialInterval)
 	}
 
+	multiplier := p.Multiplier
+	if multiplier <= 0 {
+		multiplier = 2.0
+	}
+
 	// Calculate exponential backoff
-	delay := float64(p.InitialInterval) * math.Pow(p.Multiplier, float64(attempts-1))
+	delay := float64(p.InitialInterval) * math.Pow(multiplier, float64(attempts-1))
 
 	// Cap at maximum interval
-	if delay > float64(p.MaxInterval) {
+	if p.MaxInterval > 0 && delay > float64(p.MaxInterval) {
 		delay = float64(p.MaxInterval)
+	}
+	if delay > maxDelay {
+		delay = maxDelay
 	}
 
 	return p.addJitter(time.Duration(delay))

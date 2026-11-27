@@ -237,3 +237,27 @@ func TestBuilder(t *testing.T) {
 		t.Error("expected ShouldRetry to return false for ErrNotFound")
 	}
 }
+
+// A policy literal that leaves Multiplier and MaxInterval out still backs off
+// (it used to retry at once from the second retry on).
+func TestGetDelay_ZeroMultiplierAndMaxInterval(t *testing.T) {
+	p := &Policy{MaxAttempts: 10, InitialInterval: time.Second}
+
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	for i, w := range want {
+		if got := p.GetDelay(i + 1); got != w {
+			t.Errorf("GetDelay(%d) = %v, want %v", i+1, got, w)
+		}
+	}
+
+	// A huge attempt count stays a positive, bounded delay
+	if got := p.GetDelay(200); got <= 0 || got > time.Duration(maxDelay) {
+		t.Errorf("GetDelay(200) = %v, want a positive delay of at most %v", got, time.Duration(maxDelay))
+	}
+
+	// An explicit MaxInterval still caps it
+	p.MaxInterval = 3 * time.Second
+	if got := p.GetDelay(4); got != 3*time.Second {
+		t.Errorf("GetDelay(4) with MaxInterval 3s = %v, want 3s", got)
+	}
+}
