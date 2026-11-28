@@ -1923,24 +1923,7 @@ func (s *PostgresStorage) DeliverChannelMessageWithLock(
 	}
 
 	// Step 3: Record message in history using the correct activity ID
-	// Wrap the message in ReceivedMessage format so Receive can unmarshal it correctly
-	wrappedData := map[string]any{
-		"id":           message.ID,
-		"channel_name": channelName,
-		"created_at":   message.PublishedAt,
-	}
-	// The message.Data contains the actual data - unmarshal and re-wrap
-	var msgData any
-	if len(message.Data) > 0 {
-		_ = json.Unmarshal(message.Data, &msgData)
-	}
-	wrappedData["data"] = msgData
-	if len(message.Metadata) > 0 {
-		var metadata map[string]any
-		_ = json.Unmarshal(message.Metadata, &metadata)
-		wrappedData["metadata"] = metadata
-	}
-	wrappedJSON, _ := json.Marshal(wrappedData)
+	wrappedJSON := receivedMessageRecord(channelName, message)
 
 	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)

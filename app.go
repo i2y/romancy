@@ -1643,11 +1643,11 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 
 	// Workflows waiting via WaitEvent (which receives from a channel) read
 	// the event from its channel.
-	dataJSON, err := cloudEventMessage(event)
+	dataJSON, metadataJSON, err := cloudEventChannelMessage(event)
 	if err != nil {
 		return err
 	}
-	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, nil)
+	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, metadataJSON)
 	if err != nil {
 		return fmt.Errorf("failed to publish event to channel: %w", err)
 	}
@@ -1674,7 +1674,7 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 	a.eventWG.Add(1)
 	go func() {
 		defer a.eventWG.Done()
-		a.wakeWaitingChannelSubscribers(appCtx, channelName, messageID, dataJSON, nil)
+		a.wakeWaitingChannelSubscribers(appCtx, channelName, messageID, dataJSON, metadataJSON)
 		if target != "" {
 			a.resumeWaitOnTypeAlone(appCtx, target, event.Type)
 		}
@@ -1756,42 +1756,45 @@ func cloudEventTarget(event *CloudEvent) string {
 	return id
 }
 
-// cloudEventMessage is the channel message of an incoming event, in the
-// ReceivedEvent format that WaitEvent reads.
-func cloudEventMessage(event *CloudEvent) ([]byte, error) {
-	eventData := map[string]any{
-		"id":          event.ID,
-		"type":        event.Type,
-		"source":      event.Source,
-		"specversion": event.SpecVersion,
+// cloudEventChannelMessage is the channel message that stores an event
+// (SEMANTICS §3c), in the form that the CloudEvents endpoints of Edda and
+// Shikibu store too. The data is the event's data, what a Receive of the
+// channel returns. The metadata holds the event's attributes under ce_ keys,
+// which WaitEvent of every runtime reads: ce_specversion, ce_id, ce_source
+// and ce_type, those of ce_time, ce_datacontenttype, ce_dataschema and
+// ce_subject that the event has, and ce_extensions, its extension
+// attributes (the capability token is not among them).
+func cloudEventChannelMessage(event *CloudEvent) (data, metadata []byte, err error) {
+	data = event.Data
+	if len(data) == 0 {
+		data = []byte("null")
 	}
-	if event.Time != nil {
-		eventData["time"] = event.Time
+	attributes := map[string]any{
+		"ce_specversion": event.SpecVersion,
+		"ce_id":          event.ID,
+		"ce_source":      event.Source,
+		"ce_type":        event.Type,
 	}
-	if event.DataContentType != "" {
-		eventData["datacontenttype"] = event.DataContentType
-	}
-	if event.DataSchema != "" {
-		eventData["dataschema"] = event.DataSchema
-	}
-	if event.Subject != "" {
-		eventData["subject"] = event.Subject
-	}
-	if event.Data != nil {
-		var data any
-		if err := json.Unmarshal(event.Data, &data); err == nil {
-			eventData["data"] = data
+	for key, value := range map[string]string{
+		"ce_datacontenttype": event.DataContentType,
+		"ce_dataschema":      event.DataSchema,
+		"ce_subject":         event.Subject,
+	} {
+		if value != "" {
+			attributes[key] = value
 		}
 	}
+	if event.Time != nil {
+		attributes["ce_time"] = event.Time.Format(time.RFC3339Nano)
+	}
 	if len(event.Extensions) > 0 {
-		eventData["extensions"] = event.Extensions
+		attributes["ce_extensions"] = event.Extensions
 	}
-
-	dataJSON, err := json.Marshal(eventData)
+	metadata, err = json.Marshal(attributes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize event data: %w", err)
+		return nil, nil, fmt.Errorf("failed to serialize event attributes: %w", err)
 	}
-	return dataJSON, nil
+	return data, metadata, nil
 }
 
 // wakeWaitingChannelSubscribers delivers a message to waiting channel subscribers.

@@ -120,9 +120,13 @@ func WaitEvent[T any](
 - `Source`: Event source
 - `Time`: Event timestamp
 - `ID`: Event ID
+- `SpecVersion`: CloudEvents version
 - `Subject`: Event subject, if it has one
+- `DataSchema`: Schema of the data, if it has one
 - `DataContentType`: Media type of the data, if it has one
 - `Extensions`: The other attributes (for example `romancyinstanceid`)
+
+The attributes are those of an event that the CloudEvents endpoint of Romancy, Edda or Shikibu stored (see [How the Event Is Stored](/docs/core-features/events/cloudevents-http-binding#how-the-event-is-stored)). A message that workflow code published on the channel has none: `Data` is its data, and `Type` is the type waited for.
 
 #### Error Handling
 

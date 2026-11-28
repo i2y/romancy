@@ -233,11 +233,11 @@ func TestTargetedEvent_ResumesAWaitOnTheTypeAlone(t *testing.T) {
 			if err := Subscribe(ctx, "payment.upgraded", ModeBroadcast); err != nil {
 				return nil, err
 			}
-			msg, err := Receive[map[string]any](ctx, "payment.upgraded")
+			msg, err := Receive[json.RawMessage](ctx, "payment.upgraded")
 			if err != nil {
 				return nil, err
 			}
-			ev, err := convertToReceivedEvent[paymentDone](msg)
+			ev, err := convertToReceivedEvent[paymentDone](msg, "payment.upgraded")
 			if err != nil {
 				return nil, err
 			}
@@ -275,15 +275,12 @@ func TestTargetedEvent_DirectSubscriptionGetsEarlierEvents(t *testing.T) {
 		if err := Subscribe(ctx, "payment.direct", ModeDirect); err != nil {
 			return nil, err
 		}
-		msg, err := Receive[map[string]any](ctx, "payment.direct")
+		// The message data is the event's data.
+		msg, err := Receive[paymentDone](ctx, "payment.direct")
 		if err != nil {
 			return nil, err
 		}
-		ev, err := convertToReceivedEvent[paymentDone](msg)
-		if err != nil {
-			return nil, err
-		}
-		return []int{ev.Data.N}, nil
+		return []int{msg.Data.N}, nil
 	})
 	app := startTargetedTestApp(t, func(app *App) { RegisterWorkflow(app, wf) })
 	id, err := StartWorkflow(context.Background(), app, wf, struct{}{})

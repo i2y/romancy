@@ -13,13 +13,17 @@ import (
 
 // ReceivedEvent represents an event received by a workflow.
 type ReceivedEvent[T any] struct {
-	// CloudEvents metadata
+	// CloudEvents attributes. An event that the CloudEvents endpoint of any
+	// runtime (Romancy, Edda, Shikibu) stored has them. A message published
+	// on the channel from workflow code has none: only Type is set, to the
+	// type waited for.
 	ID          string     `json:"id"`
 	Type        string     `json:"type"`
 	Source      string     `json:"source"`
 	SpecVersion string     `json:"specversion"`
 	Time        *time.Time `json:"time,omitempty"`
 	Subject     string     `json:"subject,omitempty"`
+	DataSchema  string     `json:"dataschema,omitempty"`
 	// DataContentType is the media type of the data, if the event has one.
 	// JSON data decodes into T. Text (text/*) is a string, and other data
 	// is its bytes in base64: receive them with T = string or T = []byte.
@@ -77,71 +81,101 @@ func WaitEvent[T any](ctx *WorkflowContext, eventType string, opts ...WaitEventO
 		receiveOpts = append(receiveOpts, WithReceiveTimeout(*options.timeout))
 	}
 
-	// Use Receive internally - the channel message contains CloudEvent data
-	msg, err := Receive[map[string]any](ctx, eventType, receiveOpts...)
+	// Use Receive internally: the message data is the event's data, and its
+	// metadata the event's attributes.
+	msg, err := Receive[json.RawMessage](ctx, eventType, receiveOpts...)
 	if err != nil {
 		return nil, err // SuspendSignal or other errors propagate
 	}
 
 	// Convert ReceivedMessage to ReceivedEvent
-	return convertToReceivedEvent[T](msg)
+	return convertToReceivedEvent[T](msg, eventType)
 }
 
-// convertToReceivedEvent converts a ReceivedMessage containing CloudEvent data
-// to a ReceivedEvent with proper typing.
-func convertToReceivedEvent[T any](msg *ReceivedMessage[map[string]any]) (*ReceivedEvent[T], error) {
+// convertToReceivedEvent reads a received channel message as an event. The
+// CloudEvents endpoint of every runtime stores an event as a message whose
+// data is the event's data and whose metadata holds the event's attributes
+// under ce_ keys (SEMANTICS §3c). Earlier versions of Romancy stored the
+// attributes and the data together in the message data; such messages, the
+// pending ones and the receives that histories recorded, read as before. A
+// message without attributes, such as one published from workflow code, is
+// read as its data, of the type waited for.
+func convertToReceivedEvent[T any](msg *ReceivedMessage[json.RawMessage], eventType string) (*ReceivedEvent[T], error) {
 	if msg == nil {
 		return nil, fmt.Errorf("nil message")
 	}
+	if _, ok := msg.Metadata["ce_type"].(string); ok {
+		return eventFromAttributes[T](msg.Metadata, "ce_", msg.Data)
+	}
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(msg.Data, &envelope) == nil && isEventEnvelope(envelope) {
+		attributes := make(map[string]any, len(envelope))
+		for name, value := range envelope {
+			if name != "data" {
+				var decoded any
+				_ = json.Unmarshal(value, &decoded)
+				attributes[name] = decoded
+			}
+		}
+		return eventFromAttributes[T](attributes, "", envelope["data"])
+	}
+	event := &ReceivedEvent[T]{Type: eventType}
+	if err := decodeEventData(msg.Data, &event.Data); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
 
-	event := &ReceivedEvent[T]{}
+// isEventEnvelope reports whether a message's data is an event as earlier
+// versions of the CloudEvents endpoint stored it: an object that always had
+// specversion and type, with the data under "data" and the extension
+// attributes under "extensions".
+func isEventEnvelope(envelope map[string]json.RawMessage) bool {
+	var specVersion, eventType *string
+	return json.Unmarshal(envelope["specversion"], &specVersion) == nil && specVersion != nil &&
+		json.Unmarshal(envelope["type"], &eventType) == nil && eventType != nil && *eventType != ""
+}
 
-	// Extract CloudEvent metadata from the message data
-	if id, ok := msg.Data["id"].(string); ok {
-		event.ID = id
+// eventFromAttributes builds an event from its attributes, named with prefix
+// (the ce_ keys of a message's metadata, or the names of an envelope), and
+// its data.
+func eventFromAttributes[T any](attributes map[string]any, prefix string, data json.RawMessage) (*ReceivedEvent[T], error) {
+	attribute := func(name string) string {
+		value, _ := attributes[prefix+name].(string)
+		return value
 	}
-	if typ, ok := msg.Data["type"].(string); ok {
-		event.Type = typ
+	event := &ReceivedEvent[T]{
+		ID:              attribute("id"),
+		Type:            attribute("type"),
+		Source:          attribute("source"),
+		SpecVersion:     attribute("specversion"),
+		Subject:         attribute("subject"),
+		DataSchema:      attribute("dataschema"),
+		DataContentType: attribute("datacontenttype"),
 	}
-	if source, ok := msg.Data["source"].(string); ok {
-		event.Source = source
-	}
-	if specVersion, ok := msg.Data["specversion"].(string); ok {
-		event.SpecVersion = specVersion
-	}
-	switch t := msg.Data["time"].(type) {
-	case *time.Time:
-		event.Time = t
-	case string:
+	if t := attribute("time"); t != "" {
 		if parsed, err := time.Parse(time.RFC3339, t); err == nil {
 			event.Time = &parsed
 		}
 	}
-	if subject, ok := msg.Data["subject"].(string); ok {
-		event.Subject = subject
-	}
-	if contentType, ok := msg.Data["datacontenttype"].(string); ok {
-		event.DataContentType = contentType
-	}
-	if extensions, ok := msg.Data["extensions"].(map[string]any); ok {
+	if extensions, ok := attributes[prefix+"extensions"].(map[string]any); ok {
 		event.Extensions = extensions
 	}
-
-	// Extract and deserialize the actual event data
-	if data, ok := msg.Data["data"]; ok {
-		// Re-serialize and deserialize to get proper type
-		dataJSON, err := json.Marshal(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to serialize event data: %w", err)
-		}
-		var typedData T
-		if err := json.Unmarshal(dataJSON, &typedData); err != nil {
-			return nil, fmt.Errorf("failed to deserialize event data: %w", err)
-		}
-		event.Data = typedData
+	if err := decodeEventData(data, &event.Data); err != nil {
+		return nil, err
 	}
-
 	return event, nil
+}
+
+// decodeEventData decodes an event's data into T (none leaves T's zero value).
+func decodeEventData[T any](data json.RawMessage, into *T) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(data, into); err != nil {
+		return fmt.Errorf("failed to deserialize event data: %w", err)
+	}
+	return nil
 }
 
 // WaitEventOption configures event waiting behavior.

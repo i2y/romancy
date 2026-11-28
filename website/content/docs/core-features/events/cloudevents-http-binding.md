@@ -122,6 +122,15 @@ The body of a request in neither mode is read as a structured event, whatever it
 
 Data that its `datacontenttype` says is JSON but is not JSON is refused with `400`.
 
+### How the Event Is Stored
+
+The endpoint stores the event as one message on its channel, in the form that the endpoints of Edda and Shikibu store too, so a workflow of any of them receives it:
+
+- The message's data is the event's data. A `Receive` of the channel returns it.
+- The message's metadata holds the event's attributes under `ce_` keys: `ce_specversion`, `ce_id`, `ce_source` and `ce_type`, and those of `ce_time`, `ce_datacontenttype`, `ce_dataschema` and `ce_subject` that the event has. `ce_extensions` holds the extension attributes, except `capabilitytoken`.
+
+`WaitEvent` returns the data with these attributes. On a message that workflow code published (`Publish`), which has no attributes, it returns the data with `Type` set to the type it waited for.
+
 ## HTTP Response Status Codes
 
 Romancy returns appropriate HTTP status codes according to the CloudEvents specification:
