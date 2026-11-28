@@ -330,7 +330,7 @@ app := romancy.NewApp(
 
 ### WithShutdownTimeout(duration)
 
-Sets the timeout for graceful shutdown.
+Sets the timeout for graceful shutdown. Within it, `Shutdown` refuses new CloudEvents (503), lets the events it accepted before finish storing and waking their workflows, cancels the background tasks and the runs in progress, and waits for them before it closes storage. A cancelled run leaves its instance `running`, and a later run continues it.
 
 ```go
 romancy.WithShutdownTimeout(60 * time.Second)

@@ -258,7 +258,7 @@ Content-Type: application/json
 
 - 🔄 **Retry with exponential backoff**: another worker, or this one once it is started again, accepts the event
 
-`Shutdown` waits for the events it accepted before: they finish storing and waking the workflows that wait for them, within the shutdown timeout (`WithShutdownTimeout`), before the background tasks stop and storage closes.
+`Shutdown` waits for the events it accepted before: they finish storing and waking the workflows that wait for them, within the shutdown timeout (`WithShutdownTimeout`). Then it cancels the runs in progress, including the first runs of the workflows that events started, and waits for them before storage closes. A cancelled run leaves its instance `running`, and a later run continues it.
 
 ### Delivery Guarantee
 

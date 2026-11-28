@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,4 +236,44 @@ func TestShutdown_CancelsEventWorkAtDeadline(t *testing.T) {
 	go func() { done <- app.Shutdown(context.Background()) }()
 	within(t, done, "Shutdown at its deadline")
 	require.ErrorIs(t, within(t, blocking.result, "the cancellation of the wake"), context.Canceled)
+}
+
+// Shutdown cancels the first run of a workflow that an event started, as it
+// cancels the other runs, and waits for it before it closes storage. The
+// instance stays running, for a later run.
+func TestShutdown_CancelsFirstRuns(t *testing.T) {
+	app, cleanup := createTestApp(t)
+	defer cleanup()
+	entered := make(chan struct{})
+	var enter sync.Once
+	stopped := make(chan error, 1)
+	block := DefineActivity("block_until_cancelled", func(ctx context.Context, in acceptedOrder) (string, error) {
+		enter.Do(func() { close(entered) })
+		<-ctx.Done()
+		select {
+		case stopped <- ctx.Err():
+		default:
+		}
+		return "", ctx.Err()
+	}, WithTransactional[acceptedOrder, string](false))
+	wf := DefineWorkflow("order.blocking", func(ctx *WorkflowContext, in acceptedOrder) (string, error) {
+		return block.Execute(ctx, in)
+	})
+	RegisterWorkflow(app, wf, WithEventHandler(true))
+	require.NoError(t, app.Start(context.Background()))
+
+	w := postCloudEvent(app, "order.blocking", `{"order_id":"o-1"}`)
+	require.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+	within(t, entered, "the first run")
+
+	require.NoError(t, app.Shutdown(context.Background()))
+	require.ErrorIs(t, within(t, stopped, "the cancellation of the first run"), context.Canceled)
+
+	store, err := storage.NewSQLiteStorage(app.config.databaseURL)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+	var status string
+	require.NoError(t, store.DB().QueryRowContext(context.Background(),
+		`SELECT status FROM workflow_instances WHERE workflow_name = ?`, "order.blocking").Scan(&status))
+	require.Equal(t, "running", status)
 }

@@ -163,6 +163,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 	// still run. If the deadline passes, cancelling the background tasks
 	// below stops their wakes: an undelivered message stays pending, and the
 	// sweep that requeues waits with pending messages resumes its waiters.
+	// The first runs of the workflows they started are background tasks
+	// (beginRun), cancelled below like the other runs.
 	waitDone(waitCtx, &a.eventWG)
 
 	// Stop outbox relayer if enabled
@@ -1044,13 +1046,33 @@ func (a *App) startWorkflow(ctx context.Context, workflowName string, input any,
 
 	// Start workflow execution asynchronously. The run calls the
 	// OnWorkflowStart hook, as every later run of the instance does.
+	runCtx, tracked := a.beginRun()
 	go func() {
-		if err := a.runWorkflow(context.Background(), instanceID, workflowName, input, lockID); err != nil {
+		if tracked {
+			defer a.wg.Done()
+		}
+		if err := a.runWorkflow(runCtx, instanceID, workflowName, input, lockID); err != nil {
 			slog.Error("workflow failed", "instance_id", instanceID, "error", err)
 		}
 	}()
 
 	return instanceID, nil
+}
+
+// beginRun answers the context of a first run that starts now. While the app
+// runs, the run is one of its background tasks: Shutdown cancels it and waits
+// for it before it closes storage, and the instance stays running for a later
+// run, as a resumed run does. The caller calls a.wg.Done when the run ends if
+// tracked is true. Before Start and once Shutdown has begun, the run is not
+// tracked.
+func (a *App) beginRun() (ctx context.Context, tracked bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.running {
+		return context.Background(), false
+	}
+	a.wg.Add(1)
+	return a.ctx, true
 }
 
 // createInstance stores a new instance. When this worker runs the workflow
