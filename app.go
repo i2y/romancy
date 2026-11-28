@@ -549,7 +549,7 @@ func (a *App) tryAcquireLeadership() {
 		int(a.config.leaderLeaseDuration.Seconds()),
 	)
 	if err != nil {
-		slog.Error("leader election error", "error", err)
+		a.logLoopError("leader election error", err)
 		return
 	}
 
@@ -711,7 +711,7 @@ func (a *App) cleanupStaleLocks() error {
 			defer a.resumptionSem.Release(1)
 
 			if err := a.resumeWorkflow(a.ctx, info.InstanceID); err != nil {
-				slog.Error("error resuming workflow", "instance_id", info.InstanceID, "error", err)
+				a.logLoopError("error resuming workflow", err, "instance_id", info.InstanceID)
 			}
 		}(info)
 	}
@@ -766,7 +766,7 @@ func (a *App) checkExpiredTimers() error {
 			defer a.timerSem.Release(1)
 
 			if err := a.handleExpiredTimer(timer); err != nil {
-				slog.Error("error handling timer", "timer_id", timer.TimerID, "error", err)
+				a.logLoopError("error handling timer", err, "timer_id", timer.TimerID)
 			}
 		}(timer)
 	}
@@ -1818,7 +1818,7 @@ func (a *App) checkChannelTimeouts() error {
 			defer a.messageSem.Release(1)
 
 			if err := a.handleChannelTimeout(sub); err != nil {
-				slog.Error("error handling channel timeout", "instance_id", sub.InstanceID, "error", err)
+				a.logLoopError("error handling channel timeout", err, "instance_id", sub.InstanceID)
 			}
 		}(sub)
 	}
@@ -1990,7 +1990,7 @@ func (a *App) checkRecurredWorkflows() error {
 			defer a.resumptionSem.Release(1)
 
 			if err := a.handleRecurredWorkflow(instance); err != nil {
-				slog.Error("error handling recurred workflow", "instance_id", instance.InstanceID, "error", err)
+				a.logLoopError("error handling recurred workflow", err, "instance_id", instance.InstanceID)
 			}
 		}(instance)
 	}
@@ -2078,15 +2078,18 @@ func (a *App) runWorkflowResumption() {
 	}
 }
 
-// logLoopError logs an error of a background loop. Once the app shuts down,
-// its context is cancelled and so are the queries of the loops: such an error
-// is logged at debug level only.
-func (a *App) logLoopError(msg string, err error) {
+// logLoopError logs an error of a background loop, after the key-value pairs
+// in args. Once the app shuts down, its context is cancelled and so are the
+// queries of the loops: such an error is logged at debug level only.
+func (a *App) logLoopError(msg string, err error, args ...any) {
+	attrs := make([]any, 0, len(args)+2)
+	attrs = append(attrs, args...)
+	attrs = append(attrs, "error", err)
 	if a.ctx != nil && a.ctx.Err() != nil {
-		slog.Debug(msg, "error", err)
+		slog.Debug(msg, attrs...)
 		return
 	}
-	slog.Error(msg, "error", err)
+	slog.Error(msg, attrs...)
 }
 
 // resumeResumableWorkflows finds and resumes workflows that are ready.

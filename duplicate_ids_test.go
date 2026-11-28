@@ -33,9 +33,16 @@ func (b *logBuffer) String() string {
 // to a buffer until the test ends.
 func captureWarnings(t *testing.T) *logBuffer {
 	t.Helper()
+	return captureLogs(t, slog.LevelWarn)
+}
+
+// captureLogs sends slog's default logger, at level and above, to a buffer
+// until the test ends.
+func captureLogs(t *testing.T, level slog.Level) *logBuffer {
+	t.Helper()
 	b := &logBuffer{}
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(b, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(b, &slog.HandlerOptions{Level: level})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	return b
 }

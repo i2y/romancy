@@ -157,7 +157,12 @@ func (r *Relayer) run(ctx context.Context) {
 		count, err := r.processPendingEvents(ctx)
 		switch {
 		case err != nil:
-			slog.Error("outbox relayer error", "error", err)
+			if ctx.Err() != nil {
+				// The app is shutting down and cancelled the query
+				slog.Debug("outbox relayer error", "error", err)
+			} else {
+				slog.Error("outbox relayer error", "error", err)
+			}
 			consecutiveEmpty = 0
 		case count == 0:
 			consecutiveEmpty++

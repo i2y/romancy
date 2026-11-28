@@ -2,7 +2,11 @@ package romancy
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -337,5 +341,95 @@ func TestLeaderElection_ConcurrentAccess(t *testing.T) {
 
 	for err := range errChan {
 		t.Errorf("concurrent access error: %v", err)
+	}
+}
+
+// blockingSystemLockStorage holds TryAcquireSystemLock until its context is
+// cancelled, like a query still running when the app shuts down.
+type blockingSystemLockStorage struct {
+	storage.Storage
+	entered chan struct{}
+}
+
+func (s *blockingSystemLockStorage) TryAcquireSystemLock(ctx context.Context, _, _ string, _ int) (bool, error) {
+	close(s.entered)
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// logLines returns the lines of logs that contain every one of parts.
+func logLines(logs string, parts ...string) []string {
+	var lines []string
+	for _, line := range strings.Split(logs, "\n") {
+		matches := true
+		for _, part := range parts {
+			if !strings.Contains(line, part) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// A leader election query that the shutdown cancels is not an error: it is
+// logged at debug level, like the errors of the other background loops.
+func TestLeaderElection_QueryCancelledByShutdownLogsAtDebug(t *testing.T) {
+	logs := captureLogs(t, slog.LevelDebug)
+
+	store, err := storage.NewSQLiteStorage(filepath.Join(t.TempDir(), "leader.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	app := NewApp(WithWorkerID("worker-1"))
+	blocking := &blockingSystemLockStorage{Storage: store, entered: make(chan struct{})}
+	app.storage = blocking
+	ctx, cancel := context.WithCancel(context.Background())
+	app.ctx = ctx
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.tryAcquireLeadership()
+	}()
+	<-blocking.entered
+	cancel() // what Shutdown does
+	<-done
+
+	out := logs.String()
+	if lines := logLines(out, "level=ERROR", "leader election error"); len(lines) > 0 {
+		t.Fatalf("cancelled query logged as an error: %q", lines)
+	}
+	if lines := logLines(out, "level=DEBUG", `msg="leader election error"`, `error="context canceled"`); len(lines) != 1 {
+		t.Fatalf("want one debug line for the cancelled query, got:\n%s", out)
+	}
+}
+
+// logLoopError logs at error level while the app runs and at debug level once
+// the app's context is cancelled, with its key-value pairs before the error.
+func TestLogLoopErrorAfterShutdown(t *testing.T) {
+	logs := captureLogs(t, slog.LevelDebug)
+
+	app := NewApp()
+	ctx, cancel := context.WithCancel(context.Background())
+	app.ctx = ctx
+
+	app.logLoopError("error handling timer", errors.New("disk full"), "timer_id", "t-1")
+	cancel()
+	app.logLoopError("error handling timer", context.Canceled, "timer_id", "t-2")
+
+	out := logs.String()
+	for _, want := range [][]string{
+		{"level=ERROR", `msg="error handling timer" timer_id=t-1 error="disk full"`},
+		{"level=DEBUG", `msg="error handling timer" timer_id=t-2 error="context canceled"`},
+	} {
+		if lines := logLines(out, want...); len(lines) != 1 {
+			t.Errorf("want one line with %q, got:\n%s", want, out)
+		}
 	}
 }
