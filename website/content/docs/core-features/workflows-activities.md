@@ -98,6 +98,8 @@ func registerOrderWorkflow(app *romancy.App) {
 3. Workflow starts with `data` as parameters
 4. Workflow instance ID is returned
 
+An event with the `romancyinstanceid` extension attribute is for that instance only: it starts no workflow.
+
 **Security note:** Only use `WithEventHandler()` for workflows you want publicly accessible via CloudEvents.
 
 ## DefineActivity

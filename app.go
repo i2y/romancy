@@ -1485,15 +1485,16 @@ func (a *App) ListenAndServe(addr string) error {
 
 // CloudEvent represents a CloudEvents v1.0 event.
 type CloudEvent struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Source      string          `json:"source"`
-	SpecVersion string          `json:"specversion"`
-	Time        *time.Time      `json:"time,omitempty"`
-	DataSchema  string          `json:"dataschema,omitempty"`
-	Subject     string          `json:"subject,omitempty"`
-	Data        json.RawMessage `json:"data,omitempty"`
-	Extensions  map[string]any  `json:"-"` // CloudEvents extension attributes
+	ID              string          `json:"id"`
+	Type            string          `json:"type"`
+	Source          string          `json:"source"`
+	SpecVersion     string          `json:"specversion"`
+	Time            *time.Time      `json:"time,omitempty"`
+	DataSchema      string          `json:"dataschema,omitempty"`
+	Subject         string          `json:"subject,omitempty"`
+	DataContentType string          `json:"datacontenttype,omitempty"`
+	Data            json.RawMessage `json:"data,omitempty"`
+	Extensions      map[string]any  `json:"-"` // CloudEvents extension attributes
 }
 
 // UnmarshalJSON implements custom JSON unmarshaling to capture extension attributes.
@@ -1533,6 +1534,9 @@ func (e *CloudEvent) UnmarshalJSON(data []byte) error {
 	if v, ok := raw["subject"]; ok {
 		_ = json.Unmarshal(v, &e.Subject)
 	}
+	if v, ok := raw["datacontenttype"]; ok {
+		_ = json.Unmarshal(v, &e.DataContentType)
+	}
 	if v, ok := raw["data"]; ok {
 		e.Data = v
 	}
@@ -1551,33 +1555,28 @@ func (e *CloudEvent) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// handleCloudEvent handles incoming CloudEvents. It answers 202 once the event
-// is stored, 503 while the app is not running and 500 when storing fails; both
-// are retryable, and the sender sends the event again.
+// handleCloudEvent handles incoming CloudEvents, in structured or binary
+// content mode (readCloudEvent). It answers 400 to a request that holds no
+// valid event, 202 once the event is stored, 503 while the app is not running
+// and 500 when storing fails; both are retryable, and the sender sends the
+// event again.
 func (a *App) handleCloudEvent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse CloudEvent from request body
-	var event CloudEvent
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+	event, err := readCloudEvent(r)
+	if err != nil {
+		errType := "ParseError"
+		var readErr *cloudEventReadError
+		if errors.As(err, &readErr) {
+			errType = readErr.errType
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":      err.Error(),
-			"error_type": "ParseError",
-			"retryable":  "false",
-		})
-		return
-	}
-
-	// Validate required fields
-	if event.Type == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":      "missing required field: type",
-			"error_type": "ValidationError",
+			"error_type": errType,
 			"retryable":  "false",
 		})
 		return
@@ -1588,11 +1587,8 @@ func (a *App) handleCloudEvent(w http.ResponseWriter, r *http.Request) {
 	// header), checked before the event is accepted. The token is not kept
 	// with the event.
 	token, _ := event.Extensions[cloudEventTokenExtension].(string)
-	if token == "" {
-		token = r.Header.Get("Ce-" + cloudEventTokenExtension)
-	}
 	delete(event.Extensions, cloudEventTokenExtension)
-	if err := a.acceptCloudEvent(r.Context(), &event, token); err != nil {
+	if err := a.acceptCloudEvent(r.Context(), event, token); err != nil {
 		status, errType, retryable := http.StatusInternalServerError, "InternalError", "true"
 		switch {
 		case errors.Is(err, ErrChannelForbidden):
@@ -1619,11 +1615,12 @@ func (a *App) handleCloudEvent(w http.ResponseWriter, r *http.Request) {
 var errAppNotRunning = errors.New("app is not running")
 
 // acceptCloudEvent stores an incoming event before the endpoint answers 202
-// (SEMANTICS §3c): it publishes the event to its channel and creates the
-// instance of the workflow that handles its type. The wake of the workflows
-// waiting on the channel runs after the answer, and Shutdown waits for it. A
-// wake cut short leaves the message pending, and the sweep that requeues
-// waits with pending messages resumes the waiters.
+// (SEMANTICS §3c): it publishes the event to its channel and, unless the event
+// is targeted at one instance, creates the instance of the workflow that
+// handles its type. The wake of the workflows waiting on the channel runs
+// after the answer, and Shutdown waits for it. A wake cut short leaves the
+// message pending, and the sweep that requeues waits with pending messages
+// resumes the waiters.
 func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token string) error {
 	appCtx, ok := a.beginEventWork()
 	if !ok {
@@ -1656,11 +1653,13 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 	}
 
 	// An event type that a workflow handles starts that workflow, with the
-	// event data as input. Its first run continues after the answer.
+	// event data as input. Its first run continues after the answer. An event
+	// targeted at one instance is for that instance only, and starts nothing.
+	target := cloudEventTarget(event)
 	a.eventHandlersMu.RLock()
 	workflowName, hasHandler := a.eventHandlers[event.Type]
 	a.eventHandlersMu.RUnlock()
-	if hasHandler {
+	if hasHandler && target == "" {
 		var inputData any
 		if event.Data != nil {
 			_ = json.Unmarshal(event.Data, &inputData)
@@ -1672,7 +1671,6 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 
 	// Wake up waiting subscribers. DeliverChannelMessageWithLock takes the
 	// lock of each one and records the message in its history.
-	target := cloudEventTarget(event)
 	a.eventWG.Add(1)
 	go func() {
 		defer a.eventWG.Done()
@@ -1769,6 +1767,15 @@ func cloudEventMessage(event *CloudEvent) ([]byte, error) {
 	}
 	if event.Time != nil {
 		eventData["time"] = event.Time
+	}
+	if event.DataContentType != "" {
+		eventData["datacontenttype"] = event.DataContentType
+	}
+	if event.DataSchema != "" {
+		eventData["dataschema"] = event.DataSchema
+	}
+	if event.Subject != "" {
+		eventData["subject"] = event.Subject
 	}
 	if event.Data != nil {
 		var data any

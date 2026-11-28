@@ -14,12 +14,17 @@ import (
 // ReceivedEvent represents an event received by a workflow.
 type ReceivedEvent[T any] struct {
 	// CloudEvents metadata
-	ID          string         `json:"id"`
-	Type        string         `json:"type"`
-	Source      string         `json:"source"`
-	SpecVersion string         `json:"specversion"`
-	Time        *time.Time     `json:"time,omitempty"`
-	Extensions  map[string]any `json:"extensions,omitempty"`
+	ID          string     `json:"id"`
+	Type        string     `json:"type"`
+	Source      string     `json:"source"`
+	SpecVersion string     `json:"specversion"`
+	Time        *time.Time `json:"time,omitempty"`
+	Subject     string     `json:"subject,omitempty"`
+	// DataContentType is the media type of the data, if the event has one.
+	// JSON data decodes into T. Text (text/*) is a string, and other data
+	// is its bytes in base64: receive them with T = string or T = []byte.
+	DataContentType string         `json:"datacontenttype,omitempty"`
+	Extensions      map[string]any `json:"extensions,omitempty"`
 
 	// Event data
 	Data T `json:"data"`
@@ -111,6 +116,12 @@ func convertToReceivedEvent[T any](msg *ReceivedMessage[map[string]any]) (*Recei
 		if parsed, err := time.Parse(time.RFC3339, t); err == nil {
 			event.Time = &parsed
 		}
+	}
+	if subject, ok := msg.Data["subject"].(string); ok {
+		event.Subject = subject
+	}
+	if contentType, ok := msg.Data["datacontenttype"].(string); ok {
+		event.DataContentType = contentType
 	}
 	if extensions, ok := msg.Data["extensions"].(map[string]any); ok {
 		event.Extensions = extensions

@@ -86,15 +86,17 @@ The `app.Handler()` returns an `http.Handler` that provides:
 
 ## CloudEvents Content Modes
 
-Romancy supports both CloudEvents content modes:
+Romancy reads both content modes of the HTTP binding:
 
-**Structured Mode (Recommended)**:
-- All CloudEvents attributes in JSON body
+**Structured Mode**:
 - `Content-Type: application/cloudevents+json`
-- No CE-* headers required
+- The body is the event, with all its attributes
 - Examples in this document use Structured Mode
 
-**Binary Mode (Alternative)**:
+**Binary Mode**:
+- A `ce-specversion` header
+- The attributes are the `ce-*` headers, the body is the data, and the `Content-Type` is the event's `datacontenttype`
+- The CloudEvents SDK client sends this mode by default, and so does Romancy's outbox relayer
 
 ```bash
 curl -X POST http://localhost:8001/ \
@@ -106,7 +108,19 @@ curl -X POST http://localhost:8001/ \
   -d '{"amount": 99.99}'
 ```
 
-Both modes are fully supported by Romancy's CloudEvents implementation.
+The body of a request in neither mode is read as a structured event, whatever its `Content-Type`. The batched mode (`application/cloudevents-batch+json`) is not supported: send one event per request. Every event needs the attributes `specversion`, `id`, `source` and `type`; an event without one is refused with `400`.
+
+### The Event's Data
+
+`WaitEvent[T]` decodes the event's data into `T` according to its `datacontenttype`, which `ReceivedEvent.DataContentType` holds:
+
+| `datacontenttype` | The data is | Receive it with |
+|-------------------|-------------|-----------------|
+| JSON (`application/json`, `text/json`, `*+json`), or none and the data is JSON | its JSON value | any `T` it decodes into |
+| `text/*`, in UTF-8 | the text | `T = string` |
+| anything else, or `data_base64` without a type | the bytes | `T = []byte` |
+
+Data that its `datacontenttype` says is JSON but is not JSON is refused with `400`.
 
 ## HTTP Response Status Codes
 
@@ -116,7 +130,7 @@ Romancy returns appropriate HTTP status codes according to the CloudEvents speci
 
 Romancy answers 202 once the event is stored: it is published to its channel, and the instance of the workflow that handles its type (registered with `WithEventHandler(true)`) is created. From then on the event is kept even if the process stops: a running worker resumes the workflows that have not handled it yet.
 
-The channel is the event's `type`. An event with the `romancyinstanceid` extension attribute is for that instance only, and is published to its direct channel `type:<instance ID>`; `WaitEvent` in the instance receives it, even when it arrived before the wait (see [Sending to One Instance](/docs/core-features/events/wait-event#sending-to-one-instance)).
+The channel is the event's `type`. An event with the `romancyinstanceid` extension attribute is for that instance only, and is published to its direct channel `type:<instance ID>`; `WaitEvent` in the instance receives it, even when it arrived before the wait (see [Sending to One Instance](/docs/core-features/events/wait-event#sending-to-one-instance)). Such an event starts no workflow of its type.
 
 ```bash
 curl -X POST http://localhost:8001/ \
@@ -143,7 +157,7 @@ Content-Type: application/json
 **When returned:**
 
 - ✅ The event was parsed and stored
-- ✅ The workflow that handles the event runs, and the workflows waiting for it (`WaitEvent`) are woken, after the response
+- ✅ The workflow that handles the event (none for an event with `romancyinstanceid`) runs, and the workflows waiting for it (`WaitEvent`) are woken, after the response
 - ✅ Final processing outcome is not yet known
 
 ### Client Error (400 Bad Request)
@@ -167,7 +181,7 @@ HTTP/1.1 400 Bad Request
 Content-Type: application/json
 
 {
-  "error": "Failed to find specversion in HTTP request",
+  "error": "invalid CloudEvent: specversion: no specversion",
   "error_type": "ValidationError",
   "retryable": "false"
 }
@@ -175,9 +189,8 @@ Content-Type: application/json
 
 **When returned:**
 
-- ❌ Missing required CloudEvents fields (`specversion`, `type`, `source`, `id`)
-- ❌ Invalid JSON format
-- ❌ CloudEvents validation errors
+- ❌ Missing or invalid required CloudEvents attributes (`specversion`, `type`, `source`, `id`), in either content mode (`error_type: "ValidationError"`)
+- ❌ A body that is not an event, data that is not what its `datacontenttype` says, or the batched content mode (`error_type: "ParseError"`)
 
 **Client action:**
 
@@ -431,7 +444,7 @@ This extension helps clients make intelligent retry decisions without parsing er
 
 ### With CloudEvents SDK (Go)
 
-Using the official CloudEvents Go SDK:
+Using the official CloudEvents Go SDK, which sends binary mode by default:
 
 ```go
 package main
