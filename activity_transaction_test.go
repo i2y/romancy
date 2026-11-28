@@ -418,8 +418,11 @@ func TestActivityRunsAgainAfterSQLiteWriteConflict(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if result.Output != 2 || runs.Load() != 2 {
-				t.Fatalf("output %d after %d runs; want the second run's result", result.Output, runs.Load())
+			// The first attempt always conflicts. A background writer of the
+			// app (the leader heartbeat, a sweep) can commit during a later
+			// attempt and force one more, so only the last result counts.
+			if n := runs.Load(); n < 2 || result.Output != n {
+				t.Fatalf("output %d after %d runs; want the last run's result, after at least 2", result.Output, n)
 			}
 			if writeInBody {
 				if obj, err := app.Storage().FSGet(ctx, "/actor/"+id+"/state"); err != nil || obj == nil {
