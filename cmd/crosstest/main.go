@@ -8,6 +8,12 @@
 //	# Publisher mode (send a test message)
 //	go run ./cmd/crosstest --db=/tmp/cross_test.db --channel=test --mode=publisher --message='{"hello": "world"}'
 //
+//	# Supervisor mode (supervise one child that another runtime runs; print how it ended)
+//	go run ./cmd/crosstest --db=/tmp/cross_test.db --mode=supervisor --child-framework=python --child-workflow=crosstest_py_echo --child-input='{"msg": "hi"}'
+//
+//	# Worker mode (run crosstest_go_echo and crosstest_go_string for other runtimes' supervisors)
+//	go run ./cmd/crosstest --db=/tmp/cross_test.db --mode=worker --timeout=120
+//
 //nolint:gocritic // exitAfterDefer is acceptable for CLI tools using log.Fatalf
 package main
 
@@ -19,6 +25,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/i2y/romancy"
@@ -215,6 +223,76 @@ var sendToWorkflow = romancy.DefineWorkflow("crosstest_send_to",
 	},
 )
 
+// EchoInput is the input of crosstest_go_echo, which a supervisor of another
+// runtime starts as its child.
+type EchoInput struct {
+	Msg string `json:"msg"`
+}
+
+// EchoResult is the output of crosstest_go_echo.
+type EchoResult struct {
+	Echo string `json:"echo"`
+	By   string `json:"by"`
+}
+
+var goEchoWorkflow = romancy.DefineWorkflow("crosstest_go_echo",
+	func(ctx *romancy.WorkflowContext, input EchoInput) (EchoResult, error) {
+		return EchoResult{Echo: input.Msg, By: "romancy"}, nil
+	},
+)
+
+// goStringWorkflow takes a string: the JSON null that a child started without
+// an input gets decodes to "", while an object would not decode at all.
+var goStringWorkflow = romancy.DefineWorkflow("crosstest_go_string",
+	func(ctx *romancy.WorkflowContext, input string) (string, error) {
+		return fmt.Sprintf("romancy got %q", input), nil
+	},
+)
+
+// SupervisionResult is what supervisor mode prints: how the supervisor and
+// its child ended.
+type SupervisionResult struct {
+	SupervisorStatus string          `json:"supervisor_status"`
+	ChildInstanceID  string          `json:"child_instance_id"`
+	ChildFramework   string          `json:"child_framework"`
+	ChildStatus      string          `json:"child_status"`
+	ChildInput       json.RawMessage `json:"child_input"`
+	ChildOutput      json.RawMessage `json:"child_output,omitempty"`
+}
+
+// waitForSupervision waits until the supervisor ends and reports its child.
+func waitForSupervision(ctx context.Context, app *romancy.App, instanceID string, timeout time.Duration) (*SupervisionResult, error) {
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		sup, err := app.GetInstance(ctx, instanceID)
+		if err != nil {
+			return nil, err
+		}
+		switch sup.Status {
+		case romancy.StatusCompleted, romancy.StatusFailed, romancy.StatusCancelled:
+		default:
+			continue
+		}
+		childID := instanceID + ":child:g1"
+		if result, err := romancy.GetWorkflowResult[romancy.SupervisorResult](ctx, app, instanceID); err == nil &&
+			len(result.Output.Children) == 1 {
+			childID = result.Output.Children[0].InstanceID // the last generation
+		}
+		child, err := app.GetInstance(ctx, childID)
+		if err != nil {
+			return nil, err
+		}
+		return &SupervisionResult{
+			SupervisorStatus: string(sup.Status),
+			ChildInstanceID:  child.InstanceID,
+			ChildFramework:   child.Framework,
+			ChildStatus:      string(child.Status),
+			ChildInput:       child.InputData,
+			ChildOutput:      child.OutputData,
+		}, nil
+	}
+	return nil, fmt.Errorf("timeout waiting for supervisor %s", instanceID)
+}
+
 // waitForResult polls for workflow completion and returns the result.
 func waitForResult[O any](ctx context.Context, app *romancy.App, instanceID string, timeout time.Duration) (*O, error) {
 	deadline := time.Now().Add(timeout)
@@ -247,15 +325,18 @@ func main() {
 	// Parse command-line flags
 	dbPath := flag.String("db", "", "SQLite database path (required)")
 	channel := flag.String("channel", "cross-test", "Channel name")
-	mode := flag.String("mode", "", "Mode: 'subscriber', 'publisher', or 'send-to' (required)")
+	mode := flag.String("mode", "", "Mode: 'subscriber', 'publisher', 'send-to', 'supervisor' or 'worker' (required)")
 	channelMode := flag.String("channel-mode", "broadcast", "Channel mode: 'broadcast', 'competing', or 'direct'")
 	messageType := flag.String("message-type", "strict", "Message type: 'strict' (time.Time) or 'compatible' (string timestamp)")
-	timeout := flag.Int("timeout", 30, "Timeout in seconds for subscriber mode")
+	timeout := flag.Int("timeout", 30, "Timeout in seconds for subscriber and supervisor mode; how long worker mode runs")
 	message := flag.String("message", "Hello from Go!", "Message text for publisher/send-to mode")
 	dataJSON := flag.String("data", "", "Additional JSON data for publisher/send-to mode")
 	metadataJSON := flag.String("metadata", "", "JSON metadata for publisher/send-to mode")
 	targetInstance := flag.String("target-instance", "", "Target instance ID for send-to mode (required for send-to)")
 	workerID := flag.String("worker-id", "go-crosstest-worker", "Worker ID")
+	childFramework := flag.String("child-framework", "", "Supervisor mode: runtime that runs the child: 'python', 'ruby' or 'go' (default)")
+	childWorkflow := flag.String("child-workflow", "", "Supervisor mode: the child's workflow name (required)")
+	childInputJSON := flag.String("child-input", "", "Supervisor mode: the child's input JSON (none: the runtime's empty input)")
 	flag.Parse()
 
 	if *dbPath == "" {
@@ -264,8 +345,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mode != "subscriber" && *mode != "publisher" && *mode != "send-to" {
-		fmt.Fprintln(os.Stderr, "Error: --mode must be 'subscriber', 'publisher', or 'send-to'")
+	switch *mode {
+	case "subscriber", "publisher", "send-to", "supervisor", "worker":
+	default:
+		fmt.Fprintln(os.Stderr, "Error: --mode must be 'subscriber', 'publisher', 'send-to', 'supervisor' or 'worker'")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *mode == "supervisor" && *childWorkflow == "" {
+		fmt.Fprintln(os.Stderr, "Error: --child-workflow is required for supervisor mode")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -279,15 +368,46 @@ func main() {
 	ctx := context.Background()
 
 	// Create Romancy app with SQLite
-	app := romancy.NewApp(
+	opts := []romancy.Option{
 		romancy.WithDatabase(*dbPath),
 		romancy.WithWorkerID(*workerID),
-	)
+	}
+	if *mode == "supervisor" || *mode == "worker" {
+		// A supervisor and its child poll each other: keep the loops short
+		opts = append(opts,
+			romancy.WithWorkflowResumptionInterval(200*time.Millisecond),
+			romancy.WithEventTimeoutInterval(200*time.Millisecond),
+		)
+	}
+	app := romancy.NewApp(opts...)
 
 	// Register workflows
 	romancy.RegisterWorkflow[SubscriberInput, SubscriberResult](app, subscriberWorkflow)
 	romancy.RegisterWorkflow[PublisherInput, PublisherResult](app, publisherWorkflow)
 	romancy.RegisterWorkflow[SendToInput, SendToResult](app, sendToWorkflow)
+	romancy.RegisterWorkflow[EchoInput, EchoResult](app, goEchoWorkflow)
+	romancy.RegisterWorkflow[string, string](app, goStringWorkflow)
+
+	var supervisor *romancy.WorkflowFunc[romancy.SupervisorState, romancy.SupervisorResult]
+	if *mode == "supervisor" {
+		var childInput json.RawMessage
+		if *childInputJSON != "" {
+			if !json.Valid([]byte(*childInputJSON)) {
+				log.Fatalf("Invalid --child-input JSON: %s", *childInputJSON)
+			}
+			childInput = json.RawMessage(*childInputJSON)
+		}
+		supervisor = romancy.DefineSupervisor("crosstest_supervisor",
+			romancy.SuperviseConfig{Strategy: romancy.OneForOne, MaxRestarts: 3, WithinSeconds: 60, PollSeconds: 1},
+			[]romancy.ChildSpec{{
+				Name:      "child",
+				Workflow:  *childWorkflow,
+				Framework: *childFramework,
+				Input:     childInput,
+				Restart:   romancy.RestartTransient,
+			}})
+		romancy.RegisterWorkflow(app, supervisor)
+	}
 
 	// Start the app
 	if err := app.Start(ctx); err != nil {
@@ -406,6 +526,33 @@ func main() {
 		}
 
 		resultJSON, resultErr = json.MarshalIndent(result, "", "  ")
+
+	case "supervisor":
+		log.Printf("Starting supervisor with a %q child %s...", *childFramework, *childWorkflow)
+		instanceID, err := romancy.StartWorkflow(ctx, app, supervisor, romancy.SupervisorState{})
+		if err != nil {
+			log.Fatalf("Failed to start supervisor: %v", err)
+		}
+		log.Printf("Supervisor instance started: %s", instanceID)
+
+		result, err := waitForSupervision(ctx, app, instanceID, time.Duration(*timeout)*time.Second)
+		if err != nil {
+			log.Fatalf("Supervisor did not end: %v", err)
+		}
+
+		resultJSON, resultErr = json.MarshalIndent(result, "", "  ")
+
+	case "worker":
+		// Print one line once the app is running, then serve
+		// until the timeout or a signal.
+		fmt.Println(`{"ready": true}`)
+		sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		select {
+		case <-sigCtx.Done():
+		case <-time.After(time.Duration(*timeout) * time.Second):
+		}
+		return
 	}
 
 	if resultErr != nil {
