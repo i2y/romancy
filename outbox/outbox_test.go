@@ -242,7 +242,7 @@ func (m *mockStorage) GetChannelSubscription(ctx context.Context, instanceID, ch
 func (m *mockStorage) GetChannelMode(ctx context.Context, channelName string) (storage.ChannelMode, error) {
 	return "", nil
 }
-func (m *mockStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+func (m *mockStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time, alsoChannels ...string) (bool, error) {
 	return true, nil
 }
 func (m *mockStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int, error) {

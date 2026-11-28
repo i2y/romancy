@@ -159,7 +159,7 @@ if err := romancy.SendTo(ctx, targetInstanceID, "notifications", message); err !
 }
 ```
 
-This design matches Erlang/Elixir's mailbox semantics where each process has its own mailbox identified by its PID.
+This design matches Erlang/Elixir's mailbox semantics where each process has its own mailbox identified by its PID. Like a mailbox, the direct channel keeps what is sent to it: a `ModeDirect` subscription also receives the messages sent to the instance before it subscribed.
 
 ## Unsubscribe
 
@@ -228,6 +228,7 @@ Inside an activity, `Publish` and `SendTo` run directly, in the activity's trans
 ## Delivery Guarantees
 
 - **Broadcast**: a subscription starts after the latest message on the channel, and the subscriber then sees every later message once.
+- **Direct**: a subscription to the instance's own direct channel (`ModeDirect`) starts at the first message sent to it, so nothing sent before the subscription is lost.
 - **Competing**: each message is consumed at most once. Claiming the message, recording the receive in history and deleting the message commit in one transaction. A message is handed only to a subscriber that is waiting for it, so it cannot be lost on an instance that is busy elsewhere.
 - **Stranded claims**: if a consumer dies after claiming a message, the claim is taken over once it is 300 seconds old, or as soon as the consumer is completed, failed or cancelled.
 - **No missed wakeups**: registering a wait re-checks for pending messages in the same transaction, so a message published while the workflow suspends still wakes it.

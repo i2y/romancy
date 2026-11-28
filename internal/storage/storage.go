@@ -344,7 +344,10 @@ type ChannelManager interface {
 	// For direct messages, use dynamic channel names (e.g., "channel:instance_id").
 	PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte) (int64, error)
 
-	// SubscribeToChannel subscribes an instance to a channel.
+	// SubscribeToChannel subscribes an instance to a channel. A broadcast
+	// subscription receives the messages published after it, except on the
+	// instance's own direct channel "{channel}:{instanceID}": that channel is
+	// a mailbox, and its subscription also receives the messages sent before.
 	SubscribeToChannel(ctx context.Context, instanceID, channelName string, mode ChannelMode) error
 
 	// UnsubscribeFromChannel unsubscribes an instance from a channel.
@@ -364,10 +367,17 @@ type ChannelManager interface {
 	// forever. When a pending message exists it does not register the wait; it
 	// only releases the lock with the instance still 'running' so a resumption
 	// drains the message, and returns registered=false.
+	//
+	// alsoChannels are further channels that the same receive reads (WaitEvent
+	// reads the event type and the instance's own direct channel, where
+	// targeted events are stored). A message pending on any of them keeps the
+	// instance running. The wait is registered on each of them, its timeout
+	// only on channelName, so a delivery on any channel ends the wait.
 	RegisterChannelReceiveAndReleaseLock(
 		ctx context.Context,
 		instanceID, channelName, workerID, activityID string,
 		timeoutAt *time.Time,
+		alsoChannels ...string,
 	) (registered bool, err error)
 
 	// RequeueChannelWaitsWithPending flips instances back to 'running' when they
@@ -407,7 +417,10 @@ type ChannelManager interface {
 	// GetChannelSubscribersWaiting finds subscribers waiting for messages on a channel.
 	GetChannelSubscribersWaiting(ctx context.Context, channelName string) ([]*ChannelSubscription, error)
 
-	// ClearChannelWaitingState clears the waiting state for an instance's channel subscription.
+	// ClearChannelWaitingState ends the wait registered on an instance's
+	// subscription to channelName. A wait can be registered on several of the
+	// instance's subscriptions (RegisterChannelReceiveAndReleaseLock's
+	// alsoChannels); it is cleared on all of them.
 	ClearChannelWaitingState(ctx context.Context, instanceID, channelName string) error
 
 	// DeliverChannelMessage delivers a message to a waiting subscriber (records in history).

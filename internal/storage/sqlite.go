@@ -1292,13 +1292,23 @@ func (s *SQLiteStorage) SubscribeToChannel(ctx context.Context, instanceID, chan
 	// For broadcast mode, initialize the delivery cursor to current max message ID
 	// This ensures new subscribers only receive messages published after subscription
 	if mode == ChannelModeBroadcast {
-		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
-			SELECT ?, ?, COALESCE(MAX(id), 0)
-			FROM channel_messages
-			WHERE channel = ?
-			ON CONFLICT (instance_id, channel) DO NOTHING
-		`, instanceID, channelName, channelName)
+		if isOwnDirectChannel(instanceID, channelName) {
+			// The instance's own direct channel is a mailbox: the messages
+			// sent to it before the subscription are delivered too.
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
+				VALUES (?, ?, 0)
+				ON CONFLICT (instance_id, channel) DO NOTHING
+			`, instanceID, channelName)
+		} else {
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
+				SELECT ?, ?, COALESCE(MAX(id), 0)
+				FROM channel_messages
+				WHERE channel = ?
+				ON CONFLICT (instance_id, channel) DO NOTHING
+			`, instanceID, channelName, channelName)
+		}
 		if err != nil {
 			return err
 		}
@@ -1369,7 +1379,7 @@ func (s *SQLiteStorage) GetChannelMode(ctx context.Context, channelName string) 
 
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
 // Waiting state is indicated by activity_id being non-null.
-func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time, alsoChannels ...string) (bool, error) {
 	var needTx bool
 	if !s.InTransaction(ctx) {
 		var err error
@@ -1390,9 +1400,14 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 	// A publish committed between the caller's pending check and this
 	// registration would never be delivered to a freshly registered wait;
 	// detect it here and keep the instance running instead of suspending.
-	pending, err := s.hasPendingChannelMessage(ctx, instanceID, channelName)
-	if err != nil {
-		return false, err
+	channels := waitChannels(channelName, alsoChannels)
+	pending := false
+	for _, ch := range channels {
+		p, err := s.hasPendingChannelMessage(ctx, instanceID, ch)
+		if err != nil {
+			return false, err
+		}
+		pending = pending || p
 	}
 	if pending {
 		res, err := conn.ExecContext(ctx, `
@@ -1433,18 +1448,24 @@ func (s *SQLiteStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context
 		return false, err
 	}
 
-	// Update subscription to set activity_id (non-null = waiting state)
+	// Update subscription to set activity_id (non-null = waiting state). The
+	// timeout is kept on the first channel only, so it fires once.
 	var timeoutStr sql.NullString
 	if timeoutAt != nil {
 		timeoutStr = sql.NullString{String: timeoutAt.UTC().Format("2006-01-02 15:04:05"), Valid: true}
 	}
-	_, err = conn.ExecContext(ctx, `
-		UPDATE channel_subscriptions
-		SET timeout_at = ?, activity_id = ?
-		WHERE instance_id = ? AND channel = ?
-	`, timeoutStr, activityID, instanceID, channelName)
-	if err != nil {
-		return false, err
+	for i, ch := range channels {
+		deadline := timeoutStr
+		if i > 0 {
+			deadline = sql.NullString{}
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE channel_subscriptions
+			SET timeout_at = ?, activity_id = ?
+			WHERE instance_id = ? AND channel = ?
+		`, deadline, activityID, instanceID, ch); err != nil {
+			return false, err
+		}
 	}
 
 	if needTx {
@@ -1863,15 +1884,20 @@ func (s *SQLiteStorage) GetChannelSubscribersWaiting(ctx context.Context, channe
 	return subs, rows.Err()
 }
 
-// ClearChannelWaitingState clears the waiting state for an instance's channel subscription.
-// Waiting state is cleared by setting activity_id to NULL.
+// ClearChannelWaitingState ends the wait registered on an instance's
+// subscription to channelName, on every subscription it is registered on (a
+// WaitEvent wait is registered on the event type and the instance's direct
+// channel). Waiting state is cleared by setting activity_id to NULL.
 func (s *SQLiteStorage) ClearChannelWaitingState(ctx context.Context, instanceID, channelName string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
 		SET activity_id = NULL, timeout_at = NULL
-		WHERE instance_id = ? AND channel = ?
-	`, instanceID, channelName)
+		WHERE instance_id = ? AND (channel = ? OR activity_id IN (
+			SELECT activity_id FROM channel_subscriptions
+			WHERE instance_id = ? AND channel = ? AND activity_id IS NOT NULL AND activity_id != ''
+		))
+	`, instanceID, channelName, instanceID, channelName)
 	return err
 }
 

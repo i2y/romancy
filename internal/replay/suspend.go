@@ -61,6 +61,10 @@ type SuspendSignal struct {
 	Channel    string         // Channel or event type name
 	Timeout    *time.Duration // Optional timeout
 	ActivityID string         // Activity ID for replay matching (used for both channel and timer)
+	// AlsoChannels are further channels the same receive waits on: WaitEvent
+	// also waits on the instance's own direct channel "{type}:{instance}",
+	// where the events targeted at the instance are stored.
+	AlsoChannels []string
 
 	// For SuspendForRecur
 	NewInput any // New input for the next iteration

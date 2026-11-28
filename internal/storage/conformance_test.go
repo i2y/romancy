@@ -748,3 +748,114 @@ func TestStorage_CreateInstanceKeepsFramework(t *testing.T) {
 		}
 	})
 }
+
+// SEMANTICS §3: a direct channel is a mailbox. The instance's subscription to
+// its own direct channel also gets the messages sent before it, while a
+// broadcast subscription to any other channel starts at its latest message.
+func TestStorage_DirectChannelIsAMailbox(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, s *testDB) {
+		createTestInstance(t, ctx, s, "inst-mb", "wf")
+		for _, ch := range []string{"orders:inst-mb", "orders"} {
+			if _, err := s.PublishToChannel(ctx, ch, []byte(`{"n":1}`), nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SubscribeToChannel(ctx, "inst-mb", ch, ChannelModeBroadcast); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if pending, err := s.GetPendingChannelMessagesForInstance(ctx, "inst-mb", "orders:inst-mb"); err != nil || len(pending) != 1 {
+			t.Fatalf("direct channel pending = %d, %v; want the message sent before the subscription", len(pending), err)
+		}
+		if pending, err := s.GetPendingChannelMessagesForInstance(ctx, "inst-mb", "orders"); err != nil || len(pending) != 0 {
+			t.Fatalf("broadcast pending = %d, %v; want none from before the subscription", len(pending), err)
+		}
+	})
+}
+
+// SEMANTICS §3c: one receive can wait on several channels (WaitEvent waits on
+// the event type and on the instance's direct channel). A message pending on
+// any of them keeps the instance running. Otherwise the wait is registered on
+// each, its timeout on the first only, and ending it on one ends it on all.
+func TestStorage_WaitOnSeveralChannels(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, s *testDB) {
+		subscribeBoth := func(inst string) {
+			for _, ch := range []string{"evt", "evt:" + inst} {
+				if err := s.SubscribeToChannel(ctx, inst, ch, ChannelModeBroadcast); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		register := func(inst string, deadline *time.Time) bool {
+			holder := NewLockIdentity("w")
+			mustAcquire(t, ctx, s, inst, holder)
+			registered, err := s.RegisterChannelReceiveAndReleaseLock(ctx, inst, "evt", holder, "receive_evt:1", deadline, "evt:"+inst)
+			if err != nil {
+				t.Fatalf("register %s: %v", inst, err)
+			}
+			return registered
+		}
+		waitOf := func(inst, ch string) *ChannelSubscription {
+			sub, err := s.GetChannelSubscription(ctx, inst, ch)
+			if err != nil || sub == nil {
+				t.Fatalf("subscription %s/%s = %+v, %v", inst, ch, sub, err)
+			}
+			return sub
+		}
+
+		// A message pending on the second channel keeps the instance running.
+		createTestInstance(t, ctx, s, "inst-wp", "wf")
+		subscribeBoth("inst-wp")
+		if _, err := s.PublishToChannel(ctx, "evt:inst-wp", []byte(`{"n":1}`), nil); err != nil {
+			t.Fatal(err)
+		}
+		if register("inst-wp", nil) {
+			t.Fatal("registered a wait while a message was pending on the second channel")
+		}
+		if inst, _ := s.GetInstance(ctx, "inst-wp"); inst.Status != StatusRunning || inst.LockedBy != "" {
+			t.Fatalf("instance = %s locked by %q; want running and unlocked", inst.Status, inst.LockedBy)
+		}
+
+		// Registered on both, the timeout on the first; a delivery on the
+		// second ends the wait on both.
+		createTestInstance(t, ctx, s, "inst-ws", "wf")
+		subscribeBoth("inst-ws")
+		deadline := time.Now().Add(time.Hour)
+		if !register("inst-ws", &deadline) {
+			t.Fatal("wait not registered")
+		}
+		if first := waitOf("inst-ws", "evt"); first.ActivityID != "receive_evt:1" || first.TimeoutAt == nil {
+			t.Fatalf("first channel wait = %+v; want the activity and the timeout", first)
+		}
+		if second := waitOf("inst-ws", "evt:inst-ws"); second.ActivityID != "receive_evt:1" || second.TimeoutAt != nil {
+			t.Fatalf("second channel wait = %+v; want the activity and no timeout", second)
+		}
+		msgID, err := s.PublishToChannel(ctx, "evt:inst-ws", []byte(`{"n":2}`), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := &ChannelMessage{ID: msgID, Channel: "evt:inst-ws", Data: []byte(`{"n":2}`)}
+		if res, err := s.DeliverChannelMessageWithLock(ctx, "inst-ws", "evt:inst-ws", msg, NewLockIdentity("w"), 300); err != nil || res == nil {
+			t.Fatalf("delivery on the second channel = %+v, %v", res, err)
+		}
+		for _, ch := range []string{"evt", "evt:inst-ws"} {
+			if sub := waitOf("inst-ws", ch); sub.ActivityID != "" || sub.TimeoutAt != nil {
+				t.Fatalf("delivery left the wait on %s: %+v", ch, sub)
+			}
+		}
+
+		// Clearing the wait on the first channel (a timeout) clears both.
+		createTestInstance(t, ctx, s, "inst-wt", "wf")
+		subscribeBoth("inst-wt")
+		if !register("inst-wt", &deadline) {
+			t.Fatal("wait not registered")
+		}
+		if err := s.ClearChannelWaitingState(ctx, "inst-wt", "evt"); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range []string{"evt", "evt:inst-wt"} {
+			if sub := waitOf("inst-wt", ch); sub.ActivityID != "" || sub.TimeoutAt != nil {
+				t.Fatalf("clearing the first channel left the wait on %s: %+v", ch, sub)
+			}
+		}
+	})
+}

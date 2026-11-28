@@ -1672,12 +1672,68 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 
 	// Wake up waiting subscribers. DeliverChannelMessageWithLock takes the
 	// lock of each one and records the message in its history.
+	target := cloudEventTarget(event)
 	a.eventWG.Add(1)
 	go func() {
 		defer a.eventWG.Done()
 		a.wakeWaitingChannelSubscribers(appCtx, channelName, messageID, dataJSON, nil)
+		if target != "" {
+			a.resumeWaitOnTypeAlone(appCtx, target, event.Type)
+		}
 	}()
 	return nil
+}
+
+// resumeWaitOnTypeAlone returns the target of a targeted event to running
+// when it waits on the event type alone: a WaitEvent that began before
+// targeted events were stored on the instance's direct channel, which its
+// wait does not cover (or a plain Receive of the type). The next WaitEvent
+// of the run reads the event there. A WaitEvent that waits on both channels
+// got the event from the wake.
+func (a *App) resumeWaitOnTypeAlone(ctx context.Context, instanceID, eventType string) {
+	waiting := func() (string, bool) {
+		sub, err := a.storage.GetChannelSubscription(ctx, instanceID, eventType)
+		if err != nil || sub == nil || sub.ActivityID == "" {
+			return "", false
+		}
+		mailbox, err := a.storage.GetChannelSubscription(ctx, instanceID, fmt.Sprintf("%s:%s", eventType, instanceID))
+		if err != nil || (mailbox != nil && mailbox.ActivityID != "") {
+			return "", false
+		}
+		return sub.ActivityID, true
+	}
+	activityID, ok := waiting()
+	if !ok {
+		return
+	}
+	lockID := storage.NewLockIdentity(a.config.workerID)
+	acquired, err := a.storage.TryAcquireLock(ctx, instanceID, lockID, int(a.config.staleLockTimeout.Seconds()))
+	if err != nil || !acquired {
+		return // a delivery or a run has the instance; its next WaitEvent reads the event
+	}
+	defer func() { _ = storage.ReleaseLockDetached(ctx, a.storage, instanceID, lockID) }()
+	instance, err := a.storage.GetInstance(ctx, instanceID)
+	if err != nil || instance == nil || instance.Status != storage.StatusWaitingForMessage {
+		return
+	}
+	if current, ok := waiting(); !ok || current != activityID {
+		return // the wait ended or changed meanwhile
+	}
+	txCtx, err := a.storage.BeginTransaction(ctx)
+	if err != nil {
+		return
+	}
+	if err := a.storage.ClearChannelWaitingState(txCtx, instanceID, eventType); err != nil {
+		_ = a.storage.RollbackTransaction(txCtx)
+		return
+	}
+	if err := a.storage.UpdateInstanceStatusIfLocked(txCtx, instanceID, storage.StatusRunning, "", lockID); err != nil {
+		_ = a.storage.RollbackTransaction(txCtx)
+		return
+	}
+	if err := a.storage.CommitTransaction(txCtx); err != nil {
+		slog.Debug("could not resume the target of a targeted event", "instance_id", instanceID, "error", err)
+	}
 }
 
 // cloudEventTokenExtension is the CloudEvents extension attribute that
@@ -1685,13 +1741,21 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 const cloudEventTokenExtension = "capabilitytoken"
 
 // cloudEventChannel is the channel an incoming event is published to: its
-// type, or "{type}:{instance}" for an event targeted at one instance with
-// the romancyinstanceid extension (Edda approach).
+// type, or the target's direct channel "{type}:{instance}" for an event
+// targeted at one instance with the romancyinstanceid extension, so that no
+// other instance receives it (SEMANTICS §3c).
 func cloudEventChannel(event *CloudEvent) string {
-	if id, ok := event.Extensions["romancyinstanceid"].(string); ok && id != "" {
+	if id := cloudEventTarget(event); id != "" {
 		return fmt.Sprintf("%s:%s", event.Type, id)
 	}
 	return event.Type
+}
+
+// cloudEventTarget is the instance an event is targeted at (the
+// romancyinstanceid extension), or "" for an event of every waiter.
+func cloudEventTarget(event *CloudEvent) string {
+	id, _ := event.Extensions["romancyinstanceid"].(string)
+	return id
 }
 
 // cloudEventMessage is the channel message of an incoming event, in the

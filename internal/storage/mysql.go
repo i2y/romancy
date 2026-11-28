@@ -1310,13 +1310,23 @@ func (s *MySQLStorage) SubscribeToChannel(ctx context.Context, instanceID, chann
 	// For broadcast mode, initialize the delivery cursor to current max message ID
 	// This ensures new subscribers only receive messages published after subscription
 	if mode == ChannelModeBroadcast {
-		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
-			SELECT ?, ?, COALESCE(MAX(id), 0)
-			FROM channel_messages
-			WHERE channel = ?
-			ON DUPLICATE KEY UPDATE instance_id = instance_id
-		`, instanceID, channelName, channelName)
+		if isOwnDirectChannel(instanceID, channelName) {
+			// The instance's own direct channel is a mailbox: the messages
+			// sent to it before the subscription are delivered too.
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
+				VALUES (?, ?, 0)
+				ON DUPLICATE KEY UPDATE instance_id = instance_id
+			`, instanceID, channelName)
+		} else {
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
+				SELECT ?, ?, COALESCE(MAX(id), 0)
+				FROM channel_messages
+				WHERE channel = ?
+				ON DUPLICATE KEY UPDATE instance_id = instance_id
+			`, instanceID, channelName, channelName)
+		}
 		if err != nil {
 			return err
 		}
@@ -1379,7 +1389,7 @@ func (s *MySQLStorage) GetChannelMode(ctx context.Context, channelName string) (
 }
 
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
-func (s *MySQLStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+func (s *MySQLStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time, alsoChannels ...string) (bool, error) {
 	var needTx bool
 	if !s.InTransaction(ctx) {
 		var err error
@@ -1400,9 +1410,14 @@ func (s *MySQLStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context,
 	// A publish committed between the caller's pending check and this
 	// registration would never be delivered to a freshly registered wait;
 	// detect it here and keep the instance running instead of suspending.
-	pending, err := s.hasPendingChannelMessage(ctx, instanceID, channelName)
-	if err != nil {
-		return false, err
+	channels := waitChannels(channelName, alsoChannels)
+	pending := false
+	for _, ch := range channels {
+		p, err := s.hasPendingChannelMessage(ctx, instanceID, ch)
+		if err != nil {
+			return false, err
+		}
+		pending = pending || p
 	}
 	if pending {
 		res, err := conn.ExecContext(ctx, `
@@ -1443,14 +1458,20 @@ func (s *MySQLStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context,
 		return false, err
 	}
 
-	// Update subscription with activity_id (non-null = waiting state)
-	_, err = conn.ExecContext(ctx, `
-		UPDATE channel_subscriptions
-		SET timeout_at = ?, activity_id = ?
-		WHERE instance_id = ? AND channel = ?
-	`, utcTimePtr(timeoutAt), activityID, instanceID, channelName)
-	if err != nil {
-		return false, err
+	// Update subscription with activity_id (non-null = waiting state). The
+	// timeout is kept on the first channel only, so it fires once.
+	for i, ch := range channels {
+		deadline := utcTimePtr(timeoutAt)
+		if i > 0 {
+			deadline = nil
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE channel_subscriptions
+			SET timeout_at = ?, activity_id = ?
+			WHERE instance_id = ? AND channel = ?
+		`, deadline, activityID, instanceID, ch); err != nil {
+			return false, err
+		}
 	}
 
 	if needTx {
@@ -1866,14 +1887,25 @@ func (s *MySQLStorage) GetChannelSubscribersWaiting(ctx context.Context, channel
 	return subs, rows.Err()
 }
 
-// ClearChannelWaitingState clears the waiting state for an instance's channel subscription.
+// ClearChannelWaitingState ends the wait registered on an instance's
+// subscription to channelName, on every subscription it is registered on (a
+// WaitEvent wait is registered on the event type and the instance's direct
+// channel). An UPDATE cannot read its own table in a subquery on MySQL (error
+// 1093), so the wait's activity id is read first.
 func (s *MySQLStorage) ClearChannelWaitingState(ctx context.Context, instanceID, channelName string) error {
 	conn := s.getConn(ctx)
-	_, err := conn.ExecContext(ctx, `
+	var activityID sql.NullString
+	err := conn.QueryRowContext(ctx, `
+		SELECT activity_id FROM channel_subscriptions WHERE instance_id = ? AND channel = ?
+	`, instanceID, channelName).Scan(&activityID)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
 		SET activity_id = NULL, timeout_at = NULL
-		WHERE instance_id = ? AND channel = ?
-	`, instanceID, channelName)
+		WHERE instance_id = ? AND (channel = ? OR (activity_id = ? AND activity_id != ''))
+	`, instanceID, channelName, activityID)
 	return err
 }
 

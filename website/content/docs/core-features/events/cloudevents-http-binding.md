@@ -116,6 +116,8 @@ Romancy returns appropriate HTTP status codes according to the CloudEvents speci
 
 Romancy answers 202 once the event is stored: it is published to its channel, and the instance of the workflow that handles its type (registered with `WithEventHandler(true)`) is created. From then on the event is kept even if the process stops: a running worker resumes the workflows that have not handled it yet.
 
+The channel is the event's `type`. An event with the `romancyinstanceid` extension attribute is for that instance only, and is published to its direct channel `type:<instance ID>`; `WaitEvent` in the instance receives it, even when it arrived before the wait (see [Sending to One Instance](/docs/core-features/events/wait-event#sending-to-one-instance)).
+
 ```bash
 curl -X POST http://localhost:8001/ \
   -H "Content-Type: application/cloudevents+json" \

@@ -593,6 +593,31 @@ curl -X POST http://localhost:8001/ \
   }'
 ```
 
+### Sending to One Instance
+
+An event with the `romancyinstanceid` extension attribute goes to that instance only:
+
+```bash
+curl -X POST http://localhost:8001/ \
+  -H "Content-Type: application/cloudevents+json" \
+  -d '{
+    "specversion": "1.0",
+    "type": "payment.completed",
+    "source": "payment-service",
+    "id": "evt-002",
+    "romancyinstanceid": "<instance ID>",
+    "data": {"payment_id": "PAY-124", "amount": 10.0}
+  }'
+```
+
+The event is stored on the instance's direct channel, `payment.completed:<instance ID>`, so no other instance receives it. In that instance, `WaitEvent(ctx, "payment.completed")` receives it like the events sent to every waiter of the type:
+
+- An event that arrives before the instance calls `WaitEvent` waits in the direct channel until it does.
+- When events are pending on both channels, `WaitEvent` returns the oldest first.
+- The wait ends at the first event on either channel, and its timeout covers both.
+
+After `Subscribe(ctx, "payment.completed", romancy.ModeDirect)`, `WaitEvent` and `Receive` read only the events sent to this instance. After a broadcast subscription, `Receive(ctx, "payment.completed")` reads only the events sent to every waiter.
+
 ### Using send_event() from Activities
 
 From within workflows or activities:

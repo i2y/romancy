@@ -722,7 +722,7 @@ func (e *Engine) handleChannelMessageSuspend(ctx context.Context, instanceID str
 	// registered=false means a message was already pending at registration
 	// time: the instance is left 'running' and unlocked so a resumption
 	// replays it and Receive drains the pending message.
-	if _, err := e.storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, sig.Channel, lockID, sig.ActivityID, timeoutAt); err != nil {
+	if _, err := e.storage.RegisterChannelReceiveAndReleaseLock(ctx, instanceID, sig.Channel, lockID, sig.ActivityID, timeoutAt, sig.AlsoChannels...); err != nil {
 		if errors.Is(err, storage.ErrInstanceTerminated) {
 			return nil // cancelled during this run: no wait is registered
 		}

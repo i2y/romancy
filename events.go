@@ -31,6 +31,15 @@ type ReceivedEvent[T any] struct {
 // Internally, this uses the channel messaging system. The event_type is used as
 // the channel name, and the workflow subscribes in broadcast mode.
 //
+// WaitEvent also receives the events targeted at this instance (CloudEvents
+// with the romancyinstanceid extension), which are stored on its own direct
+// channel "{eventType}:{instanceID}" so that no other instance sees them. It
+// takes the oldest pending event of the two channels, and its wait ends at
+// the first event on either. A targeted event that arrived before WaitEvent
+// is not lost: a direct channel keeps its messages until they are received.
+// After Subscribe(ctx, eventType, ModeDirect), WaitEvent receives only the
+// targeted events.
+//
 // During replay, if the event was already received, this returns immediately.
 // Otherwise, the workflow is suspended until an event arrives on the channel.
 //
@@ -56,8 +65,9 @@ func WaitEvent[T any](ctx *WorkflowContext, eventType string, opts ...WaitEventO
 		return nil, fmt.Errorf("failed to subscribe to event channel: %w", err)
 	}
 
-	// Convert WaitEventOption to ReceiveOption
-	var receiveOpts []ReceiveOption
+	// Convert WaitEventOption to ReceiveOption. The receive also reads the
+	// instance's own direct channel, where its targeted events are stored.
+	receiveOpts := []ReceiveOption{withTargetedEvents()}
 	if options.timeout != nil {
 		receiveOpts = append(receiveOpts, WithReceiveTimeout(*options.timeout))
 	}

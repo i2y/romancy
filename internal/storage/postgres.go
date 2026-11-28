@@ -1228,13 +1228,23 @@ func (s *PostgresStorage) SubscribeToChannel(ctx context.Context, instanceID, ch
 	// For broadcast mode, initialize the delivery cursor to current max message ID
 	// This ensures new subscribers only receive messages published after subscription
 	if mode == ChannelModeBroadcast {
-		_, err = conn.ExecContext(ctx, `
-			INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
-			SELECT $1, $2, COALESCE(MAX(id), 0)
-			FROM channel_messages
-			WHERE channel = $2
-			ON CONFLICT (instance_id, channel) DO NOTHING
-		`, instanceID, channelName)
+		if isOwnDirectChannel(instanceID, channelName) {
+			// The instance's own direct channel is a mailbox: the messages
+			// sent to it before the subscription are delivered too.
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
+				VALUES ($1, $2, 0)
+				ON CONFLICT (instance_id, channel) DO NOTHING
+			`, instanceID, channelName)
+		} else {
+			_, err = conn.ExecContext(ctx, `
+				INSERT INTO channel_delivery_cursors (instance_id, channel, last_delivered_id)
+				SELECT $1, $2, COALESCE(MAX(id), 0)
+				FROM channel_messages
+				WHERE channel = $2
+				ON CONFLICT (instance_id, channel) DO NOTHING
+			`, instanceID, channelName)
+		}
 		if err != nil {
 			return err
 		}
@@ -1297,7 +1307,7 @@ func (s *PostgresStorage) GetChannelMode(ctx context.Context, channelName string
 }
 
 // RegisterChannelReceiveAndReleaseLock atomically registers a channel receive wait and releases the lock.
-func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time) (bool, error) {
+func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Context, instanceID, channelName, workerID, activityID string, timeoutAt *time.Time, alsoChannels ...string) (bool, error) {
 	var needTx bool
 	if !s.InTransaction(ctx) {
 		var err error
@@ -1318,9 +1328,14 @@ func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Conte
 	// A publish committed between the caller's pending check and this
 	// registration would never be delivered to a freshly registered wait;
 	// detect it here and keep the instance running instead of suspending.
-	pending, err := s.hasPendingChannelMessage(ctx, instanceID, channelName)
-	if err != nil {
-		return false, err
+	channels := waitChannels(channelName, alsoChannels)
+	pending := false
+	for _, ch := range channels {
+		p, err := s.hasPendingChannelMessage(ctx, instanceID, ch)
+		if err != nil {
+			return false, err
+		}
+		pending = pending || p
 	}
 	if pending {
 		res, err := conn.ExecContext(ctx, `
@@ -1361,14 +1376,20 @@ func (s *PostgresStorage) RegisterChannelReceiveAndReleaseLock(ctx context.Conte
 		return false, err
 	}
 
-	// Update subscription to set timeout and activity ID (non-null = waiting)
-	_, err = conn.ExecContext(ctx, `
-		UPDATE channel_subscriptions
-		SET timeout_at = $1, activity_id = $2
-		WHERE instance_id = $3 AND channel = $4
-	`, utcTimePtr(timeoutAt), activityID, instanceID, channelName)
-	if err != nil {
-		return false, err
+	// Update subscription to set timeout and activity ID (non-null = waiting).
+	// The timeout is kept on the first channel only, so it fires once.
+	for i, ch := range channels {
+		deadline := utcTimePtr(timeoutAt)
+		if i > 0 {
+			deadline = nil
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE channel_subscriptions
+			SET timeout_at = $1, activity_id = $2
+			WHERE instance_id = $3 AND channel = $4
+		`, deadline, activityID, instanceID, ch); err != nil {
+			return false, err
+		}
 	}
 
 	if needTx {
@@ -1781,13 +1802,19 @@ func (s *PostgresStorage) GetChannelSubscribersWaiting(ctx context.Context, chan
 	return subs, rows.Err()
 }
 
-// ClearChannelWaitingState clears the waiting state for an instance's channel subscription.
+// ClearChannelWaitingState ends the wait registered on an instance's
+// subscription to channelName, on every subscription it is registered on (a
+// WaitEvent wait is registered on the event type and the instance's direct
+// channel).
 func (s *PostgresStorage) ClearChannelWaitingState(ctx context.Context, instanceID, channelName string) error {
 	conn := s.getConn(ctx)
 	_, err := conn.ExecContext(ctx, `
 		UPDATE channel_subscriptions
 		SET activity_id = NULL, timeout_at = NULL
-		WHERE instance_id = $1 AND channel = $2
+		WHERE instance_id = $1 AND (channel = $2 OR activity_id IN (
+			SELECT activity_id FROM channel_subscriptions
+			WHERE instance_id = $1 AND channel = $2 AND activity_id IS NOT NULL AND activity_id != ''
+		))
 	`, instanceID, channelName)
 	return err
 }

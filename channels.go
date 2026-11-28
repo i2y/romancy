@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -246,6 +247,19 @@ type ReceiveOption func(*receiveOptions)
 type receiveOptions struct {
 	timeout         *time.Duration
 	capabilityToken string
+	// targetedEvents makes the receive also read the instance's own direct
+	// channel "{channel}:{instance}", where the CloudEvents targeted at the
+	// instance are stored (WaitEvent, SEMANTICS §3c).
+	targetedEvents bool
+}
+
+// withTargetedEvents makes a receive also take the messages on the
+// instance's own direct channel for the channel name: WaitEvent receives the
+// events of its type and the events targeted at its instance.
+func withTargetedEvents() ReceiveOption {
+	return func(o *receiveOptions) {
+		o.targetedEvents = true
+	}
 }
 
 // WithReceiveTimeout sets a timeout for waiting for a message.
@@ -405,15 +419,23 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 	if sub == nil {
 		return nil, ErrChannelNotSubscribed
 	}
-
-	// Check for pending messages before suspending (Edda-style)
-	pendingMessages, err := s.GetPendingChannelMessagesForInstance(ctx.Context(), ctx.InstanceID(), actualChannel)
-	if err != nil {
-		return nil, ctx.abortRun(fmt.Errorf("failed to check pending messages: %w", err))
+	subs := []*storage.ChannelSubscription{sub}
+	if options.targetedEvents && !ctx.isDirectSubscription(channelName) {
+		mailbox, err := subscribeOwnDirectChannel(ctx, s, channelName)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, mailbox)
 	}
 
-	if len(pendingMessages) > 0 {
-		result, err := receivePending[T](ctx, s, sub, pendingMessages, channelName, activityID)
+	// Check for pending messages before suspending (Edda-style), the oldest
+	// first when the receive reads two channels.
+	sources, err := pendingSources(ctx, s, subs)
+	if err != nil {
+		return nil, err
+	}
+	for _, src := range sources {
+		result, err := receivePending[T](ctx, s, src.sub, src.messages, channelName, activityID)
 		if err != nil {
 			return nil, err
 		}
@@ -438,7 +460,63 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 	// Return SuspendSignal that the replay engine will handle
 	// Include the activityID so it can be used when recording history on message delivery
 	// Use actualChannel so it wakes up on the correct channel (including direct channels)
-	return nil, NewChannelMessageSuspend(ctx.InstanceID(), actualChannel, activityID, options.timeout)
+	sig := NewChannelMessageSuspend(ctx.InstanceID(), actualChannel, activityID, options.timeout)
+	for _, extra := range subs[1:] {
+		sig.AlsoChannels = append(sig.AlsoChannels, extra.Channel)
+	}
+	return nil, sig
+}
+
+// subscribeOwnDirectChannel returns the instance's subscription to its own
+// direct channel for channelName, "{channelName}:{instance}", where the
+// CloudEvents targeted at the instance are stored. It subscribes when there
+// is none; a direct channel is a mailbox, so the subscription also gets the
+// events that arrived before it. An existing subscription is kept as it is.
+func subscribeOwnDirectChannel(ctx *WorkflowContext, s storage.Storage, channelName string) (*storage.ChannelSubscription, error) {
+	mailbox := fmt.Sprintf("%s:%s", channelName, ctx.InstanceID())
+	sub, err := s.GetChannelSubscription(ctx.Context(), ctx.InstanceID(), mailbox)
+	if err != nil {
+		return nil, ctx.abortRun(fmt.Errorf("failed to read subscription: %w", err))
+	}
+	if sub != nil {
+		return sub, nil
+	}
+	if err := s.SubscribeToChannel(ctx.Context(), ctx.InstanceID(), mailbox, storage.ChannelModeBroadcast); err != nil {
+		return nil, ctx.abortRun(fmt.Errorf("failed to subscribe to channel: %w", err))
+	}
+	sub, err = s.GetChannelSubscription(ctx.Context(), ctx.InstanceID(), mailbox)
+	if err != nil {
+		return nil, ctx.abortRun(fmt.Errorf("failed to read subscription: %w", err))
+	}
+	if sub == nil {
+		return nil, ctx.abortRun(fmt.Errorf("subscription to %q not found after subscribing", mailbox))
+	}
+	return sub, nil
+}
+
+// pendingSource is a subscription with the messages pending on it.
+type pendingSource struct {
+	sub      *storage.ChannelSubscription
+	messages []*storage.ChannelMessage
+}
+
+// pendingSources returns the subscriptions that have pending messages,
+// ordered by their oldest message.
+func pendingSources(ctx *WorkflowContext, s storage.Storage, subs []*storage.ChannelSubscription) ([]pendingSource, error) {
+	var sources []pendingSource
+	for _, sub := range subs {
+		messages, err := s.GetPendingChannelMessagesForInstance(ctx.Context(), ctx.InstanceID(), sub.Channel)
+		if err != nil {
+			return nil, ctx.abortRun(fmt.Errorf("failed to check pending messages: %w", err))
+		}
+		if len(messages) > 0 {
+			sources = append(sources, pendingSource{sub: sub, messages: messages})
+		}
+	}
+	sort.SliceStable(sources, func(i, j int) bool {
+		return sources[i].messages[0].ID < sources[j].messages[0].ID
+	})
+	return sources, nil
 }
 
 // Publish sends a message to all subscribers of a channel.
