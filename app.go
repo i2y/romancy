@@ -870,7 +870,7 @@ func (a *App) handleExpiredTimer(timer *storage.TimerSubscription) error {
 	// does not run it here, the resumption loop picks it up instead of the
 	// instance waiting for a timer that no longer exists.
 	if err := a.fireTimer(timer, lockID); err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, timer.InstanceID, lockID)
+		_ = storage.ReleaseLockDetached(a.ctx, a.storage, timer.InstanceID, lockID)
 		if errors.Is(err, errTimerNotAwaited) {
 			return nil
 		}
@@ -1164,7 +1164,7 @@ func (a *App) resumeWorkflowWithLockID(ctx context.Context, instanceID, lockID s
 	// A caller may already hold the lock under lockID (a batch claim, a fired
 	// timer); every path that does not reach the engine frees it, so the
 	// instance is not left leased to a run that never happens.
-	release := func() { _ = a.storage.ReleaseLock(ctx, instanceID, lockID) }
+	release := func() { _ = storage.ReleaseLockDetached(ctx, a.storage, instanceID, lockID) }
 
 	// Get the instance to find the workflow name
 	instance, err := a.storage.GetInstance(ctx, instanceID)
@@ -1306,7 +1306,7 @@ func (a *App) cancelWorkflow(ctx context.Context, instanceID, reason string) err
 	if !acquired {
 		return fmt.Errorf("workflow is locked by another worker")
 	}
-	defer func() { _ = a.storage.ReleaseLock(ctx, instanceID, lockID) }()
+	defer func() { _ = storage.ReleaseLockDetached(ctx, a.storage, instanceID, lockID) }()
 
 	// Note: Event subscription cleanup is handled by CancelInstance
 
@@ -1923,12 +1923,12 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 	// record into the instance's history nor bring it back to running.
 	instance, err := a.storage.GetInstance(a.ctx, sub.InstanceID)
 	if err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		_ = storage.ReleaseLockDetached(a.ctx, a.storage, sub.InstanceID, lockID)
 		return err
 	}
 	current, err := a.storage.GetChannelSubscription(a.ctx, sub.InstanceID, sub.Channel)
 	if err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		_ = storage.ReleaseLockDetached(a.ctx, a.storage, sub.InstanceID, lockID)
 		return err
 	}
 	// Same wait = same activity id and same deadline as the scan saw (a
@@ -1936,14 +1936,14 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 	// the scan already compared that deadline with the database clock.
 	if instance == nil || current == nil || current.ActivityID != sub.ActivityID ||
 		current.TimeoutAt == nil || sub.TimeoutAt == nil || !current.TimeoutAt.Equal(*sub.TimeoutAt) {
-		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		_ = storage.ReleaseLockDetached(a.ctx, a.storage, sub.InstanceID, lockID)
 		return nil
 	}
 	if instance.Status != storage.StatusWaitingForMessage {
 		// The wait outlived its instance's suspension (the instance resumed
 		// or terminated without clearing it): drop it.
 		err := a.storage.ClearChannelWaitingState(a.ctx, sub.InstanceID, sub.Channel)
-		_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+		_ = storage.ReleaseLockDetached(a.ctx, a.storage, sub.InstanceID, lockID)
 		return err
 	}
 	workflowName := instance.WorkflowName
@@ -1977,7 +1977,7 @@ func (a *App) handleChannelTimeout(sub *storage.ChannelSubscription) error {
 	// transaction: a crash in between must not leave it waiting_for_message
 	// with no wait left for a delivery, a timeout or the requeue to find.
 	err = a.fireReceiveTimeout(historyEvent, sub.Channel, lockID)
-	_ = a.storage.ReleaseLock(a.ctx, sub.InstanceID, lockID)
+	_ = storage.ReleaseLockDetached(a.ctx, a.storage, sub.InstanceID, lockID)
 	if errors.Is(err, storage.ErrInstanceTerminated) {
 		return nil // cancelled meanwhile
 	}
@@ -2089,12 +2089,12 @@ func (a *App) handleRecurredWorkflow(instance *storage.WorkflowInstance) error {
 
 	// Update status back to running
 	if err := a.storage.UpdateInstanceStatusIfLocked(a.ctx, instance.InstanceID, storage.StatusRunning, "", lockID); err != nil {
-		_ = a.storage.ReleaseLock(a.ctx, instance.InstanceID, lockID)
+		_ = storage.ReleaseLockDetached(a.ctx, a.storage, instance.InstanceID, lockID)
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
 	// Resume the workflow (it will replay from the recur event and continue)
-	_ = a.storage.ReleaseLock(a.ctx, instance.InstanceID, lockID)
+	_ = storage.ReleaseLockDetached(a.ctx, a.storage, instance.InstanceID, lockID)
 	return a.resumeWorkflow(a.ctx, instance.InstanceID)
 }
 
@@ -2194,7 +2194,7 @@ func (a *App) resumeResumableWorkflows() (int, error) {
 		// started are handed back instead of waiting out their lease.
 		if a.ctx.Err() != nil || a.resumptionSem.Acquire(a.ctx, 1) != nil {
 			for _, rest := range workflows[i:] {
-				_ = a.storage.ReleaseLock(context.WithoutCancel(a.ctx), rest.InstanceID, claimEpoch)
+				_ = storage.ReleaseLockDetached(a.ctx, a.storage, rest.InstanceID, claimEpoch)
 			}
 			break
 		}

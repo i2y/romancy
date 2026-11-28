@@ -538,7 +538,7 @@ func InspectWorkflowHandler(w http.ResponseWriter, r *http.Request) {
 
 ### 3. Crash Recovery (Automatic)
 
-A run holds its instance's lock: a 5-minute lease that the run renews every minute. When a worker crashes, its leases stop being renewed and expire. Recovery needs no code of yours:
+A run holds its instance's lock: a 5-minute lease that the run renews every minute. A worker that shuts down (`Shutdown`) cancels its runs and gives their locks back, so the next poll of any worker resumes those instances. When a worker crashes, its leases stop being renewed and expire. Recovery needs no code of yours:
 
 - **Claiming expired leases**: every worker polls for `running` instances that are unlocked or whose lease expired (every second by default, `WithWorkflowResumptionInterval`, backing off while there are none), claims a batch of them and resumes them by replay
 - **Stale lock cleanup**: the leader's cleanup tick (every 60 seconds by default, `WithStaleLockInterval`) also clears the expired locks of instances that wait for an event or a timer, so the event or the timer can resume them

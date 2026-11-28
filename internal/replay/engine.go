@@ -326,7 +326,7 @@ func (e *Engine) StartWorkflowWithLockID(
 		slog.Debug("instance claimed by another run before its first run", "instance_id", instanceID)
 		return nil
 	}
-	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
+	defer func() { _ = storage.ReleaseLockDetached(ctx, e.storage, instanceID, lockID) }()
 
 	// Update status to running. A terminated instance (cancelled while it
 	// waited) is not run again.
@@ -368,7 +368,7 @@ func (e *Engine) ResumeWorkflowWithLockID(
 	if !acquired {
 		return fmt.Errorf("failed to acquire lock for instance %s", instanceID)
 	}
-	defer func() { _ = e.storage.ReleaseLock(ctx, instanceID, lockID) }()
+	defer func() { _ = storage.ReleaseLockDetached(ctx, e.storage, instanceID, lockID) }()
 
 	// Update status to running. A terminated instance (cancelled while it
 	// waited) is not run again.

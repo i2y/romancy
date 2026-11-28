@@ -269,11 +269,58 @@ func TestShutdown_CancelsFirstRuns(t *testing.T) {
 	require.NoError(t, app.Shutdown(context.Background()))
 	require.ErrorIs(t, within(t, stopped, "the cancellation of the first run"), context.Canceled)
 
+	requireRunningAndUnlocked(t, app, "order.blocking")
+}
+
+// requireRunningAndUnlocked checks, after Shutdown, that the instance of a
+// workflow whose run was cancelled is left running for a later run, and that
+// the cancelled run handed its lock back instead of keeping it for the rest
+// of its lease.
+func requireRunningAndUnlocked(t *testing.T, app *App, workflowName string) {
+	t.Helper()
 	store, err := storage.NewSQLiteStorage(app.config.databaseURL)
 	require.NoError(t, err)
 	defer func() { _ = store.Close() }()
 	var status string
+	var lockedBy *string
 	require.NoError(t, store.DB().QueryRowContext(context.Background(),
-		`SELECT status FROM workflow_instances WHERE workflow_name = ?`, "order.blocking").Scan(&status))
+		`SELECT status, locked_by FROM workflow_instances WHERE workflow_name = ?`, workflowName).Scan(&status, &lockedBy))
 	require.Equal(t, "running", status)
+	require.Nil(t, lockedBy, "the cancelled run kept its lock")
+}
+
+// A run that resumed a waiting instance is cancelled by Shutdown the same
+// way, and hands its lock back too.
+func TestShutdown_ReleasesTheLockOfACancelledResumedRun(t *testing.T) {
+	app, cleanup := createTestApp(t, WithWorkflowResumptionInterval(20*time.Millisecond))
+	defer cleanup()
+	entered := make(chan struct{})
+	var enter sync.Once
+	block := DefineActivity("block_after_resume", func(ctx context.Context, in acceptedOrder) (string, error) {
+		enter.Do(func() { close(entered) })
+		<-ctx.Done()
+		return "", ctx.Err()
+	}, WithTransactional[acceptedOrder, string](false))
+	wf := DefineWorkflow("order.resumed_blocking", func(ctx *WorkflowContext, in acceptedOrder) (string, error) {
+		if _, err := WaitEvent[map[string]any](ctx, "order.go_on"); err != nil {
+			return "", err
+		}
+		return block.Execute(ctx, in)
+	})
+	RegisterWorkflow(app, wf)
+	require.NoError(t, app.Start(context.Background()))
+
+	id, err := StartWorkflow(context.Background(), app, wf, acceptedOrder{OrderID: "o-1"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		inst, err := app.storage.GetInstance(context.Background(), id)
+		return err == nil && inst != nil && inst.Status == storage.StatusWaitingForMessage
+	}, 5*time.Second, 10*time.Millisecond)
+
+	w := postCloudEvent(app, "order.go_on", `{}`)
+	require.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+	within(t, entered, "the resumed run")
+
+	require.NoError(t, app.Shutdown(context.Background()))
+	requireRunningAndUnlocked(t, app, "order.resumed_blocking")
 }
