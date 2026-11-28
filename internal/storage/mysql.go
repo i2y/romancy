@@ -266,7 +266,7 @@ func (s *MySQLStorage) CreateInstance(ctx context.Context, instance *WorkflowIns
 			instance_id, workflow_name, status, input_data, source_hash, owner_service, framework, sandboxed, started_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, instance.InstanceID, instance.WorkflowName, instance.Status,
-		string(instance.InputData), instance.SourceHash, instance.OwnerService, "go",
+		string(instance.InputData), instance.SourceHash, instance.OwnerService, instanceFramework(instance),
 		sandboxedInt(sandboxed), instance.StartedAt.UTC(), instance.UpdatedAt.UTC())
 	if isDuplicateKey(err) {
 		return fmt.Errorf("%w: %w", ErrInstanceAlreadyExists, err)

@@ -709,3 +709,42 @@ func TestStorage_LongInstanceIDsInActorColumns(t *testing.T) {
 		}
 	})
 }
+
+// The framework column names the runtime that runs an instance, and each
+// runtime claims only its own: an instance created for edda or shikibu keeps
+// its framework on every dialect, and this worker's claim leaves it alone
+// even when it registers a workflow of the same name.
+func TestStorage_CreateInstanceKeepsFramework(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, s *testDB) {
+		created := map[string]string{"fw-default": "", "fw-go": "go", "fw-python": "python", "fw-ruby": "ruby"}
+		for id, framework := range created {
+			now := time.Now()
+			if err := s.CreateInstance(ctx, &WorkflowInstance{
+				InstanceID: id, WorkflowName: "wf-fw", Framework: framework, Status: StatusRunning,
+				InputData: []byte(`{}`), StartedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for id, want := range map[string]string{"fw-default": "go", "fw-go": "go", "fw-python": "python", "fw-ruby": "ruby"} {
+			inst, err := s.GetInstance(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inst.Framework != want {
+				t.Errorf("%s: framework %q; want %q", id, inst.Framework, want)
+			}
+		}
+		got, err := s.ClaimResumableWorkflows(ctx, "w1#1", []WorkflowVersion{{Name: "wf-fw"}}, 300, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed := map[string]bool{}
+		for _, wf := range got {
+			claimed[wf.InstanceID] = true
+		}
+		if len(got) != 2 || !claimed["fw-default"] || !claimed["fw-go"] {
+			t.Fatalf("claimed %v; want only the go instances", claimed)
+		}
+	})
+}

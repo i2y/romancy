@@ -177,7 +177,7 @@ func (s *PostgresStorage) RegisterPostCommitCallback(ctx context.Context, cb fun
 // CreateInstance creates a new workflow instance.
 func (s *PostgresStorage) CreateInstance(ctx context.Context, instance *WorkflowInstance) error {
 	conn := s.getConn(ctx)
-	framework := "go"
+	framework := instanceFramework(instance)
 
 	// Ensure workflow definition exists (required by foreign key constraint)
 	// Uses ON CONFLICT DO NOTHING for idempotency

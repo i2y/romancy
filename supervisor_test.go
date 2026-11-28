@@ -395,3 +395,103 @@ func TestSupervisor_CancelRaceUsesActualStatus(t *testing.T) {
 		t.Error("a permanent child was not restarted")
 	}
 }
+
+// A child of another framework is created for that framework's workers: its
+// framework, an object input (edda and shikibu take keyword arguments) and
+// no source hash, even when this worker registers a Go workflow of the same
+// name.
+func TestSupervisor_SpawnsChildForItsFramework(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sup.db")
+	base, err := storage.NewSQLiteStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = base.Close() }()
+	if err := storage.InitializeTestSchema(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	require.NoError(t, base.CreateInstance(ctx, &storage.WorkflowInstance{
+		InstanceID: "sup", WorkflowName: "sup", Status: storage.StatusRunning,
+		InputData: []byte("null"), StartedAt: now, UpdatedAt: now,
+	}))
+	app := NewApp(WithDatabase(path), WithAutoMigrate(false))
+	app.storage = base
+	RegisterWorkflow(app, DefineWorkflow("shared_name", func(ctx *WorkflowContext, in json.RawMessage) (string, error) {
+		return "", nil
+	}), WithWorkflowSourceHash("go-hash"))
+	wfCtx := NewWorkflowContext(ctx, "sup", "w", "", nil, false)
+	wfCtx.SetApp(app)
+
+	_, err = superviseSync(ctx, wfCtx, SuperviseConfig{Strategy: OneForOne}, superviseSyncInput{
+		SupervisorID: "sup",
+		Children: []ChildState{
+			{Spec: ChildSpec{Name: "py", Workflow: "shared_name", Framework: FrameworkPython, Restart: RestartTransient}},
+			{Spec: ChildSpec{Name: "rb", Workflow: "shared_name", Framework: FrameworkRuby, Input: json.RawMessage(`{"n":1}`), Restart: RestartTransient}},
+			{Spec: ChildSpec{Name: "go", Workflow: "shared_name", Restart: RestartTransient}},
+		},
+	})
+	require.NoError(t, err)
+
+	for id, want := range map[string]struct{ framework, input, hash string }{
+		"sup:py:g1": {FrameworkPython, `{}`, ""},
+		"sup:rb:g1": {FrameworkRuby, `{"n":1}`, ""},
+		"sup:go:g1": {FrameworkGo, `null`, "go-hash"},
+	} {
+		inst, err := base.GetInstance(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, inst, id)
+		assert.Equal(t, want.framework, inst.Framework, id)
+		assert.JSONEq(t, want.input, string(inst.InputData), id)
+		assert.Equal(t, want.hash, inst.SourceHash, id)
+	}
+}
+
+// The supervisor leaves a child of another framework to that framework's
+// workers and sees how it ends like any other child's.
+func TestSupervisor_LeavesChildToItsFramework(t *testing.T) {
+	ctx := context.Background()
+	app, cleanup := supervisorTestApp(t)
+	defer cleanup()
+
+	cfg := SuperviseConfig{Strategy: OneForOne, MaxRestarts: 10, WithinSeconds: 60, PollSeconds: 0.2}
+	supID := startSupervisor(t, ctx, app, cfg, []ChildSpec{
+		{Name: "py", Workflow: "edda_child", Framework: FrameworkPython, Restart: RestartTransient},
+	})
+	childID := supID + ":py:g1"
+	require.Eventually(t, func() bool {
+		inst, err := app.Storage().GetInstance(ctx, childID)
+		return err == nil && inst != nil
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// Several resumption ticks pass: this worker does not claim it.
+	time.Sleep(500 * time.Millisecond)
+	inst, err := app.Storage().GetInstance(ctx, childID)
+	require.NoError(t, err)
+	assert.Equal(t, storage.StatusRunning, inst.Status)
+	assert.Empty(t, inst.LockedBy)
+
+	// An edda worker's claim (its framework, its workflow names) takes it
+	// and completes it.
+	db := app.Storage().DB()
+	res, err := db.ExecContext(ctx, `UPDATE workflow_instances SET locked_by = 'edda#1'
+		WHERE instance_id = ? AND framework = 'python' AND workflow_name = 'edda_child'
+		AND status = 'running' AND locked_by IS NULL`, childID)
+	require.NoError(t, err)
+	claimed, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, claimed, "an edda worker's claim does not match the child")
+	_, err = db.ExecContext(ctx,
+		`UPDATE workflow_instances SET status = 'completed', locked_by = NULL WHERE instance_id = ?`, childID)
+	require.NoError(t, err)
+
+	// A transient child that completed is not restarted: the supervisor ends.
+	require.Eventually(t, func() bool {
+		sup, err := app.Storage().GetInstance(ctx, supID)
+		return err == nil && sup != nil && sup.Status == storage.StatusCompleted
+	}, 20*time.Second, 100*time.Millisecond)
+	g2, err := app.Storage().GetInstance(ctx, supID+":py:g2")
+	require.NoError(t, err)
+	assert.Nil(t, g2)
+}

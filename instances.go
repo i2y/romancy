@@ -22,6 +22,15 @@ const (
 	StatusCompensating      = storage.StatusCompensating
 )
 
+// The values of WorkflowInstance.Framework and ChildSpec.Framework: the
+// runtime that runs an instance. Each runtime claims and recovers only the
+// instances of its own framework.
+const (
+	FrameworkGo     = "go"     // romancy
+	FrameworkPython = "python" // edda
+	FrameworkRuby   = "ruby"   // shikibu
+)
+
 // ListInstancesOptions filters and pages the instances that
 // App.FindInstancesWithOptions returns.
 type ListInstancesOptions = storage.ListInstancesOptions

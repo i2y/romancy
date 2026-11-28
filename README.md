@@ -452,7 +452,7 @@ Workflows double as actors of a kernel shared with Edda and Shikibu (same schema
 - **Channel logs**: `ReadChannelSince` (after a message ID), `ReadChannelAfter` (after a numeric message ID)
 - **Tasks**: `PostTask`, `ClaimTask`, `CompleteTask`, `FailTask`, `ListTasks`, `WaitTask`, `WaitAnyTask`
 - **Actor FS and blobs**: `FSRead`, `FSWrite`, `FSList`, `FSDelete` (inside activities), `StorePayload`, `LoadPayload`
-- **Supervision trees**: `DefineSupervisor` with `OneForOne`, `OneForAll` and `RestForOne`
+- **Supervision trees**: `DefineSupervisor` with `OneForOne`, `OneForAll` and `RestForOne`. A child written for Edda or Shikibu sets `ChildSpec.Framework` (`FrameworkPython`, `FrameworkRuby`), and a worker of that framework runs it
 
 ```go
 var watcher = romancy.DefineWorkflow("watcher",
@@ -478,7 +478,12 @@ var watcher = romancy.DefineWorkflow("watcher",
 
 var sup = romancy.DefineSupervisor("pipeline-sup",
     romancy.SuperviseConfig{Strategy: romancy.OneForOne, MaxRestarts: 5, WithinSeconds: 60},
-    []romancy.ChildSpec{{Name: "ingest", Workflow: "ingest", Restart: romancy.RestartPermanent}},
+    []romancy.ChildSpec{
+        {Name: "ingest", Workflow: "ingest", Restart: romancy.RestartPermanent},
+        // An Edda workflow: an Edda worker sharing the database runs it.
+        {Name: "coder", Workflow: "aider_task", Framework: romancy.FrameworkPython,
+            Input: json.RawMessage(`{"repo": "/srv/app"}`), Restart: romancy.RestartTransient},
+    },
 )
 // romancy.RegisterWorkflow(app, sup)
 // romancy.StartWorkflow(ctx, app, sup, romancy.SupervisorState{})

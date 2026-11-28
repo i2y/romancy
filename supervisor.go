@@ -68,12 +68,21 @@ const (
 )
 
 // ChildSpec describes one supervised child. Input is the workflow input
-// passed verbatim on every (re)start; nil means a JSON null input.
+// passed verbatim on every (re)start; nil means a JSON null input, or an
+// empty object for a child of another framework (edda and shikibu pass the
+// input as keyword arguments).
+//
+// Framework names the runtime that runs the child: FrameworkGo (the
+// default) for a romancy workflow, FrameworkPython for an edda workflow,
+// FrameworkRuby for a shikibu workflow. Each runtime claims only the
+// instances of its own framework, so a child of another language that is
+// created as "go" is never run.
 type ChildSpec struct {
-	Name     string          `json:"name"`
-	Workflow string          `json:"workflow"`
-	Input    json.RawMessage `json:"input,omitempty"`
-	Restart  RestartMode     `json:"restart"`
+	Name      string          `json:"name"`
+	Workflow  string          `json:"workflow"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	Restart   RestartMode     `json:"restart"`
+	Framework string          `json:"framework,omitempty"`
 }
 
 // SuperviseConfig tunes a supervisor. MaxRestarts/WithinSeconds implement
@@ -132,6 +141,12 @@ const supervisorMonitorChannel = "supervisor"
 //
 // Children's workflows must be registered on workers sharing the database —
 // the supervisor only creates instance rows; the resumable sweep runs them.
+// A child written for edda or shikibu sets ChildSpec.Framework, and a
+// worker of that framework runs it.
+//
+// A running supervisor keeps the specs it started with (they travel in its
+// Recur-carried state): a changed spec applies to supervisors started
+// after the change.
 func DefineSupervisor(
 	name string,
 	cfg SuperviseConfig,
@@ -384,17 +399,32 @@ func superviseSync(
 
 		gen := c.Generation + 1
 		newID := fmt.Sprintf("%s:%s:g%d", in.SupervisorID, c.Spec.Name, gen)
+		framework := c.Spec.Framework
+		if framework == "" {
+			framework = FrameworkGo
+		}
 		input := c.Spec.Input
-		if len(input) == 0 {
-			input = json.RawMessage("null")
+		sourceHash := ""
+		if framework == FrameworkGo {
+			if len(input) == 0 {
+				input = json.RawMessage("null")
+			}
+			sourceHash = wfCtx.App().workflowSourceHash(c.Spec.Workflow)
+		} else if len(input) == 0 {
+			// edda and shikibu call the workflow with the input's keys as
+			// keyword arguments. They resume by name, so the child needs
+			// no source hash, and a Go workflow of the same name registered
+			// here is not its code.
+			input = json.RawMessage("{}")
 		}
 		inst := &storage.WorkflowInstance{
 			InstanceID:       newID,
 			WorkflowName:     c.Spec.Workflow,
+			Framework:        framework,
 			Status:           storage.StatusRunning,
 			InputData:        input,
 			ParentInstanceID: in.SupervisorID,
-			SourceHash:       wfCtx.App().workflowSourceHash(c.Spec.Workflow),
+			SourceHash:       sourceHash,
 			StartedAt:        now,
 			UpdatedAt:        now,
 		}

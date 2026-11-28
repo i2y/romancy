@@ -24,7 +24,7 @@ const (
 type WorkflowInstance struct {
 	InstanceID        string         `json:"instance_id"`
 	WorkflowName      string         `json:"workflow_name"`
-	Framework         string         `json:"framework"` // "go" or "python" (Edda unification)
+	Framework         string         `json:"framework"` // runtime that runs it: "go", "python" (edda), "ruby" (shikibu); empty creates "go"
 	Status            WorkflowStatus `json:"status"`
 	InputData         []byte         `json:"input_data"`          // JSON-encoded input
 	OutputData        []byte         `json:"output_data"`         // JSON-encoded output (if completed)
@@ -40,6 +40,17 @@ type WorkflowInstance struct {
 	LockExpiresAt     *time.Time     `json:"lock_expires_at"`
 	StartedAt         time.Time      `json:"started_at"` // When the workflow was created (unified with Edda)
 	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+// instanceFramework is the framework column CreateInstance writes: the one
+// the instance names, or this port's ("go"). Each runtime claims and
+// recovers only its own framework's instances, so an instance of an edda or
+// shikibu workflow must be created with that runtime's framework.
+func instanceFramework(instance *WorkflowInstance) string {
+	if instance.Framework != "" {
+		return instance.Framework
+	}
+	return "go"
 }
 
 // HistoryEventType represents the type of history event.

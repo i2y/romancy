@@ -244,10 +244,7 @@ func (s *SQLiteStorage) RegisterPostCommitCallback(ctx context.Context, cb func(
 // CreateInstance creates a new workflow instance.
 func (s *SQLiteStorage) CreateInstance(ctx context.Context, instance *WorkflowInstance) error {
 	conn := s.getConn(ctx)
-	framework := instance.Framework
-	if framework == "" {
-		framework = "go" // Default framework
-	}
+	framework := instanceFramework(instance)
 
 	// Ensure workflow definition exists (required by foreign key constraint)
 	// Uses INSERT OR IGNORE for idempotency
