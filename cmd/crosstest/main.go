@@ -14,6 +14,12 @@
 //	# Worker mode (run crosstest_go_echo and crosstest_go_string for other runtimes' supervisors)
 //	go run ./cmd/crosstest --db=/tmp/cross_test.db --mode=worker --timeout=120
 //
+//	# Wait-event mode (wait for one event of a type with WaitEvent and print it)
+//	go run ./cmd/crosstest --db=/tmp/cross_test.db --mode=wait-event --event-type=order.shipped --timeout=30
+//
+//	# Post-event mode (send a structured CloudEvent through the app's endpoint, in this process)
+//	go run ./cmd/crosstest --db=/tmp/cross_test.db --mode=post-event --event='{"specversion": "1.0", ...}'
+//
 //nolint:gocritic // exitAfterDefer is acceptable for CLI tools using log.Fatalf
 package main
 
@@ -24,8 +30,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -249,6 +258,43 @@ var goStringWorkflow = romancy.DefineWorkflow("crosstest_go_string",
 	},
 )
 
+// WaitEventInput is the input for the wait-event workflow.
+type WaitEventInput struct {
+	EventType      string `json:"event_type"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+// WaitEventResult is what wait-event mode prints: the event that WaitEvent
+// returned, its data as JSON.
+type WaitEventResult struct {
+	Received bool                                    `json:"received"`
+	Event    *romancy.ReceivedEvent[json.RawMessage] `json:"event,omitempty"`
+	Error    string                                  `json:"error,omitempty"`
+}
+
+// waitEventWorkflow waits for one event of a type. The CloudEvents endpoint
+// of any runtime may have stored it, and any runtime may have delivered it.
+var waitEventWorkflow = romancy.DefineWorkflow("crosstest_wait_event",
+	func(ctx *romancy.WorkflowContext, input WaitEventInput) (WaitEventResult, error) {
+		log.Printf("[WaitEvent] Waiting for an event of type '%s' (instance: %s)", input.EventType, ctx.InstanceID())
+		event, err := romancy.WaitEvent[json.RawMessage](ctx, input.EventType,
+			romancy.WithEventTimeout(time.Duration(input.TimeoutSeconds)*time.Second))
+		if err != nil {
+			if romancy.IsSuspendSignal(err) {
+				return WaitEventResult{}, err
+			}
+			return WaitEventResult{Error: err.Error()}, nil
+		}
+		return WaitEventResult{Received: true, Event: event}, nil
+	},
+)
+
+// PostEventResult is what post-event mode prints: the endpoint's answer.
+type PostEventResult struct {
+	Status int    `json:"status"`
+	Body   string `json:"body,omitempty"`
+}
+
 // SupervisionResult is what supervisor mode prints: how the supervisor and
 // its child ended.
 type SupervisionResult struct {
@@ -325,10 +371,10 @@ func main() {
 	// Parse command-line flags
 	dbPath := flag.String("db", "", "SQLite database path (required)")
 	channel := flag.String("channel", "cross-test", "Channel name")
-	mode := flag.String("mode", "", "Mode: 'subscriber', 'publisher', 'send-to', 'supervisor' or 'worker' (required)")
+	mode := flag.String("mode", "", "Mode: 'subscriber', 'publisher', 'send-to', 'supervisor', 'worker', 'wait-event' or 'post-event' (required)")
 	channelMode := flag.String("channel-mode", "broadcast", "Channel mode: 'broadcast', 'competing', or 'direct'")
 	messageType := flag.String("message-type", "strict", "Message type: 'strict' (time.Time) or 'compatible' (string timestamp)")
-	timeout := flag.Int("timeout", 30, "Timeout in seconds for subscriber and supervisor mode; how long worker mode runs")
+	timeout := flag.Int("timeout", 30, "Timeout in seconds for subscriber, supervisor and wait-event mode; how long worker mode runs")
 	message := flag.String("message", "Hello from Go!", "Message text for publisher/send-to mode")
 	dataJSON := flag.String("data", "", "Additional JSON data for publisher/send-to mode")
 	metadataJSON := flag.String("metadata", "", "JSON metadata for publisher/send-to mode")
@@ -337,6 +383,8 @@ func main() {
 	childFramework := flag.String("child-framework", "", "Supervisor mode: runtime that runs the child: 'python', 'ruby' or 'go' (default)")
 	childWorkflow := flag.String("child-workflow", "", "Supervisor mode: the child's workflow name (required)")
 	childInputJSON := flag.String("child-input", "", "Supervisor mode: the child's input JSON (none: the runtime's empty input)")
+	eventType := flag.String("event-type", "", "Wait-event mode: the type of the event to wait for (required)")
+	eventJSON := flag.String("event", "", "Post-event mode: the structured CloudEvent JSON to send (required)")
 	flag.Parse()
 
 	if *dbPath == "" {
@@ -346,15 +394,27 @@ func main() {
 	}
 
 	switch *mode {
-	case "subscriber", "publisher", "send-to", "supervisor", "worker":
+	case "subscriber", "publisher", "send-to", "supervisor", "worker", "wait-event", "post-event":
 	default:
-		fmt.Fprintln(os.Stderr, "Error: --mode must be 'subscriber', 'publisher', 'send-to', 'supervisor' or 'worker'")
+		fmt.Fprintln(os.Stderr, "Error: --mode must be 'subscriber', 'publisher', 'send-to', 'supervisor', 'worker', 'wait-event' or 'post-event'")
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	if *mode == "supervisor" && *childWorkflow == "" {
 		fmt.Fprintln(os.Stderr, "Error: --child-workflow is required for supervisor mode")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *mode == "wait-event" && *eventType == "" {
+		fmt.Fprintln(os.Stderr, "Error: --event-type is required for wait-event mode")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *mode == "post-event" && !json.Valid([]byte(*eventJSON)) {
+		fmt.Fprintln(os.Stderr, "Error: --event must be a CloudEvent in JSON for post-event mode")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -372,8 +432,10 @@ func main() {
 		romancy.WithDatabase(*dbPath),
 		romancy.WithWorkerID(*workerID),
 	}
-	if *mode == "supervisor" || *mode == "worker" {
-		// A supervisor and its child poll each other: keep the loops short
+	if *mode == "supervisor" || *mode == "worker" || *mode == "wait-event" {
+		// A supervisor and its child poll each other, and a waiter that
+		// another runtime delivers to is resumed by the poll: keep the
+		// loops short
 		opts = append(opts,
 			romancy.WithWorkflowResumptionInterval(200*time.Millisecond),
 			romancy.WithEventTimeoutInterval(200*time.Millisecond),
@@ -387,6 +449,7 @@ func main() {
 	romancy.RegisterWorkflow[SendToInput, SendToResult](app, sendToWorkflow)
 	romancy.RegisterWorkflow[EchoInput, EchoResult](app, goEchoWorkflow)
 	romancy.RegisterWorkflow[string, string](app, goStringWorkflow)
+	romancy.RegisterWorkflow[WaitEventInput, WaitEventResult](app, waitEventWorkflow)
 
 	var supervisor *romancy.WorkflowFunc[romancy.SupervisorState, romancy.SupervisorResult]
 	if *mode == "supervisor" {
@@ -540,6 +603,37 @@ func main() {
 			log.Fatalf("Supervisor did not end: %v", err)
 		}
 
+		resultJSON, resultErr = json.MarshalIndent(result, "", "  ")
+
+	case "wait-event":
+		log.Printf("Starting wait-event workflow...")
+		input := WaitEventInput{EventType: *eventType, TimeoutSeconds: *timeout}
+		instanceID, err := romancy.StartWorkflow(ctx, app, waitEventWorkflow, input)
+		if err != nil {
+			log.Fatalf("Failed to start wait-event workflow: %v", err)
+		}
+		log.Printf("Wait-event instance started: %s", instanceID)
+
+		result, err := waitForResult[WaitEventResult](ctx, app, instanceID, time.Duration(*timeout+10)*time.Second)
+		if err != nil {
+			log.Fatalf("Workflow failed: %v", err)
+		}
+
+		resultJSON, resultErr = json.MarshalIndent(result, "", "  ")
+
+	case "post-event":
+		// The endpoint stores the event and wakes the workflows waiting for
+		// it, whatever runtime runs them. Shutdown waits for that work.
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(*eventJSON))
+		req.Header.Set("Content-Type", "application/cloudevents+json")
+		rec := httptest.NewRecorder()
+		app.Handler().ServeHTTP(rec, req)
+		log.Printf("The endpoint answered %d", rec.Code)
+
+		result := PostEventResult{Status: rec.Code}
+		if rec.Code != http.StatusAccepted {
+			result.Body = rec.Body.String()
+		}
 		resultJSON, resultErr = json.MarshalIndent(result, "", "  ")
 
 	case "worker":
