@@ -48,9 +48,9 @@ func storeMessage(t *testing.T, app *App, channel, data, metadata string) {
 	if metadata != "" {
 		metadataJSON = []byte(metadata)
 	}
-	id, err := app.storage.PublishToChannel(context.Background(), channel, []byte(data), metadataJSON)
+	message, err := messagePayload{data: []byte(data)}.publish(context.Background(), app.storage, channel, metadataJSON)
 	require.NoError(t, err)
-	app.wakeWaitingChannelSubscribers(context.Background(), channel, id, []byte(data), metadataJSON)
+	app.wakeWaitingChannelSubscribers(context.Background(), message)
 }
 
 func storedMessages(t *testing.T, app *App, channel string) []*storage.ChannelMessage {

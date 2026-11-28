@@ -1290,6 +1290,26 @@ func (s *MySQLStorage) PublishToChannel(ctx context.Context, channelName string,
 	return result.LastInsertId()
 }
 
+// PublishBinaryToChannel publishes a message whose data is bytes.
+func (s *MySQLStorage) PublishBinaryToChannel(ctx context.Context, channelName string, data, metadata []byte) (int64, error) {
+	conn := s.getConn(ctx)
+	var metadataStr sql.NullString
+	if metadata != nil {
+		metadataStr = sql.NullString{String: string(metadata), Valid: true}
+	}
+	if data == nil {
+		data = []byte{} // a binary message always has its bytes
+	}
+	result, err := conn.ExecContext(ctx, `
+		INSERT INTO channel_messages (channel, data_binary, metadata, message_id, data_type)
+		VALUES (?, ?, ?, UUID(), 'binary')
+	`, channelName, data, metadataStr)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
 // SubscribeToChannel subscribes an instance to a channel.
 // For broadcast mode, it initializes the delivery cursor to the current max message ID
 // so that only messages published after subscription are received.
@@ -1633,7 +1653,7 @@ func (s *MySQLStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int,
 func (s *MySQLStorage) GetPendingChannelMessages(ctx context.Context, channelName string, afterID int64, limit int) ([]*ChannelMessage, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, channel, data, data_binary, metadata, published_at
+		SELECT id, channel, data_type, data, data_binary, metadata, published_at
 		FROM channel_messages
 		WHERE channel = ? AND id > ?
 		ORDER BY id ASC
@@ -1649,7 +1669,7 @@ func (s *MySQLStorage) GetPendingChannelMessages(ctx context.Context, channelNam
 		var msg ChannelMessage
 		var data, metadata sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &msg.PublishedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &msg.DataType, &data, &dataBinary, &metadata, &msg.PublishedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -1699,7 +1719,7 @@ func (s *MySQLStorage) GetPendingChannelMessagesForInstance(ctx context.Context,
 		}
 
 		query = `
-			SELECT id, channel, data, data_binary, metadata, published_at
+			SELECT id, channel, data_type, data, data_binary, metadata, published_at
 			FROM channel_messages
 			WHERE channel = ? AND id > ?
 			ORDER BY id ASC
@@ -1711,7 +1731,7 @@ func (s *MySQLStorage) GetPendingChannelMessagesForInstance(ctx context.Context,
 		// by this instance stay visible so a replay can drain them after a
 		// crash; stale claims and claims by terminal owners are void.
 		query = `
-			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
+			SELECT m.id, m.channel, m.data_type, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
 			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
 			LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
@@ -1738,7 +1758,7 @@ func (s *MySQLStorage) GetPendingChannelMessagesForInstance(ctx context.Context,
 		var msg ChannelMessage
 		var data, metadata sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &msg.PublishedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &msg.DataType, &data, &dataBinary, &metadata, &msg.PublishedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -2018,7 +2038,7 @@ func (s *MySQLStorage) DeliverChannelMessageWithLock(
 	}
 
 	// Step 4: Record message in history using the activity_id from subscription
-	wrappedJSON := receivedMessageRecord(channelName, message)
+	wrappedJSON := ReceivedMessageRecord(channelName, message)
 
 	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)

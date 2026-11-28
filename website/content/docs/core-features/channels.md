@@ -132,6 +132,22 @@ if err := romancy.Publish(ctx, "events", eventData,
 }
 ```
 
+### Publish Bytes
+
+Data of type `[]byte` is published as bytes, not as JSON. A `Receive` gets them as a `[]byte`, a `string` or an `any` (which holds a `[]byte`). A workflow of Edda receives them as `bytes`, and one of Shikibu as a String in the binary encoding (`ASCII-8BIT`). Any other data, a `string` among it, is published as JSON. `SendTo` does the same.
+
+```go
+// Publish the bytes of an image
+if err := romancy.Publish(ctx, "thumbnails", pngBytes); err != nil {
+    return MyResult{}, err
+}
+
+// Receive them
+msg, err := romancy.Receive[[]byte](ctx, "thumbnails")
+```
+
+A Receive of bytes into another type returns an error. The history records them in base64, and the replay returns the same bytes.
+
 ### Send to Specific Instance (SendTo)
 
 `SendTo` sends a message directly to a specific workflow instance. Use `ModeDirect` on the receiver side for easy setup.
@@ -289,7 +305,7 @@ When receiving a message, you get a `ReceivedMessage[T]` struct:
 type ReceivedMessage[T any] struct {
     ID               int64          // Message ID
     ChannelName      string         // Channel name
-    Data             T              // Your message data
+    Data             T              // Your message data (JSON, or bytes: see Publish Bytes)
     Metadata         map[string]any // Optional metadata
     SenderInstanceID string         // Sender's instance ID (if sent via SendTo)
     CreatedAt        time.Time      // When message was created

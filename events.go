@@ -25,8 +25,8 @@ type ReceivedEvent[T any] struct {
 	Subject     string     `json:"subject,omitempty"`
 	DataSchema  string     `json:"dataschema,omitempty"`
 	// DataContentType is the media type of the data, if the event has one.
-	// JSON data decodes into T. Text (text/*) is a string, and other data
-	// is its bytes in base64: receive them with T = string or T = []byte.
+	// JSON data decodes into T. Text (text/*) is a string. Other data is
+	// bytes, which T = []byte, string or any (holding a []byte) receives.
 	DataContentType string         `json:"datacontenttype,omitempty"`
 	Extensions      map[string]any `json:"extensions,omitempty"`
 
@@ -104,26 +104,46 @@ func convertToReceivedEvent[T any](msg *ReceivedMessage[json.RawMessage], eventT
 	if msg == nil {
 		return nil, fmt.Errorf("nil message")
 	}
-	if _, ok := msg.Metadata["ce_type"].(string); ok {
-		return eventFromAttributes[T](msg.Metadata, "ce_", msg.Data)
-	}
-	var envelope map[string]json.RawMessage
-	if json.Unmarshal(msg.Data, &envelope) == nil && isEventEnvelope(envelope) {
-		attributes := make(map[string]any, len(envelope))
-		for name, value := range envelope {
-			if name != "data" {
-				var decoded any
-				_ = json.Unmarshal(value, &decoded)
-				attributes[name] = decoded
+	var event *ReceivedEvent[T]
+	data := msg.Data
+	switch {
+	case isEventAttributes(msg.Metadata):
+		event = eventFromAttributes[T](msg.Metadata, "ce_")
+	case !msg.binary:
+		var envelope map[string]json.RawMessage
+		if json.Unmarshal(msg.Data, &envelope) == nil && isEventEnvelope(envelope) {
+			attributes := make(map[string]any, len(envelope))
+			for name, value := range envelope {
+				if name != "data" {
+					var decoded any
+					_ = json.Unmarshal(value, &decoded)
+					attributes[name] = decoded
+				}
 			}
+			event, data = eventFromAttributes[T](attributes, ""), envelope["data"]
 		}
-		return eventFromAttributes[T](attributes, "", envelope["data"])
 	}
-	event := &ReceivedEvent[T]{Type: eventType}
-	if err := decodeEventData(msg.Data, &event.Data); err != nil {
+	if event == nil {
+		event = &ReceivedEvent[T]{Type: eventType}
+	}
+	if msg.binary {
+		if err := decodeBytes(msg.binaryData, &event.Data); err != nil {
+			return nil, fmt.Errorf("failed to deserialize event data: %w", err)
+		}
+		return event, nil
+	}
+	if err := decodeEventData(data, &event.Data); err != nil {
 		return nil, err
 	}
 	return event, nil
+}
+
+// isEventAttributes reports whether a message's metadata holds the
+// attributes of an event under ce_ keys, as the CloudEvents endpoint of
+// every runtime stores them.
+func isEventAttributes(metadata map[string]any) bool {
+	_, ok := metadata["ce_type"].(string)
+	return ok
 }
 
 // isEventEnvelope reports whether a message's data is an event as earlier
@@ -136,10 +156,10 @@ func isEventEnvelope(envelope map[string]json.RawMessage) bool {
 		json.Unmarshal(envelope["type"], &eventType) == nil && eventType != nil && *eventType != ""
 }
 
-// eventFromAttributes builds an event from its attributes, named with prefix
-// (the ce_ keys of a message's metadata, or the names of an envelope), and
-// its data.
-func eventFromAttributes[T any](attributes map[string]any, prefix string, data json.RawMessage) (*ReceivedEvent[T], error) {
+// eventFromAttributes builds an event, without its data, from its
+// attributes, named with prefix (the ce_ keys of a message's metadata, or the
+// names of an envelope).
+func eventFromAttributes[T any](attributes map[string]any, prefix string) *ReceivedEvent[T] {
 	attribute := func(name string) string {
 		value, _ := attributes[prefix+name].(string)
 		return value
@@ -161,13 +181,11 @@ func eventFromAttributes[T any](attributes map[string]any, prefix string, data j
 	if extensions, ok := attributes[prefix+"extensions"].(map[string]any); ok {
 		event.Extensions = extensions
 	}
-	if err := decodeEventData(data, &event.Data); err != nil {
-		return nil, err
-	}
-	return event, nil
+	return event
 }
 
-// decodeEventData decodes an event's data into T (none leaves T's zero value).
+// decodeEventData decodes an event's JSON data into T (none leaves T's zero
+// value).
 func decodeEventData[T any](data json.RawMessage, into *T) error {
 	if len(data) == 0 {
 		return nil

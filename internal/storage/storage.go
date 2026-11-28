@@ -344,6 +344,11 @@ type ChannelManager interface {
 	// For direct messages, use dynamic channel names (e.g., "channel:instance_id").
 	PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte) (int64, error)
 
+	// PublishBinaryToChannel publishes a message whose data is bytes: a
+	// binary message (data_type 'binary', the bytes in data_binary), which
+	// every runtime receives as its byte type (SEMANTICS §3).
+	PublishBinaryToChannel(ctx context.Context, channelName string, data []byte, metadata []byte) (int64, error)
+
 	// SubscribeToChannel subscribes an instance to a channel. A broadcast
 	// subscription receives the messages published after it, except on the
 	// instance's own direct channel "{channel}:{instanceID}": that channel is

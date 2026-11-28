@@ -49,7 +49,9 @@ type ReceivedMessage[T any] struct {
 	// Channel name
 	ChannelName string `json:"channel_name"`
 
-	// Message data
+	// Message data. JSON data decodes into T. Bytes (a message published
+	// as a []byte, or bytes from another runtime: SEMANTICS §3) are received
+	// with T = []byte, string or any (which holds a []byte).
 	Data T `json:"data"`
 
 	// Metadata (optional)
@@ -60,6 +62,11 @@ type ReceivedMessage[T any] struct {
 
 	// When the message was created
 	CreatedAt time.Time `json:"created_at"`
+
+	// binary tells a message whose data is bytes, which binaryData holds,
+	// from one whose data is JSON.
+	binary     bool
+	binaryData []byte
 }
 
 // Subscribe registers the workflow to receive messages from a channel.
@@ -302,6 +309,14 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 	// Check if result is cached (replay)
 	// First try raw JSON to avoid re-serialization
 	if rawJSON, ok := ctx.GetCachedResultRaw(activityID); ok && len(rawJSON) > 0 {
+		var record receiveRecord
+		recordErr := json.Unmarshal(rawJSON, &record)
+
+		// A record of bytes, in base64, whichever runtime wrote it.
+		if recordErr == nil && record.DataType == storage.DataTypeBinary {
+			return replayBinaryMessage[T](&record)
+		}
+
 		// Try Go format first (ReceivedMessage with channel_name, created_at)
 		var msg ReceivedMessage[T]
 		if err := json.Unmarshal(rawJSON, &msg); err == nil && msg.ChannelName != "" {
@@ -309,68 +324,14 @@ func Receive[T any](ctx *WorkflowContext, channelName string, opts ...ReceiveOpt
 		}
 
 		// Try Python/cross-language format (channel, published_at)
-		var pythonFormat struct {
-			ID          any             `json:"id"`
-			Channel     string          `json:"channel"`
-			ChannelName string          `json:"channel_name"`
-			Data        json.RawMessage `json:"data"`
-			Metadata    map[string]any  `json:"metadata"`
-			PublishedAt string          `json:"published_at"`
-			CreatedAt   *time.Time      `json:"created_at"`
-		}
-		if err := json.Unmarshal(rawJSON, &pythonFormat); err == nil {
-			// Resolve channel name (prefer channel_name, fallback to channel)
-			resolvedChannel := pythonFormat.ChannelName
-			if resolvedChannel == "" {
-				resolvedChannel = pythonFormat.Channel
-			}
-
-			// Unmarshal data to type T
-			var data T
-			if len(pythonFormat.Data) > 0 {
-				if err := json.Unmarshal(pythonFormat.Data, &data); err != nil {
+		if recordErr == nil {
+			msg := messageFromRecord[T](&record)
+			if len(record.Data) > 0 {
+				if err := json.Unmarshal(record.Data, &msg.Data); err != nil {
 					return nil, fmt.Errorf("failed to deserialize cached message data: %w", err)
 				}
 			}
-
-			// Resolve time (prefer created_at, fallback to published_at)
-			var createdAt time.Time
-			if pythonFormat.CreatedAt != nil {
-				createdAt = *pythonFormat.CreatedAt
-			} else if pythonFormat.PublishedAt != "" {
-				// Try multiple ISO 8601 formats
-				for _, layout := range []string{
-					time.RFC3339,
-					time.RFC3339Nano,
-					"2006-01-02T15:04:05.999999",
-					"2006-01-02T15:04:05",
-				} {
-					if t, err := time.Parse(layout, pythonFormat.PublishedAt); err == nil {
-						createdAt = t
-						break
-					}
-				}
-			}
-
-			// Resolve ID (handle both int64 and string UUID)
-			var id int64
-			switch v := pythonFormat.ID.(type) {
-			case float64:
-				id = int64(v)
-			case int64:
-				id = v
-			case string:
-				// UUID string - use 0 as fallback (ID is mostly for logging)
-				id = 0
-			}
-
-			return &ReceivedMessage[T]{
-				ID:          id,
-				ChannelName: resolvedChannel,
-				Data:        data,
-				Metadata:    pythonFormat.Metadata,
-				CreatedAt:   createdAt,
-			}, nil
+			return msg, nil
 		}
 	}
 	// Also check GetCachedResult which handles cached errors
@@ -530,7 +491,7 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 	for _, opt := range opts {
 		opt(options)
 	}
-	dataJSON, metadataJSON, err := encodeMessage(data, options.metadata)
+	payload, metadataJSON, err := encodeMessage(data, options.metadata)
 	if err != nil {
 		return err
 	}
@@ -548,33 +509,40 @@ func Publish[T any](ctx *WorkflowContext, channelName string, data T, opts ...Pu
 		if s == nil {
 			return fmt.Errorf("storage not available")
 		}
-		if err := publishAndWake(c, s, channelName, dataJSON, metadataJSON); err != nil {
+		if err := publishAndWake(c, s, channelName, payload, metadataJSON); err != nil {
 			return fmt.Errorf("failed to publish to channel: %w", err)
 		}
 		return nil
 	})
 }
 
-// encodeMessage serializes a message's data and metadata.
-func encodeMessage(data any, metadata map[string]any) (dataJSON, metadataJSON []byte, err error) {
-	dataJSON, err = json.Marshal(data)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: failed to serialize message data: %w", ErrInvalidArgument, err)
+// encodeMessage serializes a message's data and metadata. Data of type
+// []byte is published as bytes, a binary message that every runtime receives
+// as its byte type (SEMANTICS §3); any other data as JSON.
+func encodeMessage(data any, metadata map[string]any) (payload messagePayload, metadataJSON []byte, err error) {
+	if b, ok := data.([]byte); ok {
+		payload = messagePayload{data: b, binary: true}
+	} else {
+		dataJSON, err := json.Marshal(data)
+		if err != nil {
+			return messagePayload{}, nil, fmt.Errorf("%w: failed to serialize message data: %w", ErrInvalidArgument, err)
+		}
+		payload = messagePayload{data: dataJSON}
 	}
 	if metadata != nil {
 		metadataJSON, err = json.Marshal(metadata)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%w: failed to serialize message metadata: %w", ErrInvalidArgument, err)
+			return messagePayload{}, nil, fmt.Errorf("%w: failed to serialize message metadata: %w", ErrInvalidArgument, err)
 		}
 	}
-	return dataJSON, metadataJSON, nil
+	return payload, metadataJSON, nil
 }
 
 // publishAndWake stores a message on the physical channel and wakes the
 // subscribers waiting on it — after commit when ctx is inside a transaction,
 // so a rollback delivers nothing.
-func publishAndWake(ctx *WorkflowContext, s storage.Storage, channel string, dataJSON, metadataJSON []byte) error {
-	messageID, err := s.PublishToChannel(ctx.Context(), channel, dataJSON, metadataJSON)
+func publishAndWake(ctx *WorkflowContext, s storage.Storage, channel string, payload messagePayload, metadataJSON []byte) error {
+	message, err := payload.publish(ctx.Context(), s, channel, metadataJSON)
 	if err != nil {
 		return err
 	}
@@ -582,12 +550,12 @@ func publishAndWake(ctx *WorkflowContext, s storage.Storage, channel string, dat
 		_ = s.RegisterPostCommitCallback(ctx.Context(), func() error {
 			// The transaction has ended: wake outside it.
 			afterCommit := ctx.WithContext(context.WithoutCancel(storage.WithoutTransaction(ctx.Context())))
-			wakeWaitingSubscribers(afterCommit, s, channel, messageID, dataJSON, metadataJSON)
+			wakeWaitingSubscribers(afterCommit, s, message)
 			return nil
 		})
 		return nil
 	}
-	wakeWaitingSubscribers(ctx, s, channel, messageID, dataJSON, metadataJSON)
+	wakeWaitingSubscribers(ctx, s, message)
 	return nil
 }
 
@@ -600,14 +568,8 @@ func publishAndWake(ctx *WorkflowContext, s storage.Storage, channel string, dat
 // For broadcast mode, all subscribers are woken up.
 // Note: SendTo uses dynamic channel names (e.g., "channel:instance_id") to ensure
 // only the target instance receives the message, so no filtering is needed here.
-func wakeWaitingSubscribers(
-	ctx *WorkflowContext,
-	s storage.Storage,
-	channelName string,
-	messageID int64,
-	dataJSON []byte,
-	metadataJSON []byte,
-) {
+func wakeWaitingSubscribers(ctx *WorkflowContext, s storage.Storage, message *storage.ChannelMessage) {
+	channelName := message.Channel
 	// Find waiting subscribers
 	waitingSubs, err := s.GetChannelSubscribersWaiting(ctx.Context(), channelName)
 	if err != nil {
@@ -618,14 +580,6 @@ func wakeWaitingSubscribers(
 
 	if len(waitingSubs) == 0 {
 		return
-	}
-
-	// Create message for delivery
-	message := &storage.ChannelMessage{
-		ID:       messageID,
-		Channel:  channelName,
-		Data:     dataJSON,
-		Metadata: metadataJSON,
 	}
 
 	// Each delivery is its own lock epoch (SEMANTICS §1). The workflow
@@ -703,7 +657,7 @@ func receivePending[T any](
 		}
 
 		var data T
-		if err := json.Unmarshal(msg.Data, &data); err != nil {
+		if err := decodeMessageData(msg, &data); err != nil {
 			return &messageDecodeError{fmt.Errorf("failed to deserialize message data: %w", err)}
 		}
 		var metadata map[string]any
@@ -719,7 +673,13 @@ func receivePending[T any](
 			Metadata:    metadata,
 			CreatedAt:   msg.PublishedAt,
 		}
-		if err := tx.RecordActivityResult(activityID, result, nil); err != nil {
+		if msg.IsBinary() {
+			result.binary, result.binaryData = true, msg.DataBinary
+		}
+		// The record holds the message as it is stored, the form a delivery
+		// records too: JSON data as it is, bytes in base64.
+		record := json.RawMessage(storage.ReceivedMessageRecord(channelName, msg))
+		if err := tx.RecordActivityResult(activityID, record, nil); err != nil {
 			return fmt.Errorf("failed to record activity result: %w", err)
 		}
 		// Competing mode consumes the message.
@@ -823,7 +783,7 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 	for _, opt := range opts {
 		opt(options)
 	}
-	dataJSON, metadataJSON, err := encodeMessage(data, options.metadata)
+	payload, metadataJSON, err := encodeMessage(data, options.metadata)
 	if err != nil {
 		return err
 	}
@@ -839,7 +799,7 @@ func SendTo[T any](ctx *WorkflowContext, targetInstanceID, channelName string, d
 		// Publish to the direct channel (Edda approach: dynamic channel
 		// names), which only the target instance receives from.
 		directChannel := fmt.Sprintf("%s:%s", channelName, targetInstanceID)
-		if err := publishAndWake(c, s, directChannel, dataJSON, metadataJSON); err != nil {
+		if err := publishAndWake(c, s, directChannel, payload, metadataJSON); err != nil {
 			return fmt.Errorf("failed to send to instance: %w", err)
 		}
 		return nil

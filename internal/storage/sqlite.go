@@ -1273,6 +1273,26 @@ func (s *SQLiteStorage) PublishToChannel(ctx context.Context, channelName string
 	return result.LastInsertId()
 }
 
+// PublishBinaryToChannel publishes a message whose data is bytes.
+func (s *SQLiteStorage) PublishBinaryToChannel(ctx context.Context, channelName string, data, metadata []byte) (int64, error) {
+	conn := s.getConn(ctx)
+	var metadataStr sql.NullString
+	if metadata != nil {
+		metadataStr = sql.NullString{String: string(metadata), Valid: true}
+	}
+	if data == nil {
+		data = []byte{} // a binary message always has its bytes
+	}
+	result, err := conn.ExecContext(ctx, `
+		INSERT INTO channel_messages (channel, data_binary, metadata, message_id, data_type)
+		VALUES (?, ?, ?, ?, 'binary')
+	`, channelName, data, metadataStr, uuid.New().String())
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
 // SubscribeToChannel subscribes an instance to a channel.
 // For broadcast mode, it initializes the delivery cursor to the current max message ID
 // so that only messages published after subscription are received.
@@ -1628,7 +1648,7 @@ func (s *SQLiteStorage) RequeueChannelWaitsWithPending(ctx context.Context) (int
 func (s *SQLiteStorage) GetPendingChannelMessages(ctx context.Context, channelName string, afterID int64, limit int) ([]*ChannelMessage, error) {
 	conn := s.getConn(ctx)
 	rows, err := conn.QueryContext(ctx, `
-		SELECT id, channel, data, data_binary, metadata, published_at
+		SELECT id, channel, data_type, data, data_binary, metadata, published_at
 		FROM channel_messages
 		WHERE channel = ? AND id > ?
 		ORDER BY id ASC
@@ -1644,7 +1664,7 @@ func (s *SQLiteStorage) GetPendingChannelMessages(ctx context.Context, channelNa
 		var msg ChannelMessage
 		var data, metadata, publishedAt sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &publishedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &msg.DataType, &data, &dataBinary, &metadata, &publishedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -1699,7 +1719,7 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 		}
 
 		query = `
-			SELECT id, channel, data, data_binary, metadata, published_at
+			SELECT id, channel, data_type, data, data_binary, metadata, published_at
 			FROM channel_messages
 			WHERE channel = ? AND id > ?
 			ORDER BY id ASC
@@ -1712,7 +1732,7 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 		// stale claims and claims by terminal owners are void.
 		staleBefore := time.Now().UTC().Add(-ChannelClaimStaleSeconds * time.Second).Format("2006-01-02 15:04:05")
 		query = `
-			SELECT m.id, m.channel, m.data, m.data_binary, m.metadata, m.published_at
+			SELECT m.id, m.channel, m.data_type, m.data, m.data_binary, m.metadata, m.published_at
 			FROM channel_messages m
 			LEFT JOIN channel_message_claims c ON m.message_id = c.message_id
 			LEFT JOIN workflow_instances ci ON c.instance_id = ci.instance_id
@@ -1739,7 +1759,7 @@ func (s *SQLiteStorage) GetPendingChannelMessagesForInstance(ctx context.Context
 		var msg ChannelMessage
 		var data, metadata, publishedAt sql.NullString
 		var dataBinary []byte
-		err := rows.Scan(&msg.ID, &msg.Channel, &data, &dataBinary, &metadata, &publishedAt)
+		err := rows.Scan(&msg.ID, &msg.Channel, &msg.DataType, &data, &dataBinary, &metadata, &publishedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -2004,7 +2024,7 @@ func (s *SQLiteStorage) DeliverChannelMessageWithLock(
 	}
 
 	// Step 3: Record message in history using the correct activity ID
-	wrappedJSON := receivedMessageRecord(channelName, message)
+	wrappedJSON := ReceivedMessageRecord(channelName, message)
 
 	_, err = conn.ExecContext(ctx, `
 		INSERT INTO workflow_history (instance_id, activity_id, event_type, event_data, data_type)

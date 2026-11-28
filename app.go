@@ -1493,8 +1493,13 @@ type CloudEvent struct {
 	DataSchema      string          `json:"dataschema,omitempty"`
 	Subject         string          `json:"subject,omitempty"`
 	DataContentType string          `json:"datacontenttype,omitempty"`
-	Data            json.RawMessage `json:"data,omitempty"`
-	Extensions      map[string]any  `json:"-"` // CloudEvents extension attributes
+	Data            json.RawMessage `json:"data,omitempty"` // bytes as a JSON string in base64
+	Extensions      map[string]any  `json:"-"`              // CloudEvents extension attributes
+
+	// binary tells an event whose data is bytes, which binaryData holds
+	// (SEMANTICS §3c), from one whose data is JSON.
+	binary     bool
+	binaryData []byte
 }
 
 // UnmarshalJSON implements custom JSON unmarshaling to capture extension attributes.
@@ -1643,11 +1648,11 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 
 	// Workflows waiting via WaitEvent (which receives from a channel) read
 	// the event from its channel.
-	dataJSON, metadataJSON, err := cloudEventChannelMessage(event)
+	payload, metadataJSON, err := cloudEventChannelMessage(event)
 	if err != nil {
 		return err
 	}
-	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, metadataJSON)
+	message, err := payload.publish(ctx, a.storage, channelName, metadataJSON)
 	if err != nil {
 		return fmt.Errorf("failed to publish event to channel: %w", err)
 	}
@@ -1674,7 +1679,7 @@ func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token str
 	a.eventWG.Add(1)
 	go func() {
 		defer a.eventWG.Done()
-		a.wakeWaitingChannelSubscribers(appCtx, channelName, messageID, dataJSON, metadataJSON)
+		a.wakeWaitingChannelSubscribers(appCtx, message)
 		if target != "" {
 			a.resumeWaitOnTypeAlone(appCtx, target, event.Type)
 		}
@@ -1759,15 +1764,20 @@ func cloudEventTarget(event *CloudEvent) string {
 // cloudEventChannelMessage is the channel message that stores an event
 // (SEMANTICS §3c), in the form that the CloudEvents endpoints of Edda and
 // Shikibu store too. The data is the event's data, what a Receive of the
-// channel returns. The metadata holds the event's attributes under ce_ keys,
-// which WaitEvent of every runtime reads: ce_specversion, ce_id, ce_source
-// and ce_type, those of ce_time, ce_datacontenttype, ce_dataschema and
-// ce_subject that the event has, and ce_extensions, its extension
-// attributes (the capability token is not among them).
-func cloudEventChannelMessage(event *CloudEvent) (data, metadata []byte, err error) {
-	data = event.Data
-	if len(data) == 0 {
-		data = []byte("null")
+// channel returns: JSON, or bytes in a binary message. The metadata holds
+// the event's attributes under ce_ keys, which WaitEvent of every runtime
+// reads: ce_specversion, ce_id, ce_source and ce_type, those of ce_time,
+// ce_datacontenttype, ce_dataschema and ce_subject that the event has, and
+// ce_extensions, its extension attributes (the capability token is not
+// among them).
+func cloudEventChannelMessage(event *CloudEvent) (payload messagePayload, metadata []byte, err error) {
+	switch {
+	case event.binary:
+		payload = messagePayload{data: event.binaryData, binary: true}
+	case len(event.Data) == 0:
+		payload = messagePayload{data: []byte("null")}
+	default:
+		payload = messagePayload{data: event.Data}
 	}
 	attributes := map[string]any{
 		"ce_specversion": event.SpecVersion,
@@ -1792,21 +1802,16 @@ func cloudEventChannelMessage(event *CloudEvent) (data, metadata []byte, err err
 	}
 	metadata, err = json.Marshal(attributes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to serialize event attributes: %w", err)
+		return messagePayload{}, nil, fmt.Errorf("failed to serialize event attributes: %w", err)
 	}
-	return data, metadata, nil
+	return payload, metadata, nil
 }
 
 // wakeWaitingChannelSubscribers delivers a message to waiting channel subscribers.
 // This is the App-level version of wakeWaitingSubscribers from channels.go.
 // Targeted delivery is handled via dynamic channel names (e.g., "channel:instance_id").
-func (a *App) wakeWaitingChannelSubscribers(
-	ctx context.Context,
-	channelName string,
-	messageID int64,
-	dataJSON []byte,
-	metadataJSON []byte,
-) {
+func (a *App) wakeWaitingChannelSubscribers(ctx context.Context, message *storage.ChannelMessage) {
+	channelName := message.Channel
 	// Find waiting subscribers
 	waitingSubs, err := a.storage.GetChannelSubscribersWaiting(ctx, channelName)
 	if err != nil {
@@ -1816,14 +1821,6 @@ func (a *App) wakeWaitingChannelSubscribers(
 
 	if len(waitingSubs) == 0 {
 		return
-	}
-
-	// Create message for delivery
-	message := &storage.ChannelMessage{
-		ID:       messageID,
-		Channel:  channelName,
-		Data:     dataJSON,
-		Metadata: metadataJSON,
 	}
 
 	lockTimeoutSec := int(a.config.staleLockTimeout.Seconds())

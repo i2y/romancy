@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -856,6 +857,74 @@ func TestStorage_WaitOnSeveralChannels(t *testing.T) {
 			if sub := waitOf("inst-wt", ch); sub.ActivityID != "" || sub.TimeoutAt != nil {
 				t.Fatalf("clearing the first channel left the wait on %s: %+v", ch, sub)
 			}
+		}
+	})
+}
+
+// SEMANTICS §3: a message's data is JSON or bytes. Bytes are stored in a
+// binary message (data_type 'binary', data_binary), every read returns them
+// as bytes, and the record of their delivery holds them in base64 with
+// "data_type": "binary".
+func TestStorage_BinaryMessages(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, s *testDB) {
+		const ch = "blobs"
+		createTestInstance(t, ctx, s, "bin-idle", "wf")
+		createTestInstance(t, ctx, s, "bin-waiting", "wf")
+		if err := s.SubscribeToChannel(ctx, "bin-idle", ch, ChannelModeBroadcast); err != nil {
+			t.Fatal(err)
+		}
+		waitOn(t, ctx, s, "bin-waiting", ch, ChannelModeBroadcast, nil)
+
+		data := []byte{0xff, 0x00, 'a'}
+		id, err := s.PublishBinaryToChannel(ctx, ch, data, []byte(`{"k":"v"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		emptyID, err := s.PublishBinaryToChannel(ctx, ch, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.queryString(t, ctx, `SELECT data_type FROM channel_messages WHERE id = ?`, id); got != DataTypeBinary {
+			t.Fatalf("data_type = %q; want binary", got)
+		}
+		if n := s.queryString(t, ctx, `SELECT COUNT(*) FROM channel_messages WHERE id = ? AND data IS NULL AND data_binary IS NOT NULL`, emptyID); n != "1" {
+			t.Fatalf("empty bytes are not a binary row with empty data_binary")
+		}
+
+		check := func(read string, msgs []*ChannelMessage, err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("%s: %v", read, err)
+			}
+			if len(msgs) != 2 || msgs[0].ID != id || msgs[1].ID != emptyID {
+				t.Fatalf("%s returned %d messages: %+v", read, len(msgs), msgs)
+			}
+			if !msgs[0].IsBinary() || !bytes.Equal(msgs[0].DataBinary, data) || len(msgs[0].Data) != 0 {
+				t.Fatalf("%s: message = %q %x %q; want binary %x", read, msgs[0].DataType, msgs[0].DataBinary, msgs[0].Data, data)
+			}
+			if !msgs[1].IsBinary() || len(msgs[1].DataBinary) != 0 {
+				t.Fatalf("%s: empty message = %q %x", read, msgs[1].DataType, msgs[1].DataBinary)
+			}
+		}
+		msgs, err := s.GetPendingChannelMessages(ctx, ch, 0, 10)
+		check("GetPendingChannelMessages", msgs, err)
+		msgs, err = s.GetPendingChannelMessagesForInstance(ctx, "bin-idle", ch)
+		check("GetPendingChannelMessagesForInstance", msgs, err)
+		msgs, err = s.ChannelMessagesAfter(ctx, ch, 0)
+		check("ChannelMessagesAfter", msgs, err)
+
+		message := &ChannelMessage{ID: id, Channel: ch, DataType: DataTypeBinary, DataBinary: data, Metadata: []byte(`{"k":"v"}`)}
+		res, err := s.DeliverChannelMessageWithLock(ctx, "bin-waiting", ch, message, NewLockIdentity("w"), 300)
+		if err != nil || res == nil {
+			t.Fatalf("delivery into the wait = %+v, %v", res, err)
+		}
+		recorded := s.queryString(t, ctx, `SELECT event_data FROM workflow_history WHERE instance_id = ? AND activity_id = ?`, "bin-waiting", "receive_"+ch+":1")
+		var record map[string]any
+		if err := json.Unmarshal([]byte(recorded), &record); err != nil {
+			t.Fatalf("record %s: %v", recorded, err)
+		}
+		if record["data_type"] != DataTypeBinary || record["data"] != "/wBh" {
+			t.Fatalf("record = %s; want the bytes in base64 with data_type binary", recorded)
 		}
 	})
 }

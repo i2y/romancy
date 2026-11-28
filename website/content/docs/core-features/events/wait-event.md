@@ -115,7 +115,7 @@ func WaitEvent[T any](
 
 `*ReceivedEvent` containing:
 
-- `Data`: Event data deserialized into the type parameter `T`: JSON data into any `T` it decodes into, text (`text/*`) into a `string`, other data into a `[]byte` (see [The Event's Data](/docs/core-features/events/cloudevents-http-binding#the-events-data))
+- `Data`: Event data deserialized into the type parameter `T`: JSON data into any `T` it decodes into, text (`text/*`) into a `string`, bytes into a `[]byte`, a `string` or an `any`, which holds a `[]byte` (see [The Event's Data](/docs/core-features/events/cloudevents-http-binding#the-events-data))
 - `Type`: CloudEvents type
 - `Source`: Event source
 - `Time`: Event timestamp

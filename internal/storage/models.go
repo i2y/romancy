@@ -172,17 +172,29 @@ const (
 	ChannelModeDirect    ChannelMode = "direct"    // Direct messages to specific instance (via SendTo)
 )
 
+// The data types of a channel message (SEMANTICS §3).
+const (
+	DataTypeJSON   = "json"   // JSON data, in Data
+	DataTypeBinary = "binary" // bytes, in DataBinary
+)
+
 // ChannelMessage represents a message in a channel.
 // SendTo uses dynamic channel names (e.g., "channel:instance_id") instead of target_instance_id.
 type ChannelMessage struct {
 	ID          int64     `json:"id"`
 	Channel     string    `json:"channel"`               // Channel name (unified with Edda)
 	MessageID   string    `json:"message_id"`            // UUID for message (Edda compatibility)
-	DataType    string    `json:"data_type"`             // "json" or "binary" (Edda compatibility)
+	DataType    string    `json:"data_type"`             // DataTypeJSON or DataTypeBinary
 	Data        []byte    `json:"data,omitempty"`        // JSON data (unified with Edda)
 	DataBinary  []byte    `json:"data_binary,omitempty"` // Binary data
 	Metadata    []byte    `json:"metadata,omitempty"`    // JSON-encoded metadata
 	PublishedAt time.Time `json:"published_at"`          // When the message was published (unified with Edda)
+}
+
+// IsBinary reports whether the message's data is bytes (in DataBinary)
+// rather than JSON (in Data).
+func (m *ChannelMessage) IsBinary() bool {
+	return m.DataType == DataTypeBinary
 }
 
 // ChannelSubscription represents a workflow's subscription to a channel.

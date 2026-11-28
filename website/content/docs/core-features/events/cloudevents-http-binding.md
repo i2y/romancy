@@ -112,21 +112,28 @@ The body of a request in neither mode is read as a structured event, whatever it
 
 ### The Event's Data
 
-`WaitEvent[T]` decodes the event's data into `T` according to its `datacontenttype`, which `ReceivedEvent.DataContentType` holds:
+The endpoint reads the event's data by its `datacontenttype` (without parameters), the same way in both content modes, and `WaitEvent[T]` decodes it into `T`. `ReceivedEvent.DataContentType` holds the type.
 
 | `datacontenttype` | The data is | Receive it with |
 |-------------------|-------------|-----------------|
-| JSON (`application/json`, `text/json`, `*+json`), or none and the data is JSON | its JSON value | any `T` it decodes into |
-| `text/*`, in UTF-8 | the text | `T = string` |
-| anything else, or `data_base64` without a type | the bytes | `T = []byte` |
+| JSON (`*/json`, `*/*+json`) | its JSON value | any `T` it decodes into |
+| `text/*` | its text if it is UTF-8, otherwise its bytes | `T = string` |
+| anything else | its bytes | `T = []byte`, `string` or `any` (which holds a `[]byte`) |
+| none, structured mode | the JSON value of `data`, or the bytes of `data_base64` | as above |
+| none, binary mode | the body's JSON value if it is JSON, otherwise its bytes | as above |
 
-Data that its `datacontenttype` says is JSON but is not JSON is refused with `400`.
+- In structured mode, `data_base64` is decoded and then read by the type: with `application/json`, it is a JSON value.
+- With a type that is not JSON, the `data` member is the text of the data and must be a string. With `application/xml`, `"data": "<a/>"` is the bytes `<a/>`.
+- Empty data, an empty body or an empty `data_base64` is no data (JSON `null`).
+- Data that its type says is JSON but is not JSON, and a `data` member that is not a string with a type that is not JSON, are refused with `400`.
+
+Bytes are stored as bytes (a binary message), which a workflow of Edda receives as `bytes` and one of Shikibu as a String in the binary encoding. A workflow that the event starts (`WithEventHandler(true)`) gets them as its input in a JSON string in base64, which an input of type `[]byte` decodes.
 
 ### How the Event Is Stored
 
 The endpoint stores the event as one message on its channel, in the form that the endpoints of Edda and Shikibu store too, so a workflow of any of them receives it:
 
-- The message's data is the event's data. A `Receive` of the channel returns it.
+- The message's data is the event's data: JSON, or bytes (see [Publish Bytes](/docs/core-features/channels#publish-bytes)). A `Receive` of the channel returns it.
 - The message's metadata holds the event's attributes under `ce_` keys: `ce_specversion`, `ce_id`, `ce_source` and `ce_type`, and those of `ce_time`, `ce_datacontenttype`, `ce_dataschema` and `ce_subject` that the event has. `ce_extensions` holds the extension attributes, except `capabilitytoken`.
 
 `WaitEvent` returns the data with these attributes. On a message that workflow code published (`Publish`), which has no attributes, it returns the data with `Type` set to the type it waited for.

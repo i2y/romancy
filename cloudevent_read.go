@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime"
 	"net/http"
 	"slices"
 	"strings"
@@ -45,13 +46,12 @@ func readCloudEvent(r *http.Request) (*CloudEvent, error) {
 	message := cehttp.NewMessage(r.Header, io.NopCloser(bytes.NewReader(body)))
 	var e *event.Event
 	switch message.ReadEncoding() {
-	case binding.EncodingStructured, binding.EncodingBinary:
+	case binding.EncodingBinary:
 		e, err = binding.ToEvent(r.Context(), message)
 	case binding.EncodingBatch:
 		err = errors.New("the batched content mode is not supported: send one event per request")
 	default:
-		e = &event.Event{}
-		err = json.Unmarshal(body, e)
+		e, err = readStructuredEvent(body)
 	}
 	if err == nil {
 		err = e.Validate()
@@ -76,9 +76,45 @@ func validationMessage(invalid event.ValidationError) string {
 	return "invalid CloudEvent: " + strings.Join(problems, "; ")
 }
 
+// readStructuredEvent reads a structured event: the body is the event. The
+// SDK reads the data member as a JSON value only for application/json and
+// text/json, and refuses the JSON value of any other JSON type (*/json,
+// */*+json), which the JSON format reads as JSON too: it reads such an event
+// as application/json, and the event keeps its own type.
+func readStructuredEvent(body []byte) (*event.Event, error) {
+	e := &event.Event{}
+	var members map[string]json.RawMessage
+	var contentType string
+	if json.Unmarshal(body, &members) == nil &&
+		json.Unmarshal(members["datacontenttype"], &contentType) == nil &&
+		isJSONMediaType(mediaTypeOf(contentType)) && !sdkReadsAsJSON(contentType) {
+		members["datacontenttype"], _ = json.Marshal(event.ApplicationJSON)
+		asJSON, err := json.Marshal(members)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(asJSON, e); err != nil {
+			return nil, err
+		}
+		e.SetDataContentType(contentType)
+		return e, nil
+	}
+	return e, json.Unmarshal(body, e)
+}
+
+// sdkReadsAsJSON reports whether the SDK reads the data member of a
+// structured event of this datacontenttype as a JSON value.
+func sdkReadsAsJSON(contentType string) bool {
+	switch mediaTypeOf(contentType) {
+	case event.ApplicationJSON, event.TextJSON, event.ApplicationCloudEventsJSON, event.ApplicationCloudEventsBatchJSON:
+		return true
+	}
+	return false
+}
+
 // cloudEventFromSDK converts an event that the CloudEvents SDK read.
 func cloudEventFromSDK(e *event.Event) (*CloudEvent, error) {
-	data, err := cloudEventDataJSON(e)
+	data, binary, err := cloudEventData(e)
 	if err != nil {
 		return nil, &cloudEventReadError{"ParseError", err}
 	}
@@ -92,6 +128,14 @@ func cloudEventFromSDK(e *event.Event) (*CloudEvent, error) {
 		DataContentType: e.DataContentType(),
 		Data:            data,
 		Extensions:      make(map[string]any, len(e.Extensions())),
+	}
+	if binary {
+		// Data keeps the bytes as JSON: the input of the workflow that
+		// handles the event, which a []byte decodes.
+		ce.binary, ce.binaryData = true, data
+		if ce.Data, err = json.Marshal(data); err != nil {
+			return nil, &cloudEventReadError{"ParseError", err}
+		}
 	}
 	if t := e.Time(); !t.IsZero() {
 		ce.Time = &t
@@ -116,32 +160,50 @@ func cloudEventExtensionValue(value any) any {
 	return value
 }
 
-// cloudEventDataJSON is an event's data as the JSON its channel message
-// carries. JSON data (a JSON datacontenttype, or none and data that is JSON)
-// is kept as it is. Text (a text/* datacontenttype, in UTF-8) is a string.
-// Any other data is its bytes, in base64, which a []byte decodes.
-func cloudEventDataJSON(e *event.Event) (json.RawMessage, error) {
-	data := e.Data()
+// cloudEventData is an event's data as its channel message stores it
+// (SEMANTICS §3c), by its datacontenttype, whichever content mode the event
+// came in. JSON data (a JSON type: */json, */*+json) is kept as it is; data
+// of a JSON type that is not JSON is refused. Text (text/*, in UTF-8) is a
+// JSON string. Any other data is bytes (binary is true). Without a
+// datacontenttype, data that is JSON is JSON (a structured event's data
+// member always is), and data_base64 and other data are bytes.
+func cloudEventData(e *event.Event) (data []byte, binary bool, err error) {
+	data = e.Data()
 	if len(data) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	mediaType := e.DataMediaType()
 	switch {
-	case mediaType == "" && !e.DataBase64 && json.Valid(data):
-		return data, nil
-	case mediaType != "" && isJSONMediaType(mediaType):
-		if !json.Valid(data) {
-			return nil, fmt.Errorf("the data is not JSON, but its datacontenttype is %s", mediaType)
+	case mediaType == "":
+		if !e.DataBase64 && json.Valid(data) {
+			return data, false, nil
 		}
-		return data, nil
+		return data, true, nil
+	case isJSONMediaType(mediaType):
+		if !json.Valid(data) {
+			return nil, false, fmt.Errorf("the data is not JSON, but its datacontenttype is %s", mediaType)
+		}
+		return data, false, nil
 	case strings.HasPrefix(mediaType, "text/") && utf8.Valid(data):
-		return json.Marshal(string(data))
+		text, err := json.Marshal(string(data))
+		return text, false, err
 	default:
-		return json.Marshal(data)
+		return data, true, nil
 	}
 }
 
-// isJSONMediaType reports whether data of mediaType is JSON.
+// isJSONMediaType reports whether data of mediaType is JSON: */json or
+// */*+json (the JSON format of CloudEvents, §3.1).
 func isJSONMediaType(mediaType string) bool {
-	return mediaType == "application/json" || mediaType == "text/json" || strings.HasSuffix(mediaType, "+json")
+	return strings.HasSuffix(mediaType, "/json") || strings.HasSuffix(mediaType, "+json")
+}
+
+// mediaTypeOf is the media type of a content type, lowercased and without
+// its parameters.
+func mediaTypeOf(contentType string) string {
+	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil {
+		return mediaType
+	}
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	return strings.ToLower(strings.TrimSpace(mediaType))
 }

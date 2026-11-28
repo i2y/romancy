@@ -25,6 +25,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -265,11 +266,12 @@ type WaitEventInput struct {
 }
 
 // WaitEventResult is what wait-event mode prints: the event that WaitEvent
-// returned, its data as JSON.
+// returned, in the JSON format of CloudEvents: its data under data, or, when
+// the data is bytes, in base64 under data_base64.
 type WaitEventResult struct {
-	Received bool                                    `json:"received"`
-	Event    *romancy.ReceivedEvent[json.RawMessage] `json:"event,omitempty"`
-	Error    string                                  `json:"error,omitempty"`
+	Received bool           `json:"received"`
+	Event    map[string]any `json:"event,omitempty"`
+	Error    string         `json:"error,omitempty"`
 }
 
 // waitEventWorkflow waits for one event of a type. The CloudEvents endpoint
@@ -277,7 +279,7 @@ type WaitEventResult struct {
 var waitEventWorkflow = romancy.DefineWorkflow("crosstest_wait_event",
 	func(ctx *romancy.WorkflowContext, input WaitEventInput) (WaitEventResult, error) {
 		log.Printf("[WaitEvent] Waiting for an event of type '%s' (instance: %s)", input.EventType, ctx.InstanceID())
-		event, err := romancy.WaitEvent[json.RawMessage](ctx, input.EventType,
+		event, err := romancy.WaitEvent[any](ctx, input.EventType,
 			romancy.WithEventTimeout(time.Duration(input.TimeoutSeconds)*time.Second))
 		if err != nil {
 			if romancy.IsSuspendSignal(err) {
@@ -285,9 +287,30 @@ var waitEventWorkflow = romancy.DefineWorkflow("crosstest_wait_event",
 			}
 			return WaitEventResult{Error: err.Error()}, nil
 		}
-		return WaitEventResult{Received: true, Event: event}, nil
+		printed, err := printedEvent(event)
+		if err != nil {
+			return WaitEventResult{Error: err.Error()}, nil
+		}
+		return WaitEventResult{Received: true, Event: printed}, nil
 	},
 )
+
+// printedEvent is a received event in the JSON format of CloudEvents.
+func printedEvent(event *romancy.ReceivedEvent[any]) (map[string]any, error) {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+	var printed map[string]any
+	if err := json.Unmarshal(encoded, &printed); err != nil {
+		return nil, err
+	}
+	if data, ok := event.Data.([]byte); ok {
+		delete(printed, "data")
+		printed["data_base64"] = base64.StdEncoding.EncodeToString(data)
+	}
+	return printed, nil
+}
 
 // PostEventResult is what post-event mode prints: the endpoint's answer.
 type PostEventResult struct {

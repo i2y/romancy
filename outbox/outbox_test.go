@@ -230,6 +230,9 @@ func (m *mockStorage) ChannelMessagesAfter(ctx context.Context, channel string, 
 func (m *mockStorage) PublishToChannel(ctx context.Context, channelName string, dataJSON []byte, metadata []byte) (int64, error) {
 	return 0, nil
 }
+func (m *mockStorage) PublishBinaryToChannel(ctx context.Context, channelName string, data []byte, metadata []byte) (int64, error) {
+	return 0, nil
+}
 func (m *mockStorage) SubscribeToChannel(ctx context.Context, instanceID, channelName string, mode storage.ChannelMode) error {
 	return nil
 }
