@@ -91,8 +91,10 @@ func TestWorkflowWithWaitEvent(t *testing.T) {
 		}),
 	}
 
-	// Process the cloud event
-	app.processCloudEvent(ctx, paymentEvent)
+	// Accept the cloud event
+	if err := app.acceptCloudEvent(ctx, paymentEvent, ""); err != nil {
+		t.Fatalf("failed to accept event: %v", err)
+	}
 
 	// Wait for the workflow to complete
 	time.Sleep(500 * time.Millisecond)

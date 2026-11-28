@@ -114,7 +114,7 @@ Romancy returns appropriate HTTP status codes according to the CloudEvents speci
 
 ### Success (202 Accepted)
 
-When an event is successfully accepted for asynchronous processing:
+Romancy answers 202 once the event is stored: it is published to its channel, and the instance of the workflow that handles its type (registered with `WithEventHandler(true)`) is created. From then on the event is kept even if the process stops: a running worker resumes the workflows that have not handled it yet.
 
 ```bash
 curl -X POST http://localhost:8001/ \
@@ -138,10 +138,10 @@ Content-Type: application/json
 }
 ```
 
-**When to use:**
+**When returned:**
 
-- ✅ Event was successfully parsed and accepted
-- ✅ Event handler is executing in the background
+- ✅ The event was parsed and stored
+- ✅ The workflow that handles the event runs, and the workflows waiting for it (`WaitEvent`) are woken, after the response
 - ✅ Final processing outcome is not yet known
 
 ### Client Error (400 Bad Request)
@@ -230,13 +230,39 @@ Content-Type: application/json
 
 **When returned:**
 
-- ⚠️ Database connection failures
+- ⚠️ The event could not be stored (for example, the database cannot be reached)
 - ⚠️ Internal server errors
 - ⚠️ Unexpected errors
 
 **Client action:**
 
 - 🔄 **Retry with exponential backoff**
+
+### Service Unavailable (503 Service Unavailable)
+
+When the app is not running: before `Start`, or once `Shutdown` has begun (**retryable**). Nothing is published and no workflow starts.
+
+**Response:**
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+
+{
+  "error": "app is not running",
+  "error_type": "ServiceUnavailable",
+  "retryable": "true"
+}
+```
+
+**Client action:**
+
+- 🔄 **Retry with exponential backoff**: another worker, or this one once it is started again, accepts the event
+
+`Shutdown` waits for the events it accepted before: they finish storing and waking the workflows that wait for them, within the shutdown timeout (`WithShutdownTimeout`), before the background tasks stop and storage closes.
+
+### Delivery Guarantee
+
+Events are delivered at least once: a sender that retries after a 500, a 503 or a lost response can store the same event twice. A workflow that must not handle an event twice deduplicates on an id it receives. A workflow that waits for the event gets its `id` (`ReceivedEvent.ID`); a workflow that the event starts (`WithEventHandler(true)`) gets only its `data`, so the sender puts an id there.
 
 ## Error Response Structure
 
@@ -256,7 +282,7 @@ All error responses include structured information to help clients decide whethe
 - **`error_type`** (string): Error type name for debugging
 - **`retryable`** (string, `"true"` or `"false"`): Whether the client should retry
   - `"false"`: Client error (400, 403) - Fix the request before retrying
-  - `"true"`: Server error (500) - Retry with exponential backoff
+  - `"true"`: Server error (500, 503) - Retry with exponential backoff
 
 ## Client Retry Logic
 
@@ -323,7 +349,7 @@ func SendCloudEventWithRetry(eventData map[string]any, maxRetries int) error {
 			json.Unmarshal(body, &errResp)
 			return fmt.Errorf("non-retryable error: %s", errResp.Error)
 
-		case http.StatusInternalServerError: // 500
+		case http.StatusInternalServerError, http.StatusServiceUnavailable: // 500, 503
 			// Server error - Retry with exponential backoff
 			var errResp ErrorResponse
 			json.Unmarshal(body, &errResp)
@@ -379,7 +405,7 @@ Romancy complies with the following CloudEvents specifications:
 ✅ **Server Error Responses (Retryable):**
 
 - `500 Internal Server Error` - Internal error
-- `503 Service Unavailable` - (Reserved for future use)
+- `503 Service Unavailable` - The app is not running (before `Start`, or once `Shutdown` has begun)
 
 ❌ **Prohibited:**
 
@@ -502,7 +528,7 @@ func sendCloudEvent() error {
 		var errResp map[string]any
 		json.Unmarshal(body, &errResp)
 		return fmt.Errorf("client error: %v", errResp["error"])
-	case http.StatusInternalServerError:
+	case http.StatusInternalServerError, http.StatusServiceUnavailable:
 		var errResp map[string]any
 		json.Unmarshal(body, &errResp)
 		return fmt.Errorf("server error (retryable): %v", errResp["error"])
@@ -560,12 +586,12 @@ if resp.StatusCode != http.StatusAccepted {
 ### 2. Implement Retry Logic
 
 ```go
-// ✅ Retry on 500, don't retry on 400
+// ✅ Retry on 500 and 503, don't retry on 400
 switch resp.StatusCode {
 case http.StatusBadRequest:
 	// Don't retry - fix the request
 	return fmt.Errorf("invalid event: %w", parseError(resp))
-case http.StatusInternalServerError:
+case http.StatusInternalServerError, http.StatusServiceUnavailable:
 	var errResp ErrorResponse
 	json.NewDecoder(resp.Body).Decode(&errResp)
 	if errResp.Retryable == "true" {

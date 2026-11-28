@@ -217,11 +217,7 @@ func TestCloudEvents_SealedChannelRequiresToken(t *testing.T) {
 
 	w := post(`,"capabilitytoken":"` + token + `"`)
 	require.Equal(t, http.StatusAccepted, w.Code)
-	deadline := time.Now().Add(5 * time.Second)
-	for countChannelMessages(t, app, "sealed.event") == 0 {
-		require.True(t, time.Now().Before(deadline), "the accepted event was not published")
-		time.Sleep(20 * time.Millisecond)
-	}
+	require.Equal(t, 1, countChannelMessages(t, app, "sealed.event"), "the accepted event was not published before the answer")
 	msgs, err := app.Storage().ChannelMessagesSince(ctx, "sealed.event", "")
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)

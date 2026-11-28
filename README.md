@@ -585,9 +585,11 @@ curl -X POST http://localhost:8001/ \
 ```
 
 **HTTP Response Codes**:
-- **202 Accepted**: Event accepted for asynchronous processing
+- **202 Accepted**: Event stored; the workflows handle it after the response
 - **400 Bad Request**: CloudEvents parsing/validation error (non-retryable)
-- **500 Internal Server Error**: Internal error (retryable)
+- **403 Forbidden**: The event's channel is sealed and the event carries no valid `capabilitytoken` (non-retryable)
+- **500 Internal Server Error**: Internal error, such as an event that could not be stored (retryable)
+- **503 Service Unavailable**: The app is not running: before `Start`, or once `Shutdown` has begun (retryable)
 
 ## MCP Integration
 

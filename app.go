@@ -61,6 +61,10 @@ type App struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// Incoming events being stored or waking the workflows that wait for
+	// them. Shutdown waits for them before it stops the background tasks.
+	eventWG sync.WaitGroup
+
 	// Concurrency control semaphores
 	resumptionSem *semaphore.Weighted
 	timerSem      *semaphore.Weighted
@@ -150,6 +154,17 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.running = false
 	a.mu.Unlock()
 
+	// One deadline for the whole shutdown.
+	waitCtx, cancelWait := context.WithTimeout(ctx, a.config.shutdownTimeout)
+	defer cancelWait()
+
+	// From here on, incoming events are refused with 503. The events
+	// accepted before finish first, while storage and the background tasks
+	// still run. If the deadline passes, cancelling the background tasks
+	// below stops their wakes: an undelivered message stays pending, and the
+	// sweep that requeues waits with pending messages resumes its waiters.
+	waitDone(waitCtx, &a.eventWG)
+
 	// Stop outbox relayer if enabled
 	if a.outboxRelayer != nil {
 		a.outboxRelayer.Stop()
@@ -168,18 +183,10 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 
 	// Wait for background tasks with timeout
-	done := make(chan struct{})
-	go func() {
-		a.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// All tasks completed
-	case <-ctx.Done():
-		return fmt.Errorf("shutdown timed out")
-	case <-time.After(a.config.shutdownTimeout):
+	if !waitDone(waitCtx, &a.wg) {
+		if ctx.Err() != nil {
+			return fmt.Errorf("shutdown timed out")
+		}
 		return fmt.Errorf("shutdown timed out after %v", a.config.shutdownTimeout)
 	}
 
@@ -209,6 +216,36 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// waitDone waits for wg until ctx is done, and answers whether wg finished.
+func waitDone(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// beginEventWork reserves a place for the processing of an incoming event,
+// unless the app is not running: before Start, or once Shutdown has begun.
+// It answers the app's context, for the processing that continues after the
+// answer. The caller calls a.eventWG.Done when the processing ends; while it
+// holds the place, it may add more of its work to a.eventWG.
+func (a *App) beginEventWork() (context.Context, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.running {
+		return nil, false
+	}
+	a.eventWG.Add(1)
+	return a.ctx, true
 }
 
 // initStorage initializes the storage backend.
@@ -1492,7 +1529,9 @@ func (e *CloudEvent) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// handleCloudEvent handles incoming CloudEvents.
+// handleCloudEvent handles incoming CloudEvents. It answers 202 once the event
+// is stored, 503 while the app is not running and 500 when storing fails; both
+// are retryable, and the sender sends the event again.
 func (a *App) handleCloudEvent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1531,33 +1570,50 @@ func (a *App) handleCloudEvent(w http.ResponseWriter, r *http.Request) {
 		token = r.Header.Get("Ce-" + cloudEventTokenExtension)
 	}
 	delete(event.Extensions, cloudEventTokenExtension)
-	if a.storage != nil {
-		if err := checkChannelSeal(r.Context(), a.storage, storage.CapabilityKindChannelPub, cloudEventChannel(&event), token); err != nil {
-			status, errType, retryable := http.StatusInternalServerError, "InternalError", "true"
-			if errors.Is(err, ErrChannelForbidden) {
-				status, errType, retryable = http.StatusForbidden, "Forbidden", "false"
-			}
-			w.WriteHeader(status)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":      err.Error(),
-				"error_type": errType,
-				"retryable":  retryable,
-			})
-			return
+	if err := a.acceptCloudEvent(r.Context(), &event, token); err != nil {
+		status, errType, retryable := http.StatusInternalServerError, "InternalError", "true"
+		switch {
+		case errors.Is(err, ErrChannelForbidden):
+			status, errType, retryable = http.StatusForbidden, "Forbidden", "false"
+		case errors.Is(err, errAppNotRunning):
+			status, errType = http.StatusServiceUnavailable, "ServiceUnavailable"
 		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":      err.Error(),
+			"error_type": errType,
+			"retryable":  retryable,
+		})
+		return
 	}
-
-	// Process the event asynchronously
-	// Use background context since HTTP request context is canceled after response
-	go a.processCloudEvent(context.Background(), &event)
 
 	// Return 202 Accepted (CloudEvents HTTP Protocol Binding)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 
-// processCloudEvent processes an incoming CloudEvent.
-func (a *App) processCloudEvent(ctx context.Context, event *CloudEvent) {
+// errAppNotRunning refuses an incoming event while the app is not running:
+// before Start, or once Shutdown has begun.
+var errAppNotRunning = errors.New("app is not running")
+
+// acceptCloudEvent stores an incoming event before the endpoint answers 202
+// (SEMANTICS §3c): it publishes the event to its channel and creates the
+// instance of the workflow that handles its type. The wake of the workflows
+// waiting on the channel runs after the answer, and Shutdown waits for it. A
+// wake cut short leaves the message pending, and the sweep that requeues
+// waits with pending messages resumes the waiters.
+func (a *App) acceptCloudEvent(ctx context.Context, event *CloudEvent, token string) error {
+	appCtx, ok := a.beginEventWork()
+	if !ok {
+		return errAppNotRunning
+	}
+	defer a.eventWG.Done()
+
+	channelName := cloudEventChannel(event)
+	if err := checkChannelSeal(ctx, a.storage, storage.CapabilityKindChannelPub, channelName, token); err != nil {
+		return err
+	}
+
 	// Call OnEventReceived hook
 	a.hooks.OnEventReceived(ctx, hooks.EventReceivedInfo{
 		EventType:   event.Type,
@@ -1566,28 +1622,40 @@ func (a *App) processCloudEvent(ctx context.Context, event *CloudEvent) {
 		InstanceID:  "", // Not known at this point
 	})
 
-	// First, try to deliver to waiting workflows
-	if err := a.deliverEventToWaitingWorkflows(ctx, event); err != nil {
-		slog.Error("error delivering event to waiting workflows", "error", err)
+	// Workflows waiting via WaitEvent (which receives from a channel) read
+	// the event from its channel.
+	dataJSON, err := cloudEventMessage(event)
+	if err != nil {
+		return err
+	}
+	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, nil)
+	if err != nil {
+		return fmt.Errorf("failed to publish event to channel: %w", err)
 	}
 
-	// Then, check if this event type triggers a new workflow
+	// An event type that a workflow handles starts that workflow, with the
+	// event data as input. Its first run continues after the answer.
 	a.eventHandlersMu.RLock()
 	workflowName, hasHandler := a.eventHandlers[event.Type]
 	a.eventHandlersMu.RUnlock()
-
 	if hasHandler {
-		// Start a new workflow with the event data as input
 		var inputData any
 		if event.Data != nil {
 			_ = json.Unmarshal(event.Data, &inputData)
 		}
-
-		_, err := a.startWorkflow(ctx, workflowName, inputData, &startOptions{})
-		if err != nil {
-			slog.Error("error starting workflow from event", "workflow", workflowName, "error", err)
+		if _, err := a.startWorkflow(ctx, workflowName, inputData, &startOptions{}); err != nil {
+			return fmt.Errorf("failed to start workflow %s from event: %w", workflowName, err)
 		}
 	}
+
+	// Wake up waiting subscribers. DeliverChannelMessageWithLock takes the
+	// lock of each one and records the message in its history.
+	a.eventWG.Add(1)
+	go func() {
+		defer a.eventWG.Done()
+		a.wakeWaitingChannelSubscribers(appCtx, channelName, messageID, dataJSON, nil)
+	}()
+	return nil
 }
 
 // cloudEventTokenExtension is the CloudEvents extension attribute that
@@ -1604,15 +1672,9 @@ func cloudEventChannel(event *CloudEvent) string {
 	return event.Type
 }
 
-// deliverEventToWaitingWorkflows delivers an event to workflows waiting for it.
-// Uses the unified channel system: event_type is used as the channel name.
-// Workflows waiting via WaitEvent (which internally uses Receive) are subscribed to the event_type channel.
-func (a *App) deliverEventToWaitingWorkflows(ctx context.Context, event *CloudEvent) error {
-	if a.storage == nil {
-		return nil
-	}
-
-	// Prepare CloudEvent data in ReceivedEvent format
+// cloudEventMessage is the channel message of an incoming event, in the
+// ReceivedEvent format that WaitEvent reads.
+func cloudEventMessage(event *CloudEvent) ([]byte, error) {
 	eventData := map[string]any{
 		"id":          event.ID,
 		"type":        event.Type,
@@ -1634,22 +1696,9 @@ func (a *App) deliverEventToWaitingWorkflows(ctx context.Context, event *CloudEv
 
 	dataJSON, err := json.Marshal(eventData)
 	if err != nil {
-		return fmt.Errorf("failed to serialize event data: %w", err)
+		return nil, fmt.Errorf("failed to serialize event data: %w", err)
 	}
-
-	channelName := cloudEventChannel(event)
-
-	// Publish to channel using event.Type as channel name
-	messageID, err := a.storage.PublishToChannel(ctx, channelName, dataJSON, nil)
-	if err != nil {
-		return fmt.Errorf("failed to publish event to channel: %w", err)
-	}
-
-	// Wake up waiting subscribers using the unified channel system
-	// This uses DeliverChannelMessageWithLock which handles locking and history recording
-	a.wakeWaitingChannelSubscribers(ctx, channelName, messageID, dataJSON, nil)
-
-	return nil
+	return dataJSON, nil
 }
 
 // wakeWaitingChannelSubscribers delivers a message to waiting channel subscribers.
