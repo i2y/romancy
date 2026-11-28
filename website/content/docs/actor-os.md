@@ -3,14 +3,12 @@ title: "Actor OS Vision"
 weight: 2
 ---
 
-# Actor OS Vision
-
-Romancy is the Go implementation of a shared **actor OS** kernel: the same
+Romancy is the Go implementation of a shared **Actor OS** kernel: the same
 database-backed kernel is implemented in Go (romancy), Python (edda), and
 Ruby (shikibu), so actors written in different languages exchange messages,
 tasks, and supervision on one kernel.
 
-![ActorOS architecture](/images/actoros-architecture.svg)
+![Actor OS architecture: romancy (Go), edda (Python) and shikibu (Ruby) run on one kernel, a shared database schema plus SEMANTICS.md, on SQLite, PostgreSQL or MySQL](/images/actoros-architecture.svg)
 
 The kernel is not a server — it is a **shared database schema plus a
 semantics constitution** ([SEMANTICS.md](https://github.com/durax-io/schema/blob/main/SEMANTICS.md)),
@@ -18,14 +16,14 @@ with its concurrency protocols machine-checked in TLA+.
 
 ## Unix analogies
 
-| Unix | Actor OS | Backed by |
+| Unix | Actor OS | Notes |
 |---|---|---|
 | process | workflow instance | one row, replayed after crashes |
 | init / systemd | supervision tree | one_for_one / one_for_all / rest_for_one |
 | pipe / mailbox | channel | broadcast / competing / direct, cross-language |
 | filesystem | actor FS | `/actor/{id}/` private, `/shared/` shared |
 | file descriptor | capability token | sealed channels, FS writes |
-| scheduler | lock claim + epoch fencing | TLA+-verified |
+| scheduler | lock claim + epoch fencing | one worker per instance; model-checked in TLA+ |
 
 ## Kernel primitives
 
@@ -42,7 +40,7 @@ All primitives take the `*romancy.WorkflowContext`.
 | Blobs | `StorePayload`, `LoadPayload`, `BlobStat` | Content-addressed (`blob:sha256:…`), so readable by anyone who knows the hash: encrypt secrets before storing them. |
 | Event log | `ReadChannelSince`, `ReadChannelAfter` | Read a channel's messages after a cursor: a message ID (`ErrCursorNotFound` once that message is gone) or the numeric ID of the last message read (keeps working after it is deleted). |
 | Supervision | `DefineSupervisor` | `OneForOne` / `OneForAll` / `RestForOne`; restart modes `RestartPermanent` (always), `RestartTransient` (only after failure or cancellation) and `RestartTemporary` (never); restart intensity limits. |
-| Sandboxing | `WithSandboxed(true)` | See the README's *Sandboxed Actors* section. |
+| Sandboxing | `WithSandboxed(true)` | A `StartWorkflow` option, accepted from an unsandboxed workflow or an outside caller. A sandboxed workflow cannot issue capabilities, so it holds only tokens that others delegate to it, for example in its input. Workflows it starts are sandboxed too (start them with its `ctx.Context()` so the parent is known). The library enforces this, not the database: code in the worker process can bypass it. |
 
 DOWN messages, name release, task reclaim and the removal of expired capabilities run on the leader's cleanup tick (`WithStaleLockInterval`, 60 s by default).
 

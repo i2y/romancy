@@ -1,96 +1,121 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 660" font-family="'Hiragino Sans','Noto Sans JP','Helvetica Neue',sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="656" viewBox="0 0 900 656" role="img" aria-labelledby="title desc">
+  <title id="title">Actor OS architecture</title>
+  <desc id="desc">Actors written in Go (romancy), Python (edda) and Ruby (shikibu) run on one Actor OS kernel: a shared database schema plus SEMANTICS.md, implemented by each library. The kernel provides processes, channels, names and monitors, supervision, tasks, capabilities, an actor file system with blobs, and scheduling. Its concurrency protocols are model-checked in TLA+. It runs on SQLite, PostgreSQL or MySQL, with no kernel server and no message broker.</desc>
+  <style>
+    svg { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    text { font-size: 13px; }
+    .card { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1.5; }
+    .muted { fill: #64748b; }
+    .box { fill: #ffffff; stroke-width: 2; }
+    .go { stroke: #00add8; }
+    .go-t { fill: #0e7490; }
+    .py { stroke: #3776ab; }
+    .py-t { fill: #275f8f; }
+    .rb { stroke: #cc342d; }
+    .rb-t { fill: #a8241f; }
+    .name { font-size: 18px; font-weight: 700; }
+    .arrow { stroke: #94a3b8; stroke-width: 1.5; }
+    .head { fill: #94a3b8; }
+    .kernel { fill: #0f172a; }
+    .k-title { fill: #f8fafc; font-size: 20px; font-weight: 700; }
+    .k-sub { fill: #94a3b8; }
+    .pill { fill: #064e3b; }
+    .pill-t { fill: #a7f3d0; font-size: 12px; font-weight: 600; }
+    .chip { fill: #1e293b; }
+    .chip-t { fill: #f1f5f9; font-size: 15px; font-weight: 600; }
+    .chip-d { fill: #cbd5e1; }
+    .db { fill: #fefce8; stroke: #e7e5e4; stroke-width: 1.5; }
+    .db-t { fill: #292524; font-size: 16px; font-weight: 700; }
+    .db-s { fill: #57534e; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: #161b22; stroke: #2a313c; }
+      .muted { fill: #94a3b8; }
+      .box { fill: #0d1117; }
+      .go { stroke: #1fb6d6; }
+      .go-t { fill: #67d8ef; }
+      .py { stroke: #5b95cc; }
+      .py-t { fill: #93c0ea; }
+      .rb { stroke: #e0564e; }
+      .rb-t { fill: #f49a93; }
+      .arrow { stroke: #64748b; }
+      .head { fill: #64748b; }
+      .kernel { fill: #1b2433; stroke: #334155; }
+      .k-sub { fill: #9fb0c5; }
+      .pill { fill: #0b3b2c; }
+      .pill-t { fill: #86efac; }
+      .chip { fill: #263246; }
+      .chip-d { fill: #c5cfdc; }
+      .db { fill: #221f17; stroke: #4a4436; }
+      .db-t { fill: #f5f5f4; }
+      .db-s { fill: #b9b3a8; }
+    }
+  </style>
   <defs>
-    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 1 L 9 5 L 0 9 z" fill="#64748b"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path class="head" d="M0 1L9 5L0 9z"/>
     </marker>
-    <linearGradient id="kernel" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#1e293b"/>
-      <stop offset="1" stop-color="#0f172a"/>
-    </linearGradient>
   </defs>
 
-  <!-- application layer -->
-  <rect x="230" y="18" width="460" height="48" rx="10" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5"/>
-  <text x="460" y="48" text-anchor="middle" font-size="17" fill="#334155">あなたのアプリケーション</text>
+  <rect class="card" x="0.75" y="0.75" width="898.5" height="654.5" rx="16"/>
 
-  <!-- arrows app -> languages -->
-  <line x1="390" y1="66" x2="222" y2="106" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
-  <line x1="460" y1="66" x2="460" y2="106" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
-  <line x1="530" y1="66" x2="698" y2="106" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- actors and the three libraries -->
+  <text class="muted" x="40" y="40">Your actors, written in Go, Python or Ruby</text>
 
-  <!-- language boxes -->
-  <g>
-    <rect x="100" y="110" width="220" height="66" rx="10" fill="#ffffff" stroke="#00add8" stroke-width="2.5"/>
-    <text x="210" y="138" text-anchor="middle" font-size="17" font-weight="bold" fill="#0e7490">romancy</text>
-    <text x="210" y="162" text-anchor="middle" font-size="13" fill="#64748b">Go</text>
-  </g>
-  <g>
-    <rect x="350" y="110" width="220" height="66" rx="10" fill="#ffffff" stroke="#3776ab" stroke-width="2.5"/>
-    <text x="460" y="138" text-anchor="middle" font-size="17" font-weight="bold" fill="#275f8f">edda</text>
-    <text x="460" y="162" text-anchor="middle" font-size="13" fill="#64748b">Python</text>
-  </g>
-  <g>
-    <rect x="600" y="110" width="220" height="66" rx="10" fill="#ffffff" stroke="#cc342d" stroke-width="2.5"/>
-    <text x="710" y="138" text-anchor="middle" font-size="17" font-weight="bold" fill="#a8241f">shikibu</text>
-    <text x="710" y="162" text-anchor="middle" font-size="13" fill="#64748b">Ruby</text>
-  </g>
+  <rect class="box go" x="40" y="54" width="260" height="72" rx="10"/>
+  <text class="name go-t" x="170" y="86" text-anchor="middle">romancy</text>
+  <text class="muted" x="170" y="108" text-anchor="middle">Go library</text>
 
-  <!-- interop annotation -->
-  <text x="460" y="652" text-anchor="middle" font-size="12.5" fill="#64748b">どの言語で書いても、同じカーネル上で相互にメッセージを交換できる</text>
+  <rect class="box py" x="320" y="54" width="260" height="72" rx="10"/>
+  <text class="name py-t" x="450" y="86" text-anchor="middle">edda</text>
+  <text class="muted" x="450" y="108" text-anchor="middle">Python library</text>
 
-  <!-- arrows languages -> kernel -->
-  <line x1="280" y1="176" x2="380" y2="228" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
-  <line x1="460" y1="176" x2="460" y2="228" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
-  <line x1="640" y1="176" x2="540" y2="228" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect class="box rb" x="600" y="54" width="260" height="72" rx="10"/>
+  <text class="name rb-t" x="730" y="86" text-anchor="middle">shikibu</text>
+  <text class="muted" x="730" y="108" text-anchor="middle">Ruby library</text>
+
+  <line class="arrow" x1="170" y1="127" x2="170" y2="167" marker-end="url(#arrow)"/>
+  <line class="arrow" x1="450" y1="127" x2="450" y2="167" marker-end="url(#arrow)"/>
+  <line class="arrow" x1="730" y1="127" x2="730" y2="167" marker-end="url(#arrow)"/>
 
   <!-- kernel -->
-  <rect x="100" y="232" width="720" height="306" rx="14" fill="url(#kernel)"/>
-  <text x="460" y="266" text-anchor="middle" font-size="19" font-weight="bold" fill="#f8fafc">ActorOS カーネル</text>
-  <text x="460" y="288" text-anchor="middle" font-size="12" fill="#94a3b8">実体 = 共有DBスキーマ + セマンティクス規約（SEMANTICS.md）</text>
+  <rect class="kernel" x="40" y="170" width="820" height="358" rx="14"/>
+  <text class="k-title" x="64" y="204">Actor OS kernel</text>
+  <text class="k-sub" x="64" y="226">A shared database schema + SEMANTICS.md, implemented by each library</text>
+  <rect class="pill" x="608" y="186" width="228" height="26" rx="13"/>
+  <text class="pill-t" x="722" y="203.5" text-anchor="middle">Protocols model-checked in TLA+</text>
 
-  <!-- primitive chips: 2 cols x 4 rows, chip 322x46, gap 16/10, start x=130 y=302 -->
-  <g font-size="13.5">
-    <!-- row 1 -->
-    <rect x="130" y="302" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="146" y="321" font-weight="bold" fill="#e2e8f0">プロセス</text>
-    <text x="146" y="339" font-size="11" fill="#94a3b8">durable ワークフロー — 落ちてもリプレイで復活</text>
-    <rect x="468" y="302" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="484" y="321" font-weight="bold" fill="#e2e8f0">チャネル</text>
-    <text x="484" y="339" font-size="11" fill="#94a3b8">broadcast / competing / direct メッセージ</text>
-    <!-- row 2 -->
-    <rect x="130" y="358" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="146" y="377" font-weight="bold" fill="#e2e8f0">supervision tree</text>
-    <text x="146" y="395" font-size="11" fill="#94a3b8">世代つき再起動 — one_for_one / one_for_all</text>
-    <rect x="468" y="358" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="484" y="377" font-weight="bold" fill="#e2e8f0">スケジューラ</text>
-    <text x="484" y="395" font-size="11" fill="#94a3b8">lock claim + epoch fencing で安全に多重起動</text>
-    <!-- row 3 -->
-    <rect x="130" y="414" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="146" y="433" font-weight="bold" fill="#e2e8f0">actor FS</text>
-    <text x="146" y="451" font-size="11" fill="#94a3b8">/actor/{id}/ は私的領域、/shared/ は共有</text>
-    <rect x="468" y="414" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="484" y="433" font-weight="bold" fill="#e2e8f0">capability</text>
-    <text x="484" y="451" font-size="11" fill="#94a3b8">権限トークン — sealed チャネルと FS 書き込み</text>
-    <!-- row 4 -->
-    <rect x="130" y="470" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="146" y="489" font-weight="bold" fill="#e2e8f0">タスク配布</text>
-    <text x="146" y="507" font-size="11" fill="#94a3b8">actor_tasks — 言語をまたいだ仕事の受け渡し</text>
-    <rect x="468" y="470" width="322" height="46" rx="8" fill="#1e3a5f" opacity="0.9"/>
-    <text x="484" y="489" font-weight="bold" fill="#e2e8f0">レジストリ</text>
-    <text x="484" y="507" font-size="11" fill="#94a3b8">名前つきアクター — monitor と DOWN 通知</text>
-  </g>
+  <!-- primitives: 2 columns x 4 rows, chip 378x56 -->
+  <rect class="chip" x="64" y="246" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="82" y="270">Processes</text>
+  <text class="chip-d" x="82" y="290">Workflow instances, replayed after a crash</text>
+  <rect class="chip" x="458" y="246" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="476" y="270">Channels</text>
+  <text class="chip-d" x="476" y="290">Broadcast, competing or direct delivery</text>
 
-  <!-- TLA+ badge -->
-  <rect x="650" y="246" width="154" height="26" rx="13" fill="#065f46"/>
-  <text x="727" y="264" text-anchor="middle" font-size="12" font-weight="bold" fill="#a7f3d0">TLA+ 形式検証済み</text>
+  <rect class="chip" x="64" y="314" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="82" y="338">Names &amp; monitors</text>
+  <text class="chip-d" x="82" y="358">Look up actors by name; DOWN when one exits</text>
+  <rect class="chip" x="458" y="314" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="476" y="338">Supervision</text>
+  <text class="chip-d" x="476" y="358">one_for_one · one_for_all · rest_for_one</text>
 
-  <!-- arrow kernel -> db -->
-  <line x1="460" y1="538" x2="460" y2="578" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect class="chip" x="64" y="382" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="82" y="406">Tasks</text>
+  <text class="chip-d" x="82" y="426">A durable work queue shared across languages</text>
+  <rect class="chip" x="458" y="382" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="476" y="406">Capabilities</text>
+  <text class="chip-d" x="476" y="426">Tokens that seal channels and /shared/ writes</text>
 
-  <!-- db layer -->
-  <rect x="220" y="582" width="480" height="56" rx="10" fill="#fefce8" stroke="#d4d4d8" stroke-width="1.5"/>
-  <text x="460" y="606" text-anchor="middle" font-size="15" font-weight="bold" fill="#3f3f46">SQLite / PostgreSQL / MySQL</text>
-  <text x="460" y="626" text-anchor="middle" font-size="12" fill="#71717a">ただのデータベース — 専用サーバー・ブローカーは不要</text>
+  <rect class="chip" x="64" y="450" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="82" y="474">Actor FS &amp; blobs</text>
+  <text class="chip-d" x="82" y="494">/actor/{id}/ for its owner, /shared/ for all</text>
+  <rect class="chip" x="458" y="450" width="378" height="56" rx="8"/>
+  <text class="chip-t" x="476" y="474">Scheduling</text>
+  <text class="chip-d" x="476" y="494">One worker per instance, with epoch fencing</text>
 
-  <!-- side annotations -->
+  <!-- database -->
+  <line class="arrow" x1="450" y1="529" x2="450" y2="563" marker-end="url(#arrow)"/>
+  <rect class="db" x="170" y="566" width="560" height="64" rx="12"/>
+  <text class="db-t" x="450" y="593" text-anchor="middle">SQLite · PostgreSQL · MySQL</text>
+  <text class="db-s" x="450" y="614" text-anchor="middle">Just a database: no kernel server, no message broker</text>
 </svg>
